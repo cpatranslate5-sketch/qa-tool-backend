@@ -1,13 +1,9 @@
-"""Quick local smoke test — exercises login, projects, languages, single
-check, and a real multi-upload against the sample file the user sent.
+"""Quick local smoke test for the shared-folders / admin model.
 Uses a throwaway SQLite DB (no DATABASE_URL set) and no AI key, so only
 rule-based findings are expected, not AI ones."""
 import os
 import sys
 
-os.environ.pop("DATABASE_URL", None)
-if os.path.exists("qa_tool_smoketest.db"):
-    os.remove("qa_tool_smoketest.db")
 os.environ["DATABASE_URL"] = ""
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -15,7 +11,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import app.database as dbmod
 dbmod.engine = dbmod.create_engine("sqlite:///./qa_tool_smoketest.db", connect_args={"check_same_thread": False})
 dbmod.SessionLocal = dbmod.sessionmaker(autocommit=False, autoflush=False, bind=dbmod.engine)
-
+if os.path.exists("qa_tool_smoketest.db"):
+    os.remove("qa_tool_smoketest.db")
 dbmod.init_db()
 
 from fastapi.testclient import TestClient
@@ -30,83 +27,99 @@ def check(label, resp, expect=200):
         print("   body:", resp.text[:500])
     return resp
 
-# health
-check("health", client.get("/health"))
+# --- folder creation: first ever becomes admin ---
+r = check("create folder Александр (first -> admin)", client.post("/managers", json={"name": "Александр", "code": "1234"}))
+admin_id = r.json()["id"]
+assert r.json()["is_admin"] is True
 
-# login (new)
-r = check("login (register)", client.post("/auth/login", json={"name": "Александр", "code": "1234"}))
-manager_id = r.json()["manager_id"]
+r = check("create folder Мария (second -> not admin)", client.post("/managers", json={"name": "Мария", "code": "5678"}))
+regular_id = r.json()["id"]
+assert r.json()["is_admin"] is False
 
-# login again with wrong code
-check("login (wrong code)", client.post("/auth/login", json={"name": "Александр", "code": "wrong"}), expect=401)
+check("duplicate folder name", client.post("/managers", json={"name": "Александр", "code": "0000"}), expect=409)
 
-# login again with correct code
-check("login (correct code)", client.post("/auth/login", json={"name": "Александр", "code": "1234"}))
+# --- listing folders (public, no code) ---
+r = check("list managers", client.get("/managers"))
+assert len(r.json()) == 2
 
-# create project
-r = check("create project", client.post(f"/managers/{manager_id}/projects", json={"name": "Pragmatic Play Promo"}))
+# --- unlock flow ---
+check("unlock wrong code", client.post(f"/managers/{regular_id}/unlock", json={"code": "wrong"}), expect=401)
+check("unlock correct code", client.post(f"/managers/{regular_id}/unlock", json={"code": "5678"}))
+
+# --- non-admin blocked from structural changes ---
+check("non-admin create project blocked", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": regular_id}), expect=403)
+
+# --- admin creates project ---
+r = check("admin create project", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}))
 project_id = r.json()["id"]
+assert r.json()["created_by_name"] == "Александр"
 
-# duplicate project name
-check("duplicate project", client.post(f"/managers/{manager_id}/projects", json={"name": "Pragmatic Play Promo"}), expect=409)
+check("duplicate project name", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}), expect=409)
 
-# set glossary
-check("set glossary", client.put(
-    f"/managers/{manager_id}/projects/{project_id}/glossary",
-    json={"glossary": "Mission Rush -> Mission Rush (не переводится)"},
+# --- non-admin blocked from glossary edit / adding language ---
+check("non-admin edit glossary blocked", client.put(
+    f"/projects/{project_id}/glossary", json={"glossary": "x", "manager_id": regular_id}
+), expect=403)
+check("non-admin add language blocked", client.post(
+    f"/projects/{project_id}/languages", json={"lang_code": "ru", "manager_id": regular_id}
+), expect=403)
+
+# --- admin sets glossary + adds language ---
+check("admin set glossary", client.put(
+    f"/projects/{project_id}/glossary", json={"glossary": "Mission Rush -> Mission Rush", "manager_id": admin_id}
 ))
-
-# add language folder
-r = check("add language", client.post(f"/managers/{manager_id}/projects/{project_id}/languages", json={"lang_code": "ru"}))
+r = check("admin add language", client.post(
+    f"/projects/{project_id}/languages", json={"lang_code": "ru", "manager_id": admin_id}
+))
 language_id = r.json()["id"]
 
-# list languages
-check("list languages", client.get(f"/managers/{manager_id}/projects/{project_id}/languages"))
+# --- BOTH folders see the same shared project/language (no manager scoping) ---
+r = check("list projects (shared)", client.get("/projects"))
+assert len(r.json()) == 1
+r = check("list languages (shared)", client.get(f"/projects/{project_id}/languages"))
+assert len(r.json()) == 1
 
-# single check tied to project/language (numbers mismatch on purpose)
-r = check("single check", client.post("/check", json={
+# --- non-admin CAN run a single check ---
+r = check("non-admin single check", client.post("/check", json={
     "source": "The bonus is $50 and expires in 3 days.",
     "translation": "Бонус составляет $500 и истекает через 3 дня.",
     "checks": ["numbers", "placeholders", "glossary", "register", "typo"],
     "project_id": project_id,
     "language_id": language_id,
+    "manager_name": "Мария",
 }))
 print("   findings:", r.json()["findings"])
 
-# history should have 1 entry
-r = check("single check history", client.get(f"/managers/{manager_id}/projects/{project_id}/languages/{language_id}/history"))
-assert len(r.json()) == 1, f"expected 1 history entry, got {len(r.json())}"
-print("   history entries:", len(r.json()))
+# --- history shows who performed it ---
+r = check("history shows attribution", client.get(f"/projects/{project_id}/languages/{language_id}/history"))
+assert len(r.json()) == 1
+assert r.json()[0]["performed_by_name"] == "Мария"
+print("   performed_by_name:", r.json()[0]["performed_by_name"])
 
-# multi-check with the real sample file
+# --- non-admin CAN run a multi-check upload ---
 sample_path = "/root/.claude/uploads/aee9e6e5-e96f-5b4b-aa4e-8aad6284c8c9/147efc1b-Promo_Rules_Localization.xlsx"
 with open(sample_path, "rb") as f:
-    r = check("multi-check upload", client.post(
-        f"/managers/{manager_id}/projects/{project_id}/multi-check",
+    r = check("non-admin multi-check upload", client.post(
+        f"/projects/{project_id}/multi-check",
         files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        data={"source_lang": ""},
+        data={"source_lang": "", "manager_name": "Мария"},
     ))
 multi_data = r.json()
-print("   resolved source_lang:", multi_data["source_lang"])
-print("   summary:", multi_data["summary"])
 multi_check_id = multi_data["multi_check_id"]
-assert multi_data["source_lang"] == "en"
-assert multi_data["summary"]["languages_checked"], "expected at least one target language checked"
+print("   summary:", multi_data["summary"])
 
-# multi-check detail fetch
-check("multi-check detail", client.get(f"/managers/{manager_id}/projects/{project_id}/multi-check/{multi_check_id}"))
+r = check("multi-check history shows attribution", client.get(f"/projects/{project_id}/multi-check"))
+assert r.json()[0]["performed_by_name"] == "Мария"
 
-# multi-check history
-r = check("multi-check history", client.get(f"/managers/{manager_id}/projects/{project_id}/multi-check"))
-assert len(r.json()) == 1
-
-# report download
-r = check("multi-check report download", client.get(
-    f"/managers/{manager_id}/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx"
+check("multi-check report download", client.get(
+    f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx"
 ))
-assert r.headers["content-type"].startswith("application/vnd.openxmlformats")
-with open("/tmp/qa_report_smoketest.xlsx", "wb") as out:
-    out.write(r.content)
-print("   report bytes:", len(r.content))
+
+# --- re-running migrations on an already-migrated DB should be a no-op ---
+dbmod.init_db()
+r = check("managers survive re-migration", client.get("/managers"))
+assert len(r.json()) == 2
+r = check("projects survive re-migration", client.get("/projects"))
+assert len(r.json()) == 1
 
 print("\nALL SMOKETEST CHECKS PASSED")

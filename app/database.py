@@ -40,8 +40,62 @@ def get_db():
         db.close()
 
 
+def _run_migrations():
+    """
+    Small hand-rolled, idempotent migrations — this project has no Alembic
+    set up, and the data so far is trivial, so we adjust the live schema
+    directly instead. Safe to run on every startup.
+    """
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    cascade = " CASCADE" if engine.dialect.name == "postgresql" else ""
+
+    if "managers" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("managers")}
+        if "is_admin" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE managers ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE"))
+
+    # The project/language/check tables changed shape (projects used to be
+    # owned by one manager; now they're shared, and single_checks/multi_checks
+    # gained a performed_by_name column). Rather than hand-write an ALTER for
+    # every case, just drop and let create_all() below rebuild them fresh —
+    # there's no meaningful data yet to preserve there, and managers (the
+    # actual folders/logins) are left untouched.
+    if "projects" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("projects")}
+        needs_reset = "manager_id" in cols or "name" not in cols
+        if not needs_reset and "single_checks" in existing_tables:
+            sc_cols = {c["name"] for c in insp.get_columns("single_checks")}
+            needs_reset = "performed_by_name" not in sc_cols
+        if needs_reset:
+            with engine.begin() as conn:
+                for table in ("multi_checks", "single_checks", "project_languages", "projects"):
+                    conn.execute(text(f"DROP TABLE IF EXISTS {table}{cascade}"))
+
+
+def _ensure_admin_exists():
+    from app import models
+
+    db = SessionLocal()
+    try:
+        has_admin = db.query(models.Manager).filter(models.Manager.is_admin.is_(True)).first()
+        if has_admin:
+            return
+        earliest = db.query(models.Manager).order_by(models.Manager.id.asc()).first()
+        if earliest:
+            earliest.is_admin = True
+            db.commit()
+    finally:
+        db.close()
+
+
 def init_db():
     # Imported here to avoid circular imports at module load time.
     from app import models  # noqa: F401
 
+    _run_migrations()
     Base.metadata.create_all(bind=engine)
+    _ensure_admin_exists()

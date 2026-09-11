@@ -2,6 +2,7 @@ import datetime
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -19,31 +20,36 @@ def _now() -> datetime.datetime:
 
 
 class Manager(Base):
+    """A "folder" in the user's terms. The very first manager ever created
+    is automatically the admin — only the admin folder may create projects,
+    language folders, or edit a project's glossary (see main.py's
+    _require_admin). Every other folder can use whatever the admin has
+    already set up (single checks, multi-uploads) but not restructure it."""
+
     __tablename__ = "managers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     code_hash: Mapped[str] = mapped_column(String(200), nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
-
-    projects: Mapped[list["Project"]] = relationship(back_populates="manager", cascade="all, delete-orphan")
 
 
 class Project(Base):
+    """Shared/global — every folder sees the same set of projects. Only the
+    admin folder can create one (see _require_admin in main.py)."""
+
     __tablename__ = "projects"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    manager_id: Mapped[int] = mapped_column(ForeignKey("managers.id"), nullable=False)
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     glossary: Mapped[str] = mapped_column(Text, default="")
+    created_by_name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
-    manager: Mapped["Manager"] = relationship(back_populates="projects")
     languages: Mapped[list["ProjectLanguage"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-
-    __table_args__ = (UniqueConstraint("manager_id", "name", name="uq_project_per_manager"),)
 
 
 class ProjectLanguage(Base):
@@ -72,6 +78,7 @@ class SingleCheck(Base):
     translation: Mapped[str] = mapped_column(Text, nullable=False)
     checks_run: Mapped[list] = mapped_column(JSON, default=list)
     findings: Mapped[list] = mapped_column(JSON, default=list)
+    performed_by_name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     project: Mapped["Project"] = relationship(back_populates="single_checks")
@@ -90,6 +97,7 @@ class MultiCheck(Base):
     checks_run: Mapped[list] = mapped_column(JSON, default=list)
     summary: Mapped[dict] = mapped_column(JSON, default=dict)
     results: Mapped[dict] = mapped_column(JSON, default=dict)
+    performed_by_name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     project: Mapped["Project"] = relationship(back_populates="multi_checks")

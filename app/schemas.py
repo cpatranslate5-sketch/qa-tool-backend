@@ -3,25 +3,34 @@ from pydantic import BaseModel
 DEFAULT_CHECKS = ["numbers", "placeholders", "glossary", "register", "typo"]
 
 
-class LoginIn(BaseModel):
+class ManagerOut(BaseModel):
+    id: int
+    name: str
+    is_admin: bool
+
+    class Config:
+        from_attributes = True
+
+
+class ManagerCreateIn(BaseModel):
     name: str
     code: str
 
 
-class LoginOut(BaseModel):
-    manager_id: int
-    name: str
-    is_new: bool
+class ManagerUnlockIn(BaseModel):
+    code: str
 
 
 class ProjectIn(BaseModel):
     name: str
+    manager_id: int
 
 
 class ProjectOut(BaseModel):
     id: int
     name: str
     glossary: str
+    created_by_name: str
 
     class Config:
         from_attributes = True
@@ -29,10 +38,12 @@ class ProjectOut(BaseModel):
 
 class GlossaryIn(BaseModel):
     glossary: str
+    manager_id: int
 
 
 class LanguageIn(BaseModel):
     lang_code: str
+    manager_id: int
 
 
 class LanguageOut(BaseModel):
@@ -53,6 +64,8 @@ class CheckIn(BaseModel):
     language_id: int | None = None
     # Only used when project_id/language_id are not given (standalone check).
     glossary: str = ""
+    # Who's running it, for shared-history attribution (any folder may check).
+    manager_name: str = ""
 
 
 class Finding(BaseModel):
@@ -72,6 +85,7 @@ class SingleCheckHistoryOut(BaseModel):
     translation: str
     checks_run: list
     findings: list
+    performed_by_name: str
     created_at: str
 
     class Config:
@@ -83,6 +97,7 @@ class MultiCheckHistoryOut(BaseModel):
     filename: str
     source_lang: str
     summary: dict
+    performed_by_name: str
     created_at: str
 
     class Config:
