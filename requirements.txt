@@ -3,3 +3,7 @@ uvicorn[standard]
 httpx
 python-dotenv
 pydantic
+sqlalchemy>=2.0
+psycopg[binary]
+openpyxl
+python-multipart
