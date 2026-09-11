@@ -1,6 +1,13 @@
+import datetime
+
 from pydantic import BaseModel
 
-DEFAULT_CHECKS = ["numbers", "placeholders", "glossary", "register", "typo"]
+# Every check type a single-check or multi-check can run. "missing" isn't
+# here — it always runs automatically whenever a translation is empty.
+DEFAULT_CHECKS = [
+    "numbers", "placeholders", "glossary", "register", "typo",
+    "untranslatable", "completeness", "punctuation",
+]
 
 
 class ManagerOut(BaseModel):
@@ -29,16 +36,22 @@ class ProjectIn(BaseModel):
 class ProjectOut(BaseModel):
     id: int
     name: str
-    glossary: str
+    glossary_filename: str
+    glossary_uploaded_at: datetime.datetime | None
     created_by_name: str
 
     class Config:
         from_attributes = True
 
 
-class GlossaryIn(BaseModel):
-    glossary: str
-    manager_id: int
+class GlossaryStatusOut(BaseModel):
+    """The glossary is now a structured document uploaded as a file (admin
+    only) — this is what every folder sees to know what's loaded, without
+    exposing the full table."""
+
+    filename: str
+    uploaded_at: datetime.datetime | None
+    term_count: int
 
 
 class LanguageIn(BaseModel):
@@ -59,11 +72,16 @@ class CheckIn(BaseModel):
     translation: str
     checks: list[str] = DEFAULT_CHECKS
     # Optional — when provided, the check is saved into that project's
-    # language-folder history and the project glossary is used automatically.
+    # language-folder history and the project's glossary (narrowed to
+    # EN + RU + this language) is used automatically.
     project_id: int | None = None
     language_id: int | None = None
     # Only used when project_id/language_id are not given (standalone check).
     glossary: str = ""
+    # One-off instruction for this specific task only (e.g. "in this task,
+    # 'Golden Spin' should be translated, not left as-is") — never saved to
+    # the project, unlike the glossary.
+    extra_instructions: str = ""
     # Who's running it, for shared-history attribution (any folder may check).
     manager_name: str = ""
 

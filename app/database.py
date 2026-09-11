@@ -58,12 +58,28 @@ def _run_migrations():
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE managers ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE"))
 
+    if "projects" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("projects")}
+        with engine.begin() as conn:
+            # The free-text glossary field was replaced by the structured
+            # glossary_terms table (a file upload, not a textbox) — drop it
+            # rather than leave a stale NOT NULL column that would break
+            # every future insert (the ORM no longer sets it).
+            if "glossary" in cols:
+                conn.execute(text("ALTER TABLE projects DROP COLUMN glossary"))
+            if "glossary_filename" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_filename VARCHAR(300) NOT NULL DEFAULT ''"))
+            if "glossary_uploaded_at" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_uploaded_at TIMESTAMPTZ"))
+
     # The project/language/check tables changed shape (projects used to be
     # owned by one manager; now they're shared, and single_checks/multi_checks
     # gained a performed_by_name column). Rather than hand-write an ALTER for
     # every case, just drop and let create_all() below rebuild them fresh —
     # there's no meaningful data yet to preserve there, and managers (the
     # actual folders/logins) are left untouched.
+    insp = inspect(engine)  # re-inspect: the block above may have altered "projects"
+    existing_tables = set(insp.get_table_names())
     if "projects" in existing_tables:
         cols = {c["name"] for c in insp.get_columns("projects")}
         needs_reset = "manager_id" in cols or "name" not in cols

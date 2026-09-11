@@ -9,6 +9,7 @@ from app.claude_client import run_ai_checks
 from app.config import settings
 from app.database import get_db, init_db
 from app.excel_multi import build_report_workbook, parse_workbook, pick_source_lang, run_multi_check
+from app.glossary import format_glossary_prompt, parse_glossary_workbook, terms_for_language
 from app.rule_checks import run_rule_checks
 
 app = FastAPI(title="Translation QA Tool", version="0.3.0")
@@ -133,14 +134,74 @@ def _get_project(project_id: int, db: Session) -> models.Project:
     return project
 
 
-@app.put("/projects/{project_id}/glossary", response_model=schemas.ProjectOut)
-def update_glossary(project_id: int, payload: schemas.GlossaryIn, db: Session = Depends(get_db)):
-    _require_admin(payload.manager_id, db)
+def _all_glossary_terms(project_id: int, db: Session) -> list[dict]:
+    rows = db.query(models.GlossaryTerm).filter(
+        models.GlossaryTerm.project_id == project_id
+    ).order_by(models.GlossaryTerm.row_order).all()
+    return [{"term_en": t.term_en, "description": t.description, "translations": t.translations} for t in rows]
+
+
+def _glossary_lookup(project_id: int, db: Session):
+    """Returns a callable(lang_code) -> glossary prompt text, narrowed to
+    EN + RU + that one language — every check (single or multi) uses this
+    rather than ever loading the full multi-language table."""
+    all_terms = _all_glossary_terms(project_id, db)
+
+    def lookup(lang_code: str) -> str:
+        rows = terms_for_language(all_terms, lang_code)
+        return format_glossary_prompt(rows, lang_code)
+
+    return lookup
+
+
+@app.post("/projects/{project_id}/glossary/upload", response_model=schemas.GlossaryStatusOut)
+async def upload_glossary(
+    project_id: int,
+    file: UploadFile = File(...),
+    manager_id: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Admin-only. Replaces the project's whole glossary with the uploaded
+    file — one sheet, EN column, optional description column, then one
+    column per target language (matches the agency's existing doc)."""
+    _require_admin(manager_id, db)
     project = _get_project(project_id, db)
-    project.glossary = payload.glossary
+    file_bytes = await file.read()
+
+    try:
+        terms = parse_glossary_workbook(file_bytes)
+    except Exception:
+        raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx в формате глоссария.")
+    if not terms:
+        raise HTTPException(400, "В файле не найдено ни одного термина (пустая колонка EN?).")
+
+    db.query(models.GlossaryTerm).filter(models.GlossaryTerm.project_id == project_id).delete()
+    for i, t in enumerate(terms):
+        db.add(models.GlossaryTerm(
+            project_id=project_id,
+            term_en=t["term_en"],
+            description=t["description"],
+            translations=t["translations"],
+            row_order=i,
+        ))
+    project.glossary_filename = file.filename or "glossary.xlsx"
+    project.glossary_uploaded_at = models._now()
     db.commit()
-    db.refresh(project)
-    return project
+
+    return schemas.GlossaryStatusOut(
+        filename=project.glossary_filename, uploaded_at=project.glossary_uploaded_at, term_count=len(terms)
+    )
+
+
+@app.get("/projects/{project_id}/glossary/status", response_model=schemas.GlossaryStatusOut)
+def glossary_status(project_id: int, db: Session = Depends(get_db)):
+    """Visible to every folder — just enough to see what's loaded, not the
+    full table."""
+    project = _get_project(project_id, db)
+    term_count = db.query(models.GlossaryTerm).filter(models.GlossaryTerm.project_id == project_id).count()
+    return schemas.GlossaryStatusOut(
+        filename=project.glossary_filename, uploaded_at=project.glossary_uploaded_at, term_count=term_count
+    )
 
 
 # ----------------------------------------------------------- languages ----
@@ -187,10 +248,13 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         language = db.get(models.ProjectLanguage, payload.language_id)
         if project is None or language is None or language.project_id != project.id:
             raise HTTPException(404, "Проект или языковая папка не найдены.")
-        glossary = project.glossary
+        # Narrowed to EN + RU + this one language — never the whole glossary.
+        glossary = _glossary_lookup(project.id, db)(language.lang_code)
 
     findings = run_rule_checks(payload.source, payload.translation, payload.checks)
-    findings += await run_ai_checks(payload.source, payload.translation, glossary, payload.checks)
+    findings += await run_ai_checks(
+        payload.source, payload.translation, glossary, payload.checks, payload.extra_instructions
+    )
 
     single_check_id = None
     if language is not None:
@@ -233,7 +297,10 @@ def single_check_history(project_id: int, language_id: int, db: Session = Depend
 
 # ---------------------------------------------------------- multi check ---
 
-DEFAULT_MULTI_CHECKS = ["numbers", "placeholders", "max_length", "glossary", "register", "typo"]
+DEFAULT_MULTI_CHECKS = [
+    "numbers", "placeholders", "max_length", "glossary", "register", "typo",
+    "untranslatable", "completeness", "punctuation",
+]
 
 
 @app.post("/projects/{project_id}/multi-check")
@@ -242,6 +309,10 @@ async def multi_check(
     file: UploadFile = File(...),
     source_lang: str = Form(""),
     manager_name: str = Form(""),
+    extra_instructions: str = Form(""),
+    # Comma-separated check keys from the UI's checkboxes; empty/absent falls
+    # back to the full default set.
+    checks: str = Form(""),
     db: Session = Depends(get_db),
 ):
     project = _get_project(project_id, db)
@@ -255,14 +326,18 @@ async def multi_check(
     if not sheets:
         raise HTTPException(400, "В файле не найдено ни одной колонки с кодом языка.")
 
+    selected_checks = [c.strip() for c in checks.split(",") if c.strip()] or DEFAULT_MULTI_CHECKS
+
     resolved_source = pick_source_lang(sheets, source_lang.strip().lower() or None)
-    results = await run_multi_check(sheets, resolved_source, project.glossary, DEFAULT_MULTI_CHECKS)
+    results = await run_multi_check(
+        sheets, resolved_source, _glossary_lookup(project_id, db), selected_checks, extra_instructions
+    )
 
     record = models.MultiCheck(
         project_id=project_id,
         filename=file.filename or "upload.xlsx",
         source_lang=resolved_source,
-        checks_run=DEFAULT_MULTI_CHECKS,
+        checks_run=selected_checks,
         summary=results["summary"],
         results=results,
         performed_by_name=manager_name.strip(),

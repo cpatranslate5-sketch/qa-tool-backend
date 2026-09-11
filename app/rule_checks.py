@@ -76,6 +76,36 @@ def check_missing(source: str, translation: str) -> list[dict]:
     return []
 
 
+# Terminal punctuation we require to survive translation — the client's
+# stated rule is specifically about a dropped period/exclamation mark, so we
+# don't flag a source that ends in "?" or "…" here, only "." and "!".
+TERMINAL_PUNCT = ".!"
+TERMINAL_PUNCT_ACCEPTABLE = ".!?…"
+
+
+def check_punctuation(source: str, translation: str) -> list[dict]:
+    findings = []
+    src = source.rstrip()
+    tr = translation.rstrip()
+
+    if src and src[-1] in TERMINAL_PUNCT:
+        if not tr or tr[-1] not in TERMINAL_PUNCT_ACCEPTABLE:
+            findings.append({
+                "type": "punctuation",
+                "severity": "low",
+                "message": f"В исходнике в конце стоит «{src[-1]}», а перевод не заканчивается знаком препинания.",
+            })
+
+    if "  " in translation:
+        findings.append({
+            "type": "punctuation",
+            "severity": "low",
+            "message": "В переводе есть двойной пробел.",
+        })
+
+    return findings
+
+
 def run_rule_checks(
     source: str,
     translation: str,
@@ -91,4 +121,6 @@ def run_rule_checks(
         findings += check_placeholders(source, translation)
     if "max_length" in checks:
         findings += check_max_length(translation, max_length)
+    if "punctuation" in checks:
+        findings += check_punctuation(source, translation)
     return findings

@@ -40,6 +40,22 @@ def _is_meta_col(header: str) -> bool:
     return header.strip().lower() in META_COL_NAMES
 
 
+_PAREN_LANG_RE = re.compile(r"^([a-zA-Zа-яА-Я]{2,3})\s*\(([a-zA-Zа-яА-Я0-9]{1,5})\)$")
+
+
+def _normalize_lang_label(label: str) -> str:
+    """Turns a display-style language header like "ES (MX)" or "PT (BR)"
+    into the hyphenated form used everywhere else ("es-mx", "pt-br"), while
+    leaving an already-plain code like "es-mx" or "fr-сi" untouched. Some
+    client files use one style, some the other, so both need to resolve to
+    the same lang_code."""
+    label = label.strip()
+    m = _PAREN_LANG_RE.match(label)
+    if m:
+        return f"{m.group(1).lower()}-{m.group(2).lower()}"
+    return label.lower()
+
+
 def _find_header_row(ws, max_scan: int = 5) -> int:
     best_row, best_score = 1, -1
     for r in range(1, min(max_scan, ws.max_row) + 1):
@@ -79,12 +95,14 @@ def parse_workbook(file_bytes: bytes) -> list[dict]:
                 max_length_col = c
             elif _is_meta_col(label):
                 continue
-            elif " " in label or len(label) > 12:
-                # Looks like prose, not a language code — skip rather than
-                # misread a stray comment column as a "language".
-                unrecognized.append(label)
             else:
-                lang_cols[c] = label.lower()
+                normalized = _normalize_lang_label(label)
+                if " " in normalized or len(normalized) > 12:
+                    # Looks like prose, not a language code — skip rather
+                    # than misread a stray comment column as a "language".
+                    unrecognized.append(label)
+                else:
+                    lang_cols[c] = normalized
 
         if not lang_cols:
             continue
@@ -145,6 +163,7 @@ async def _check_language_for_sheet(
     source_lang: str,
     glossary: str,
     checks: list[str],
+    extra_instructions: str,
     semaphore: asyncio.Semaphore,
 ) -> list[dict]:
     relevant_rows = []
@@ -161,7 +180,7 @@ async def _check_language_for_sheet(
         return []
 
     async with semaphore:
-        ai_findings_by_idx = await run_ai_checks_batch(ai_items, glossary, checks)
+        ai_findings_by_idx = await run_ai_checks_batch(ai_items, glossary, checks, extra_instructions)
 
     out = []
     for idx, row in enumerate(relevant_rows):
@@ -180,7 +199,19 @@ async def _check_language_for_sheet(
     return out
 
 
-async def run_multi_check(sheets: list[dict], source_lang: str, glossary: str, checks: list[str]) -> dict:
+async def run_multi_check(
+    sheets: list[dict],
+    source_lang: str,
+    glossary_for_lang,
+    checks: list[str],
+    extra_instructions: str = "",
+) -> dict:
+    """
+    glossary_for_lang: a callable(lang_code) -> glossary prompt text, already
+    narrowed to EN + RU + that one target language — see app.glossary. Each
+    target language gets its own call, so the AI prompt for e.g. "es-mx"
+    never carries the other 34 languages' glossary rows.
+    """
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
     total_findings = 0
@@ -189,7 +220,9 @@ async def run_multi_check(sheets: list[dict], source_lang: str, glossary: str, c
     for sheet in sheets:
         target_langs = [l for l in sheet["languages"] if l != source_lang]
         tasks = [
-            _check_language_for_sheet(sheet, lang, source_lang, glossary, checks, semaphore)
+            _check_language_for_sheet(
+                sheet, lang, source_lang, glossary_for_lang(lang), checks, extra_instructions, semaphore
+            )
             for lang in target_langs
         ]
         per_lang_results = await asyncio.gather(*tasks) if tasks else []

@@ -43,13 +43,35 @@ class Project(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
-    glossary: Mapped[str] = mapped_column(Text, default="")
     created_by_name: Mapped[str] = mapped_column(String(120), default="")
+    glossary_filename: Mapped[str] = mapped_column(String(300), default="")
+    glossary_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     languages: Mapped[list["ProjectLanguage"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    glossary_terms: Mapped[list["GlossaryTerm"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+
+
+class GlossaryTerm(Base):
+    """One row of the project's master glossary doc: an EN term, an optional
+    free-text description/context, and a translation per target language
+    (keyed by lang_code, e.g. {"ru": "...", "es-mx": "...", ...}). Re-uploading
+    the glossary file replaces all of a project's rows. A check for a given
+    language only ever needs EN + RU + that one target column — see
+    app.glossary.terms_for_language."""
+
+    __tablename__ = "glossary_terms"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    term_en: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    translations: Mapped[dict] = mapped_column(JSON, default=dict)
+    row_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    project: Mapped["Project"] = relationship(back_populates="glossary_terms")
 
 
 class ProjectLanguage(Base):

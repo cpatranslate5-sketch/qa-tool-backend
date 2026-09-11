@@ -1,6 +1,8 @@
-"""Quick local smoke test for the shared-folders / admin model.
-Uses a throwaway SQLite DB (no DATABASE_URL set) and no AI key, so only
-rule-based findings are expected, not AI ones."""
+"""Quick local smoke test for the shared-folders / admin model, the
+structured glossary upload, and the new check types. Uses a throwaway
+SQLite DB (no DATABASE_URL set) and no AI key, so only rule-based findings
+are expected, not AI ones."""
+import io
 import os
 import sys
 
@@ -53,6 +55,7 @@ check("non-admin create project blocked", client.post("/projects", json={"name":
 r = check("admin create project", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}))
 project_id = r.json()["id"]
 assert r.json()["created_by_name"] == "Александр"
+assert r.json()["glossary_filename"] == ""
 
 # --- new project auto-gets the standard set of language folders ---
 r = check("auto-created language folders", client.get(f"/projects/{project_id}/languages"))
@@ -68,43 +71,91 @@ print(f"   {len(auto_langs)} language folders auto-created")
 
 check("duplicate project name", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}), expect=409)
 
-# --- non-admin blocked from glossary edit / adding language ---
-check("non-admin edit glossary blocked", client.put(
-    f"/projects/{project_id}/glossary", json={"glossary": "x", "manager_id": regular_id}
-), expect=403)
-check("non-admin add language blocked", client.post(
-    f"/projects/{project_id}/languages", json={"lang_code": "ru", "manager_id": regular_id}
+r = check("ru language id lookup", client.get(f"/projects/{project_id}/languages"))
+language_id = next(l["id"] for l in r.json() if l["lang_code"] == "ru")
+
+# --- build a glossary workbook matching the agency's real doc shape:
+# EN | Пояснение | RU | ES (MX) | ...
+import openpyxl
+gwb = openpyxl.Workbook()
+gws = gwb.active
+gws.append(["EN", "Пояснение", "RU", "ES (MX)"])
+gws.append(["Mission Rush", "название турнира, не переводить", "Mission Rush", "Mission Rush"])
+gws.append(["Golden Spin", "название бонуса", "Голден Спин", "Golden Spin"])
+gws.append(["$5,000", "формат валюты для примера", "5 000$", "$5,000"])
+gbuf = io.BytesIO()
+gwb.save(gbuf)
+gbuf.seek(0)
+
+check("non-admin glossary upload blocked", client.post(
+    f"/projects/{project_id}/glossary/upload",
+    files={"file": ("glossary.xlsx", gbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": regular_id},
 ), expect=403)
 
-# --- admin sets glossary + adds language ---
-check("admin set glossary", client.put(
-    f"/projects/{project_id}/glossary", json={"glossary": "Mission Rush -> Mission Rush", "manager_id": admin_id}
+gbuf.seek(0)
+r = check("admin glossary upload", client.post(
+    f"/projects/{project_id}/glossary/upload",
+    files={"file": ("glossary.xlsx", gbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": admin_id},
 ))
-r = check("admin add language", client.post(
-    f"/projects/{project_id}/languages", json={"lang_code": "ru", "manager_id": admin_id}
-))
-language_id = r.json()["id"]
+assert r.json()["term_count"] == 3, r.json()
+assert r.json()["filename"] == "glossary.xlsx"
+
+r = check("glossary status (visible to any folder)", client.get(f"/projects/{project_id}/glossary/status"))
+assert r.json()["term_count"] == 3
+
+# --- non-admin blocked from adding language ---
+check("non-admin add language blocked", client.post(
+    f"/projects/{project_id}/languages", json={"lang_code": "xx-test", "manager_id": regular_id}
+), expect=403)
 
 # --- BOTH folders see the same shared project/language (no manager scoping) ---
 r = check("list projects (shared)", client.get("/projects"))
 assert len(r.json()) == 1
 r = check("list languages (shared)", client.get(f"/projects/{project_id}/languages"))
-assert len(r.json()) == 35  # the auto-seeded default set (ru already existed among them)
+assert len(r.json()) == 35
 
-# --- non-admin CAN run a single check ---
-r = check("non-admin single check", client.post("/check", json={
+# --- non-admin CAN run a single check, glossary narrowed to EN+RU+target ---
+r = check("non-admin single check (ru)", client.post("/check", json={
     "source": "The bonus is $50 and expires in 3 days.",
-    "translation": "Бонус составляет $500 и истекает через 3 дня.",
-    "checks": ["numbers", "placeholders", "glossary", "register", "typo"],
+    "translation": "Бонус составляет $500 и истекает через 3 дня",
+    "checks": ["numbers", "placeholders", "glossary", "register", "typo", "untranslatable", "completeness", "punctuation"],
     "project_id": project_id,
     "language_id": language_id,
     "manager_name": "Мария",
 }))
-print("   findings:", r.json()["findings"])
+findings = r.json()["findings"]
+print("   findings:", findings)
+# number mismatch ($50 vs $500) must be caught by the rule-based check
+assert any(f["type"] == "numbers" for f in findings)
+# source ends in "." and translation doesn't -> punctuation rule should fire
+assert any(f["type"] == "punctuation" for f in findings), findings
+
+# --- double space is caught regardless of source ---
+r = check("punctuation: double space", client.post("/check", json={
+    "source": "Hello world.",
+    "translation": "Привет  мир.",
+    "checks": ["punctuation"],
+    "manager_name": "Мария",
+}))
+findings = r.json()["findings"]
+assert any(f["type"] == "punctuation" for f in findings), findings
+
+# --- extra_instructions field is accepted and doesn't break anything ---
+check("check with extra_instructions", client.post("/check", json={
+    "source": "Play Golden Spin now!",
+    "translation": "Играйте в Golden Spin сейчас!",
+    "checks": ["untranslatable"],
+    "project_id": project_id,
+    "language_id": language_id,
+    "extra_instructions": "В этой задаче 'Golden Spin' нужно переводить как 'Голден Спин'.",
+    "manager_name": "Мария",
+}))
 
 # --- history shows who performed it ---
 r = check("history shows attribution", client.get(f"/projects/{project_id}/languages/{language_id}/history"))
-assert len(r.json()) == 1
+assert len(r.json()) == 2  # the ru single check + the extra_instructions one; the double-space check was standalone
 assert r.json()[0]["performed_by_name"] == "Мария"
 print("   performed_by_name:", r.json()[0]["performed_by_name"])
 
@@ -114,7 +165,7 @@ with open(sample_path, "rb") as f:
     r = check("non-admin multi-check upload", client.post(
         f"/projects/{project_id}/multi-check",
         files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        data={"source_lang": "", "manager_name": "Мария"},
+        data={"source_lang": "", "manager_name": "Мария", "extra_instructions": ""},
     ))
 multi_data = r.json()
 multi_check_id = multi_data["multi_check_id"]
@@ -127,11 +178,28 @@ check("multi-check report download", client.get(
     f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx"
 ))
 
+# --- re-uploading the glossary replaces it, doesn't accumulate ---
+gwb2 = openpyxl.Workbook()
+gws2 = gwb2.active
+gws2.append(["EN", "Пояснение", "RU"])
+gws2.append(["Free Spins", "бонусные вращения", "Фриспины"])
+gbuf2 = io.BytesIO()
+gwb2.save(gbuf2)
+gbuf2.seek(0)
+r = check("admin re-uploads glossary (replaces)", client.post(
+    f"/projects/{project_id}/glossary/upload",
+    files={"file": ("glossary2.xlsx", gbuf2, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": admin_id},
+))
+assert r.json()["term_count"] == 1, r.json()
+
 # --- re-running migrations on an already-migrated DB should be a no-op ---
 dbmod.init_db()
 r = check("managers survive re-migration", client.get("/managers"))
 assert len(r.json()) == 2
 r = check("projects survive re-migration", client.get("/projects"))
 assert len(r.json()) == 1
+r = check("glossary survives re-migration", client.get(f"/projects/{project_id}/glossary/status"))
+assert r.json()["term_count"] == 1
 
 print("\nALL SMOKETEST CHECKS PASSED")
