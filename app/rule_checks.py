@@ -53,10 +53,42 @@ def check_placeholders(source: str, translation: str) -> list[dict]:
     return findings
 
 
-def run_rule_checks(source: str, translation: str, checks: list[str]) -> list[dict]:
+def check_max_length(translation: str, max_length: int | None) -> list[dict]:
+    if not max_length:
+        return []
+    length = len(translation)
+    if length > max_length:
+        return [{
+            "type": "max_length",
+            "severity": "medium",
+            "message": f"Перевод длиннее лимита: {length} символов при ограничении {max_length}.",
+        }]
+    return []
+
+
+def check_missing(source: str, translation: str) -> list[dict]:
+    if source.strip() and not translation.strip():
+        return [{
+            "type": "missing",
+            "severity": "high",
+            "message": "Перевод отсутствует.",
+        }]
+    return []
+
+
+def run_rule_checks(
+    source: str,
+    translation: str,
+    checks: list[str],
+    max_length: int | None = None,
+) -> list[dict]:
     findings = []
+    if not translation.strip():
+        return check_missing(source, translation)
     if "numbers" in checks:
         findings += check_numbers(source, translation)
     if "placeholders" in checks:
         findings += check_placeholders(source, translation)
+    if "max_length" in checks:
+        findings += check_max_length(translation, max_length)
     return findings
