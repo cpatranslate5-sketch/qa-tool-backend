@@ -95,6 +95,18 @@ def list_projects(db: Session = Depends(get_db)):
     return db.query(models.Project).order_by(models.Project.name).all()
 
 
+# Every new project starts out with this fixed set of language folders,
+# so the admin doesn't have to add each one by hand. More can still be
+# added afterwards via /projects/{id}/languages for anything not covered
+# here.
+DEFAULT_PROJECT_LANGUAGES = [
+    "en", "ar", "az", "bd", "de", "el", "es", "es-mx", "es-ar", "fr-ci",
+    "hi", "hing", "id", "it", "jp", "kz", "ko", "kg", "mr", "ms", "pl",
+    "pt-br", "ro", "ru", "sw", "te", "tj", "th", "tl", "tr", "ua", "ur",
+    "uz", "vi", "cn",
+]
+
+
 @app.post("/projects", response_model=schemas.ProjectOut)
 def create_project(payload: schemas.ProjectIn, db: Session = Depends(get_db)):
     manager = _require_admin(payload.manager_id, db)
@@ -106,6 +118,9 @@ def create_project(payload: schemas.ProjectIn, db: Session = Depends(get_db)):
         raise HTTPException(409, "Проект с таким названием уже есть.")
     project = models.Project(name=name, created_by_name=manager.name)
     db.add(project)
+    db.flush()  # assigns project.id, without committing yet
+    for code in DEFAULT_PROJECT_LANGUAGES:
+        db.add(models.ProjectLanguage(project_id=project.id, lang_code=code))
     db.commit()
     db.refresh(project)
     return project

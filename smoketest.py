@@ -54,6 +54,18 @@ r = check("admin create project", client.post("/projects", json={"name": "Pragma
 project_id = r.json()["id"]
 assert r.json()["created_by_name"] == "Александр"
 
+# --- new project auto-gets the standard set of language folders ---
+r = check("auto-created language folders", client.get(f"/projects/{project_id}/languages"))
+auto_langs = {l["lang_code"] for l in r.json()}
+expected = {
+    "en", "ar", "az", "bd", "de", "el", "es", "es-mx", "es-ar", "fr-ci",
+    "hi", "hing", "id", "it", "jp", "kz", "ko", "kg", "mr", "ms", "pl",
+    "pt-br", "ro", "ru", "sw", "te", "tj", "th", "tl", "tr", "ua", "ur",
+    "uz", "vi", "cn",
+}
+assert auto_langs == expected, f"missing: {expected - auto_langs}, extra: {auto_langs - expected}"
+print(f"   {len(auto_langs)} language folders auto-created")
+
 check("duplicate project name", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}), expect=409)
 
 # --- non-admin blocked from glossary edit / adding language ---
@@ -77,7 +89,7 @@ language_id = r.json()["id"]
 r = check("list projects (shared)", client.get("/projects"))
 assert len(r.json()) == 1
 r = check("list languages (shared)", client.get(f"/projects/{project_id}/languages"))
-assert len(r.json()) == 1
+assert len(r.json()) == 35  # the auto-seeded default set (ru already existed among them)
 
 # --- non-admin CAN run a single check ---
 r = check("non-admin single check", client.post("/check", json={
