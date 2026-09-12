@@ -11,6 +11,7 @@ import re
 import openpyxl
 
 from app.claude_client import (
+    _filter_findings_by_checks,
     _model_for_lang,
     build_batch_prompt,
     create_message_batch,
@@ -539,7 +540,11 @@ def build_batch_plan(
             "row_count": len(sheet["rows"]),
         })
 
-    skeleton = {"sheets": skeleton_sheets, "source_lang": source_lang}
+    # checks rides along in the skeleton so finalize_batch_results (called
+    # later, sometimes in a completely different request once the
+    # Anthropic batch has ended) can still filter the model's response to
+    # only what was actually asked for.
+    skeleton = {"sheets": skeleton_sheets, "source_lang": source_lang, "checks": checks}
     return requests, skeleton
 
 
@@ -562,6 +567,13 @@ def finalize_batch_results(skeleton: dict, ai_text_by_custom_id: dict[str, str |
                 # JSON round-trips dict keys as strings — restore int keys.
                 number_to_index = {int(k): v for k, v in lang_skel["number_to_index"].items()}
                 ai_grouped = group_batch_findings(raw, number_to_index)
+                # Guarantees the model's response never smuggles in a check
+                # type the manager didn't ask for, even if it ignored the
+                # prompt's instruction to stick to the requested list.
+                ai_grouped = {
+                    idx: _filter_findings_by_checks(fs, skeleton.get("checks", []))
+                    for idx, fs in ai_grouped.items()
+                }
 
             findings_list = []
             for idx, row in enumerate(lang_skel["rows"]):

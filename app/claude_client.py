@@ -63,11 +63,12 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 {extra_instructions}
 
 Что проверять: {checks_description}
+Даже если заметишь другую проблему вне этого списка (в т.ч. очевидную) — не включай её в ответ, для неё есть отдельная проверка.
 
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет):
 [
-  {{"type": "glossary|numerals|register|typo|untranslatable|completeness", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
+  {{"type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
 ]"""
 
 BATCH_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны пары (контекст, исходный текст, перевод) на один целевой язык.
@@ -86,6 +87,7 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 {extra_instructions}
 
 Что проверять: {checks_description}
+Даже если заметишь другую проблему вне этого списка (в т.ч. очевидную) — не включай её в ответ, для неё есть отдельная проверка.
 
 Пары для проверки:
 {pairs_block}
@@ -93,7 +95,7 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 Верни ТОЛЬКО валидный JSON-массив по всем парам без markdown и пояснений, строго в этой форме
 (пустой массив [], если нигде нет проблем; не включай пары без проблем):
 [
-  {{"row": <номер пары из списка выше>, "type": "glossary|numerals|register|typo|untranslatable|completeness", "severity": "low|medium|high", "message": "конкретное описание на русском"}}
+  {{"row": <номер пары из списка выше>, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском"}}
 ]"""
 
 
@@ -163,6 +165,22 @@ def _checks_description(checks: list[str], numeral_rule: dict | None = None, ton
     return "; ".join(labels) if labels else None
 
 
+def _allowed_ai_types(checks: list[str]) -> set[str]:
+    """The finding "type" values this run is actually allowed to return —
+    whatever was requested, restricted to the AI check types that exist at
+    all. Used as a hard filter on the model's response: the prompt already
+    tells the model to check only these, but a model doesn't always listen
+    perfectly (a glaring, unrelated problem can slip through anyway), so
+    this guarantees a check the manager didn't ask for never shows up in
+    the results, rather than just hoping the prompt was followed."""
+    return {c for c in checks if c in CHECK_LABELS}
+
+
+def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[dict]:
+    allowed = _allowed_ai_types(checks)
+    return [f for f in findings if f.get("type") in allowed]
+
+
 # Languages that get the stronger CLAUDE_MODEL_HARD instead of the default
 # CLAUDE_MODEL — agreed with Александр after costing out the difference
 # (Sonnet is exactly ~2x Haiku per token, but only these languages' calls
@@ -230,9 +248,10 @@ async def run_ai_checks(
         glossary=glossary.strip() or "не указан",
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description,
+        type_enum="|".join(sorted(_allowed_ai_types(checks))),
     )
     text_block = await _call_claude(prompt, model=_model_for_lang(target_lang))
-    return parse_json_array(text_block)
+    return _filter_findings_by_checks(parse_json_array(text_block), checks)
 
 
 def build_batch_prompt(
@@ -283,6 +302,7 @@ def build_batch_prompt(
         glossary=glossary.strip() or "не указан",
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description,
+        type_enum="|".join(sorted(_allowed_ai_types(checks))),
         pairs_block=pairs_block,
     )
     number_to_index = {n: idx for n, (idx, _) in enumerate(checkable, start=1)}
@@ -322,7 +342,8 @@ async def run_ai_checks_batch(
         return {}
     text_block = await _call_claude(prompt, model=_model_for_lang(target_lang))
     raw = parse_json_array(text_block)
-    return group_batch_findings(raw, number_to_index)
+    grouped = group_batch_findings(raw, number_to_index)
+    return {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
 
 
 # --------------------------------------------------- Message Batches API ---

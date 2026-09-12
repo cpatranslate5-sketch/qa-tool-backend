@@ -2,6 +2,7 @@
 structured glossary/numerals/tone documents, and the new check types. Uses
 a throwaway SQLite DB (no DATABASE_URL set) and no AI key, so only
 rule-based findings are expected, not AI ones."""
+import asyncio
 import io
 import os
 import sys
@@ -580,5 +581,78 @@ for normal in ["ru", "es-mx", "en", "de-DE", "fr"]:
     assert _model_for_lang(normal) == settings.CLAUDE_MODEL, normal
 print("[OK] _model_for_lang: confirmed hard-language list (kk/ky/tg/uz/sw/te/mr/az) "
       "routes to CLAUDE_MODEL_HARD by base subtag, everything else to CLAUDE_MODEL")
+
+# --- numbers check: a correctly localized decimal comma or zero-padded
+# hour must NOT be flagged as a mismatch — Александр hit this live: an
+# Azerbaijani translation writing "0,40" for the source's "$0.40" and
+# "03:00" for the source's "3:00" was flagged "numbers" even though
+# nothing was actually mistranslated, just correctly reformatted. ---
+from app.rule_checks import check_numbers
+
+az_source = (
+    "To participate in the tournament, you must confirm participation in any game from the list, "
+    "place bets from $0.40, and complete missions. The tournament runs from 09/22/2026 (3:00 UTC) "
+    "to 09/28/2026 (22:59 UTC). The full rules are available in the in-game menu. Minimum bet: $0.40"
+)
+az_translation = (
+    "Turnirdə iştirak etmək üçün siyahıdakı istənilən oyunda iştirakınızı təsdiqləməli, 0,40 ₼ və "
+    "daha çox mərc etməli və missiyaları yerinə yetirməlisiniz. Turnir from 22/09/2026 (03:00 UTC) – "
+    "28/09/2026 (22:59 UTC) tarixləri arasında keçirilir. Tam qaydaları oyun içi menyuda oxuya "
+    "bilərsiniz. Min. mərc: 0,40 ₼"
+)
+assert check_numbers(az_source, az_translation) == [], check_numbers(az_source, az_translation)
+# A genuine mismatch (thousands grouping aside — see below) must still fire.
+assert check_numbers("The bonus is $50.", "Бонус составляет $500.") != []
+# A comma used to GROUP thousands (not as a decimal separator) is left
+# alone — "50,000" really is a different number from "50" if unmatched.
+assert check_numbers("$50,000 prize", "50 тысяч приз") != []
+print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no longer "
+      "false-flagged as a numbers mismatch; real mismatches and thousands-grouping still caught")
+
+# --- AI findings are hard-filtered to only the checks actually requested,
+# even if the model ignores the prompt's instruction and reports something
+# else anyway (Александр hit this live: with only "Нумералс" ticked, the
+# result still contained "untranslatable" findings) ---
+from app.claude_client import _allowed_ai_types, _filter_findings_by_checks, run_ai_checks
+import app.claude_client as claude_client_mod
+
+assert _allowed_ai_types(["numerals"]) == {"numerals"}
+assert _allowed_ai_types(["numerals", "punctuation", "max_length"]) == {"numerals"}  # rule checks aren't AI types
+
+raw_findings = [
+    {"type": "numerals", "severity": "medium", "message": "формат валюты не совпадает"},
+    {"type": "untranslatable", "severity": "high", "message": "слово не переведено"},
+]
+assert _filter_findings_by_checks(raw_findings, ["numerals"]) == [raw_findings[0]]
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+captured_prompts = []
+
+
+async def _fake_call_claude(prompt, model=None):
+    captured_prompts.append(prompt)
+    # Simulates a model that ignores "проверяй только numerals" and
+    # reports an untranslatable-text issue anyway.
+    return (
+        '[{"type": "numerals", "severity": "medium", "message": "формат валюты не совпадает"},'
+        '{"type": "untranslatable", "severity": "high", "message": "слово не переведено"}]'
+    )
+
+
+claude_client_mod._call_claude = _fake_call_claude
+findings = asyncio.get_event_loop().run_until_complete(
+    run_ai_checks(
+        "source", "translation", "", ["numerals"], target_lang="az-az",
+        numeral_rule={"формат валюты": "0,40 ₼"},
+    )
+)
+assert findings == [raw_findings[0]], findings
+# The JSON schema shown to the model is also scoped down to just the
+# requested check(s), not a fixed always-all-6 list.
+type_enum_line = next(line for line in captured_prompts[0].splitlines() if '"type":' in line)
+assert "numerals" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
+settings.ANTHROPIC_API_KEY = ""
+print("[OK] AI findings hard-filtered to requested checks even when the model reports "
+      "an out-of-scope finding anyway (prompt's type list is also scoped down, in addition)")
 
 print("\nALL SMOKETEST CHECKS PASSED")

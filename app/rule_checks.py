@@ -11,6 +11,31 @@ NUMBER_RE = re.compile(r"\d[\d.,]*\d|\d")
 # Common placeholder styles: {name}, {{name}}, %s, %1$s, <tag>...</tag>, [tag]
 PLACEHOLDER_RE = re.compile(r"\{\{?[^}]+\}?\}|%\d*\$?[sd]|<[^>]+>|\[[^\]]+\]")
 
+# A comma used as a DECIMAL separator, e.g. "0,40" (kopecks/cents,
+# Russian/Azerbaijani-style) — matched only when 1-2 digits follow the
+# comma, so it's never confused with a comma used to GROUP thousands
+# (e.g. "50,000"), which really is a different number if it doesn't match.
+_DECIMAL_COMMA_RE = re.compile(r"^(\d+),(\d{1,2})$")
+
+
+def _normalize_number(tok: str) -> str:
+    """Normalizes cosmetic-only formatting differences that are *expected*
+    to differ between source and a correctly localized translation, so
+    they aren't flagged as a real numbers mismatch:
+      - a decimal comma ("0,40") is unified with a decimal point ("0.40") —
+        the source is usually English (period), while many of the agency's
+        target languages correctly use a comma for the same value.
+      - a leading zero on an otherwise-plain digit run ("03" for a
+        zero-padded hour) is unified with its unpadded form ("3") — both
+        are the same time, just padded differently.
+    Real numeric differences (50 vs 500, 0.40 vs 0.04) are untouched and
+    still compare as different."""
+    m = _DECIMAL_COMMA_RE.match(tok)
+    normalized = f"{m.group(1)}.{m.group(2)}" if m else tok
+    if "." not in normalized and len(normalized) > 1:
+        normalized = normalized.lstrip("0") or "0"
+    return normalized
+
 
 def _extract_numbers(text: str) -> list[str]:
     return NUMBER_RE.findall(text)
@@ -24,7 +49,7 @@ def check_numbers(source: str, translation: str) -> list[dict]:
     src_nums = _extract_numbers(source)
     tr_nums = _extract_numbers(translation)
     findings = []
-    if sorted(src_nums) != sorted(tr_nums):
+    if sorted(map(_normalize_number, src_nums)) != sorted(map(_normalize_number, tr_nums)):
         findings.append({
             "type": "numbers",
             "severity": "high",
