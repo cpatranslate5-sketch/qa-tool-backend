@@ -11,8 +11,10 @@ import re
 import openpyxl
 
 from app.claude_client import (
+    _ai_failure_warning,
     _filter_findings_by_checks,
     _model_for_lang,
+    _truncation_warning,
     _usage_cost,
     build_batch_prompt,
     create_message_batch,
@@ -352,7 +354,7 @@ async def _check_language_for_sheet(
         return [], 0.0
 
     async with semaphore:
-        ai_findings_by_idx, cost_usd = await run_ai_checks_batch(
+        ai_findings_by_idx, cost_usd, truncated = await run_ai_checks_batch(
             ai_items, checks, extra_instructions, tone_register, lang, source_lang
         )
 
@@ -370,6 +372,19 @@ async def _check_language_for_sheet(
                 "translation": tgt,
                 "findings": findings,
             })
+    if truncated:
+        # The model's response for this language got cut off mid-array —
+        # some rows may never have been checked by it at all. Surfaced as
+        # its own synthetic entry rather than silently showing whatever
+        # partial findings survived as if they were the complete picture
+        # (see Александр's "incomplete report" on a large Spanish upload).
+        out.append({
+            "excel_row": 0,
+            "context": "⚠ Системное предупреждение",
+            "source": "",
+            "translation": "",
+            "findings": [_truncation_warning()],
+        })
     return out, cost_usd
 
 
@@ -576,21 +591,37 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
         languages_out = {}
         for lang, lang_skel in sheet["languages"].items():
             ai_grouped: dict[int, list[dict]] = {}
+            warning_finding = None
             custom_id = lang_skel["custom_id"]
             if custom_id is not None:
-                ai_result = ai_results_by_custom_id.get(custom_id) or {}
-                raw = parse_json_array(ai_result.get("text"))
-                # JSON round-trips dict keys as strings — restore int keys.
-                number_to_index = {int(k): v for k, v in lang_skel["number_to_index"].items()}
-                ai_grouped = group_batch_findings(raw, number_to_index)
-                # Guarantees the model's response never smuggles in a check
-                # type the manager didn't ask for, even if it ignored the
-                # prompt's instruction to stick to the requested list.
-                ai_grouped = {
-                    idx: _filter_findings_by_checks(fs, skeleton.get("checks", []))
-                    for idx, fs in ai_grouped.items()
-                }
-                total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
+                ai_result = ai_results_by_custom_id.get(custom_id)
+                if ai_result is None:
+                    # Expected result never showed up in the batch's .jsonl
+                    # at all — same class of silent data loss as an
+                    # errored/expired request, so it gets the same warning
+                    # rather than quietly counting as "nothing found".
+                    warning_finding = _ai_failure_warning("результат не получен")
+                elif ai_result.get("result_type") != "succeeded":
+                    warning_finding = _ai_failure_warning(ai_result.get("result_type") or "неизвестная ошибка")
+                else:
+                    raw = parse_json_array(ai_result.get("text"))
+                    # JSON round-trips dict keys as strings — restore int keys.
+                    number_to_index = {int(k): v for k, v in lang_skel["number_to_index"].items()}
+                    ai_grouped = group_batch_findings(raw, number_to_index)
+                    # Guarantees the model's response never smuggles in a check
+                    # type the manager didn't ask for, even if it ignored the
+                    # prompt's instruction to stick to the requested list.
+                    ai_grouped = {
+                        idx: _filter_findings_by_checks(fs, skeleton.get("checks", []))
+                        for idx, fs in ai_grouped.items()
+                    }
+                    if ai_result.get("stop_reason") == "max_tokens":
+                        # Response got cut off mid-array — some rows may
+                        # never have been checked by the AI at all (see
+                        # Александр's "incomplete Spanish report").
+                        warning_finding = _truncation_warning()
+                if ai_result is not None:
+                    total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
 
             findings_list = []
             for idx, row in enumerate(lang_skel["rows"]):
@@ -603,6 +634,14 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                         "translation": row["translation"],
                         "findings": findings,
                     })
+            if warning_finding is not None:
+                findings_list.append({
+                    "excel_row": 0,
+                    "context": "⚠ Системное предупреждение",
+                    "source": "",
+                    "translation": "",
+                    "findings": [warning_finding],
+                })
             languages_out[lang] = findings_list
             total_findings += sum(len(f["findings"]) for f in findings_list)
 

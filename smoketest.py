@@ -279,11 +279,14 @@ async def _fake_get_batch_results(results_url):
     assert results_url == "fake://results"
     # One fake AI finding for the "ru" target language of the (only) sheet —
     # custom_id format is "s{sheet_index}-{lang}" (see build_batch_plan).
-    # Shape matches the real get_batch_results: {custom_id: {"text": ..., "usage": ...}}.
+    # Shape matches the real get_batch_results: {custom_id: {"text": ...,
+    # "usage": ..., "stop_reason": ..., "result_type": ...}}.
     return {
         "s0-ru": {
             "text": '[{"row": 1, "type": "typo", "severity": "medium", "message": "тестовая ИИ-находка"}]',
             "usage": {"input_tokens": 1000, "output_tokens": 200},
+            "stop_reason": "end_turn",
+            "result_type": "succeeded",
         }
     }
 
@@ -624,7 +627,7 @@ async def _fake_call_claude(prompt, model=None):
         '[{"type": "typo", "severity": "medium", "message": "неверная валюта в переводе"},'
         '{"type": "untranslatable", "severity": "high", "message": "слово не переведено"}]'
     )
-    return (text, {"input_tokens": 500, "output_tokens": 100})
+    return (text, {"input_tokens": 500, "output_tokens": 100}, "end_turn")
 
 
 claude_client_mod._call_claude = _fake_call_claude
@@ -641,6 +644,86 @@ type_enum_line = next(line for line in captured_prompts[0].splitlines() if '"typ
 assert "typo" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
 print("[OK] AI findings hard-filtered to requested checks even when the model reports "
       "an out-of-scope finding anyway (prompt's type list is also scoped down, in addition)")
+
+# --- a truncated JSON response (the model hit the max_tokens ceiling
+# mid-array) must not lose every finding that came before the cut — only
+# the incomplete trailing entry is dropped, everything complete survives —
+# and callers must be told the response was truncated at all, rather than
+# a partial result silently looking like a complete "checked, nothing
+# else" report. Александр hit exactly this: a large Spanish multi-check
+# came back with an incomplete report and no indication anything was cut
+# short. ---
+from app.claude_client import parse_json_array, _truncation_warning, _ai_failure_warning
+
+truncated_text = (
+    '[{"type": "typo", "severity": "medium", "message": "первая находка"},'
+    '{"type": "typo", "severity": "high", "message": "вторая находка"},'
+    '{"type": "typo", "sever'  # cut off mid-object, exactly as a max_tokens cutoff would do
+)
+salvaged = parse_json_array(truncated_text)
+assert len(salvaged) == 2, salvaged
+assert salvaged[0]["message"] == "первая находка" and salvaged[1]["message"] == "вторая находка", salvaged
+print("[OK] parse_json_array: a JSON array cut off mid-object (max_tokens truncation) "
+      "keeps every complete finding before the cut instead of losing the whole response")
+
+
+async def _fake_call_claude_truncated(prompt, model=None):
+    return ('[{"type": "typo", "severity": "medium", "message": "неверная валюта"}]',
+            {"input_tokens": 500, "output_tokens": 100}, "max_tokens")
+
+
+claude_client_mod._call_claude = _fake_call_claude_truncated
+findings_trunc, _ = asyncio.get_event_loop().run_until_complete(
+    run_ai_checks("source", "translation", ["typo"], target_lang="az-az")
+)
+assert any(f["type"] == "system" for f in findings_trunc), findings_trunc
+claude_client_mod._call_claude = _fake_call_claude
+print("[OK] run_ai_checks adds a visible system warning whenever the AI response was "
+      "cut off by the max_tokens ceiling, instead of silently showing a partial result")
+
+# --- same guarantee on the async Message Batches merge path
+# (finalize_batch_results): a language whose batch response was truncated,
+# or whose request errored/expired/never came back at all, gets a visible
+# warning finding rather than silently showing as "checked, nothing found".
+from app.excel_multi import finalize_batch_results
+
+fake_skeleton = {
+    "checks": ["typo"],
+    "source_lang": "en",
+    "sheets": [{
+        "sheet_name": "Sheet1",
+        "target_langs": ["es-mx", "fr", "de"],
+        "unrecognized_columns": [],
+        "row_count": 1,
+        "languages": {
+            "es-mx": {
+                "custom_id": "s0-es-mx", "model": "claude-haiku-4-5-20251001",
+                "number_to_index": {}, "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
+            },
+            "fr": {
+                "custom_id": "s0-fr", "model": "claude-haiku-4-5-20251001",
+                "number_to_index": {}, "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
+            },
+            "de": {
+                # never made it into the results at all (e.g. dropped between submit and poll)
+                "custom_id": "s0-de", "model": "claude-haiku-4-5-20251001",
+                "number_to_index": {}, "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
+            },
+        },
+    }],
+}
+fake_batch_results = {
+    "s0-es-mx": {"text": "[", "usage": {"input_tokens": 10, "output_tokens": 8000}, "stop_reason": "max_tokens", "result_type": "succeeded"},
+    "s0-fr": {"text": None, "usage": {}, "stop_reason": None, "result_type": "errored"},
+    # "s0-de" deliberately absent
+}
+merged = finalize_batch_results(fake_skeleton, fake_batch_results)
+by_lang = merged["sheets"][0]["languages"]
+assert any(f["type"] == "system" for row in by_lang["es-mx"] for f in row["findings"]), by_lang["es-mx"]
+assert any(f["type"] == "system" for row in by_lang["fr"] for f in row["findings"]), by_lang["fr"]
+assert any(f["type"] == "system" for row in by_lang["de"] for f in row["findings"]), by_lang["de"]
+print("[OK] finalize_batch_results: a truncated, errored, or missing-entirely batch result "
+      "each surface a visible system warning instead of silently reporting as clean")
 
 # --- the /check endpoint itself surfaces the real AI cost, not just the
 # internal run_ai_checks helper (Александр asked to see the cost of each

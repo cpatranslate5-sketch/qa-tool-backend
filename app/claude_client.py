@@ -227,12 +227,27 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
     return cost * BATCH_PRICE_DISCOUNT if batch else cost
 
 
-async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | None, dict]:
-    """Returns (response_text, usage) — usage is Anthropic's raw {"input_tokens":
-    int, "output_tokens": int, ...} dict (empty when no API key is configured),
-    used by callers to compute and surface this check's actual API cost."""
+# Generous headroom for a batch prompt covering many rows of one language
+# at once (see excel_multi.build_batch_plan — one prompt per language, not
+# per row) — raising this costs nothing by itself (Anthropic bills actual
+# tokens generated, not the max_tokens ceiling), and a low ceiling is
+# exactly what caused Александр's "incomplete report": a large language's
+# response hit the old 8000-token cap mid-array and every finding after
+# the cut point was silently lost. Comfortably under both models' real
+# output limits (Haiku 4.5: 64K; Sonnet: even higher).
+AI_MAX_TOKENS = 32000
+
+
+async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | None, dict, str | None]:
+    """Returns (response_text, usage, stop_reason) — usage is Anthropic's raw
+    {"input_tokens": int, "output_tokens": int, ...} dict (empty when no API
+    key is configured), used by callers to compute and surface this check's
+    actual API cost. stop_reason is "max_tokens" when the response was cut
+    off mid-generation (the response is then incomplete/truncated JSON) —
+    callers use this to warn rather than silently show a partial result as
+    if it were complete."""
     if not settings.ANTHROPIC_API_KEY:
-        return None, {}
+        return None, {}, None
     resolved_model = model or settings.CLAUDE_MODEL
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
@@ -244,7 +259,7 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
             },
             json={
                 "model": resolved_model,
-                "max_tokens": 8000,
+                "max_tokens": AI_MAX_TOKENS,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
@@ -252,7 +267,49 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
         data = resp.json()
 
     text = next((b["text"] for b in data.get("content", []) if b.get("type") == "text"), None)
-    return text, data.get("usage", {})
+    return text, data.get("usage", {}), data.get("stop_reason")
+
+
+def _salvage_json_objects(text: str) -> list:
+    """Best-effort recovery when the model's JSON array response got cut off
+    mid-array (hit max_tokens) — rather than losing every finding in the
+    batch just because the last entry is incomplete, scans for complete
+    top-level {...} objects (respecting quoted strings, so a brace inside a
+    message string doesn't confuse the count) and parses each on its own,
+    keeping whatever came through whole and discarding only the truncated
+    tail."""
+    objects = []
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                try:
+                    obj = json.loads(candidate)
+                    if isinstance(obj, dict):
+                        objects.append(obj)
+                except Exception:
+                    pass
+                start = None
+    return objects
 
 
 def parse_json_array(text_block: str | None) -> list:
@@ -265,7 +322,48 @@ def parse_json_array(text_block: str | None) -> list:
             return result
     except Exception:
         pass
-    return []
+    return _salvage_json_objects(cleaned)
+
+
+def _truncation_warning() -> dict:
+    """A synthetic finding (not from the model) injected whenever a
+    response was cut off by the max_tokens ceiling — makes an otherwise
+    silent, partial result visible instead of just looking like a clean
+    "no problems found" report."""
+    return {
+        "type": "system",
+        "severity": "high",
+        "message": (
+            "Ответ ИИ был обрезан из-за большого объёма материала (слишком много текста и/или находок "
+            "для одного запроса) — часть строк могла остаться непроверенной нейросетью. Бесплатные "
+            "автоматические проверки (числа, теги, пунктуация) при этом всё равно отработали по всем "
+            "строкам. Попробуйте проверить этот язык отдельно от остальных или уменьшить число выбранных "
+            "критериев за один прогон."
+        ),
+    }
+
+
+_AI_FAILURE_REASONS_RU = {
+    "errored": "ошибка на стороне ИИ-сервиса",
+    "expired": "истекло время ожидания ответа",
+    "canceled": "запрос был отменён",
+}
+
+
+def _ai_failure_warning(reason: str) -> dict:
+    """A synthetic finding for when the AI request for a language never
+    produced any usable result at all (errored/expired/canceled batch
+    request, or a result that never came back) — otherwise this looks
+    identical to "checked, nothing found"."""
+    return {
+        "type": "system",
+        "severity": "high",
+        "message": (
+            f"ИИ-проверка для этого языка не выполнилась ({_AI_FAILURE_REASONS_RU.get(reason, reason)}) — "
+            "свяжитесь с нами, чтобы разобраться. Бесплатные автоматические проверки всё равно "
+            "отработали по всем строкам."
+        ),
+    }
 
 
 async def run_ai_checks(
@@ -290,8 +388,10 @@ async def run_ai_checks(
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
     )
     model = _model_for_lang(target_lang)
-    text_block, usage = await _call_claude(prompt, model=model)
+    text_block, usage, stop_reason = await _call_claude(prompt, model=model)
     findings = _filter_findings_by_checks(parse_json_array(text_block), checks)
+    if stop_reason == "max_tokens":
+        findings = findings + [_truncation_warning()]
     return findings, _usage_cost(model, usage)
 
 
@@ -368,20 +468,23 @@ async def run_ai_checks_batch(
     tone_register: str = "",
     target_lang: str = "",
     source_lang: str = "",
-) -> tuple[dict[int, list[dict]], float]:
+) -> tuple[dict[int, list[dict]], float, bool]:
     """Synchronous path: builds the prompt, calls Claude right away, and
-    returns (findings keyed by index into items, this call's cost_usd)."""
+    returns (findings keyed by index into items, this call's cost_usd,
+    whether the response was truncated by the max_tokens ceiling — the
+    caller adds a visible warning for that rather than presenting a
+    partial result as a complete one)."""
     prompt, number_to_index = build_batch_prompt(
         items, checks, extra_instructions, tone_register, target_lang, source_lang
     )
     if prompt is None:
-        return {}, 0.0
+        return {}, 0.0, False
     model = _model_for_lang(target_lang)
-    text_block, usage = await _call_claude(prompt, model=model)
+    text_block, usage, stop_reason = await _call_claude(prompt, model=model)
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
-    return filtered, _usage_cost(model, usage)
+    return filtered, _usage_cost(model, usage), stop_reason == "max_tokens"
 
 
 # --------------------------------------------------- Message Batches API ---
@@ -415,7 +518,7 @@ async def create_message_batch(requests: list[dict]) -> str | None:
             "custom_id": r["custom_id"],
             "params": {
                 "model": r.get("model") or settings.CLAUDE_MODEL,
-                "max_tokens": 8000,
+                "max_tokens": AI_MAX_TOKENS,
                 "messages": [{"role": "user", "content": r["prompt"]}],
             },
         }
@@ -438,10 +541,14 @@ async def get_batch_status(batch_id: str) -> dict:
 
 async def get_batch_results(results_url: str) -> dict[str, dict]:
     """Fetches and parses the batch's .jsonl results. Returns
-    {custom_id: {"text": str | None, "usage": dict}} — text is None for any
-    request that errored, expired, or was canceled (extremely unlikely, but
-    handled rather than crashing the whole multi-check over one bad
-    language); usage is {} in that case too, same as a missing-key cost."""
+    {custom_id: {"text": str | None, "usage": dict, "stop_reason": str |
+    None, "result_type": str | None}}. text/usage/stop_reason are None/{}/
+    None for any request that errored, expired, or was canceled — handled
+    rather than crashing the whole multi-check over one bad language, but
+    result_type is passed through either way so the caller (see
+    excel_multi.finalize_batch_results) can tell that case apart from a
+    genuine "checked, nothing found" and surface it instead of staying
+    silent about it."""
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.get(results_url, headers=_headers())
         resp.raise_for_status()
@@ -457,11 +564,14 @@ async def get_batch_results(results_url: str) -> dict[str, dict]:
         if custom_id is None:
             continue
         result = entry.get("result", {})
+        result_type = result.get("type")
         text = None
         usage = {}
-        if result.get("type") == "succeeded":
+        stop_reason = None
+        if result_type == "succeeded":
             message = result.get("message", {})
             text = next((b["text"] for b in message.get("content", []) if b.get("type") == "text"), None)
             usage = message.get("usage", {})
-        out[custom_id] = {"text": text, "usage": usage}
+            stop_reason = message.get("stop_reason")
+        out[custom_id] = {"text": text, "usage": usage, "stop_reason": stop_reason, "result_type": result_type}
     return out
