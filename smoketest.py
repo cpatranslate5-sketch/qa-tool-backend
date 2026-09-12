@@ -222,6 +222,23 @@ print("   summary:", multi_data["summary"])
 # just the rule-based findings, same as the old fully-synchronous behavior.
 assert multi_data["status"] == "completed", multi_data
 
+# --- detect-languages: the target-language checkbox list must come from
+# the UPLOADED FILE's own columns, not only from the project's Tone
+# document — Александр hit a real gap where English simply had no row in
+# his Tone document (it rarely needs a ты/вы-style rule) and so never
+# appeared as a selectable target at all, no matter what the file
+# contained. This endpoint is what lets the frontend show the file's own
+# languages instead. ---
+with open(sample_path, "rb") as f:
+    r = check("detect-languages reports the file's own language columns", client.post(
+        f"/projects/{project_id}/multi-check/detect-languages",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    ))
+detected = r.json()["languages"]
+assert "ru" in detected, detected
+assert len(detected) > 2, detected  # this sample file spans many target languages
+print(f"   detected languages: {detected}")
+
 # --- target_langs filter: checking just 2 of the file's many languages
 # should only touch those 2 in the summary ---
 with open(sample_path, "rb") as f:
@@ -541,6 +558,26 @@ assert check_numbers("Prize: $1,500,000", "Приз: $1500000") == []
 assert check_numbers("Win up to $1,400 today", "Выиграйте до $1,500 сегодня") != []
 print("[OK] check_numbers: a thousands-grouping comma can be freely added or dropped "
       "without being flagged, while an actually different grouped number is still caught")
+
+# --- a SPACE is just as legitimate a thousands separator as a comma —
+# it's how Russian formats a big number ("1 500 000") — but NUMBER_RE
+# can't include a bare space (that would merge unrelated numbers separated
+# by ordinary whitespace). Александр hit this live in a real prize-table
+# promo: every single big number came back "different" between Russian
+# ("1 500 000") and English/Spanish ("1,500,000") for no reason at all. ---
+assert check_numbers("1st place — 1,500,000 ARS", "1 место — 1 500 000 ARS") == []
+assert check_numbers("Prize: 90,000 ARS", "Приз: 90 000 ARS") == []
+# An actually different space-grouped number must still be caught, and the
+# message must point at the specific numbers that differ, not dump every
+# number in the text — a long paragraph can have 20+ numbers where only
+# one is actually wrong.
+mismatch = check_numbers("70th-99th place — 70,000 ARS", "С 70 по 99 место — 72 000 ARS")
+assert mismatch, mismatch
+assert "70000" in mismatch[0]["message"] and "72000" in mismatch[0]["message"], mismatch
+print("[OK] check_numbers: a space used to group thousands (standard Russian formatting) "
+      "is treated the same as a comma — freely interchangeable without being flagged — "
+      "while an actually different number is still caught, and the message names the "
+      "specific number(s) that differ rather than dumping the whole list")
 
 # --- a DATE must not be flagged just because the target language writes
 # the day/month/year in a different order and/or with a different

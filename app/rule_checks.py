@@ -6,6 +6,7 @@ matching between source/translation, and placeholders/tags getting lost
 or corrupted in translation.
 """
 import re
+from collections import Counter
 
 NUMBER_RE = re.compile(r"\d[\d.,]*\d|\d")
 # Common placeholder styles: {name}, {{name}}, %s, %1$s, <tag>...</tag>, [tag]
@@ -25,6 +26,25 @@ _DECIMAL_COMMA_RE = re.compile(r"^(\d+),(\d{1,2})$")
 # NUMBER_RE never captures as part of the number to begin with), so "1,400"
 # and "1400" are the same value and must compare equal.
 _THOUSANDS_GROUPED_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$")
+
+# A plain space (regular, non-breaking, or thin) is ALSO a standard
+# thousands separator — it's how Russian formats a big number ("1 500 000"),
+# while the same value shows up comma-grouped in English/Spanish
+# ("1,500,000"). NUMBER_RE can't include a bare space in its own character
+# class (that would merge any two unrelated numbers separated by ordinary
+# whitespace, e.g. "5 победителей" + "9 призов"), so this instead matches
+# the shape directly in the source text — a 1-3 digit group followed by one
+# or more further EXACTLY-3-digit groups, each separated by a single space
+# with nothing else between them — before numbers are extracted at all, and
+# joins each match into one plain digit run first. Александр's real promo
+# files write the exact same prize amounts space-grouped in Russian and
+# comma-grouped in English/Spanish side by side; without this, literally
+# every big number in a prize table came back "different" for no reason.
+_SPACE_THOUSANDS_RE = re.compile(r"\d{1,3}(?:[   ]\d{3})+")
+
+
+def _merge_space_thousands(text: str) -> str:
+    return _SPACE_THOUSANDS_RE.sub(lambda m: re.sub(r"[   ]", "", m.group(0)), text)
 
 
 def _normalize_number(tok: str) -> str:
@@ -81,7 +101,7 @@ def _decompose_grouped(tok: str) -> list[str]:
 
 
 def _extract_numbers(text: str) -> list[str]:
-    return NUMBER_RE.findall(text)
+    return NUMBER_RE.findall(_merge_space_thousands(text))
 
 
 def _flatten_numbers(nums: list[str]) -> list[str]:
@@ -98,12 +118,28 @@ def _extract_placeholders(text: str) -> list[str]:
 def check_numbers(source: str, translation: str) -> list[dict]:
     src_nums = _extract_numbers(source)
     tr_nums = _extract_numbers(translation)
+    src_flat = _flatten_numbers(src_nums)
+    tr_flat = _flatten_numbers(tr_nums)
     findings = []
-    if sorted(_flatten_numbers(src_nums)) != sorted(_flatten_numbers(tr_nums)):
+    if sorted(src_flat) != sorted(tr_flat):
+        # Point at the SPECIFIC number(s) that actually differ, not a dump
+        # of every number in the text — a long promo paragraph can easily
+        # have 20-30 numbers where only one is actually wrong, and the raw
+        # full lists made that one real difference hard to spot by eye
+        # (Александр kept asking "why is it showing me this" at a glance).
+        src_counter = Counter(src_flat)
+        tr_counter = Counter(tr_flat)
+        missing = sorted((src_counter - tr_counter).elements())
+        extra = sorted((tr_counter - src_counter).elements())
+        parts = []
+        if missing:
+            parts.append(f"есть в исходнике, нет в переводе: {missing}")
+        if extra:
+            parts.append(f"есть в переводе, нет в исходнике: {extra}")
         findings.append({
             "type": "numbers",
             "severity": "high",
-            "message": f"Числа в исходнике и переводе не совпадают. Исходник: {src_nums or '—'}. Перевод: {tr_nums or '—'}.",
+            "message": "Числа в исходнике и переводе не совпадают — " + "; ".join(parts) + ".",
         })
     return findings
 

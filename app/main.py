@@ -385,6 +385,31 @@ DEFAULT_MULTI_CHECKS = [
 ]
 
 
+@app.post("/projects/{project_id}/multi-check/detect-languages")
+async def detect_file_languages(project_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Language codes found as column headers in an uploaded file — lets the
+    UI populate the target-language checkboxes from the file the manager is
+    ABOUT to check, rather than only from the project's Tone-of-address
+    document (see known_languages above). Александр hit a real gap here: a
+    language can be legitimately present in a file without ever needing a
+    tone-of-address rule (English chiefly, which rarely needs a ты/вы-style
+    distinction) — so it simply never had a row in the Tone document, never
+    appeared in known_languages, and was therefore never even offered as a
+    selectable target at all, no matter what the uploaded file actually
+    contained. Read-only: just parses the file and reports what's in it,
+    doesn't run any check or store anything."""
+    _get_project(project_id, db)
+    file_bytes = await file.read()
+    try:
+        sheets = parse_workbook(file_bytes)
+    except Exception:
+        raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
+    langs: set[str] = set()
+    for s in sheets:
+        langs.update(s["languages"])
+    return {"languages": merge_lang_codes(langs)}
+
+
 @app.post("/projects/{project_id}/multi-check")
 async def multi_check(
     project_id: int,
