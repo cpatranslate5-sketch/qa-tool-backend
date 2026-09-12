@@ -80,15 +80,27 @@ def check_missing(source: str, translation: str) -> list[dict]:
 # stated rule is specifically about a dropped period/exclamation mark, so we
 # don't flag a source that ends in "?" or "…" here, only "." and "!".
 TERMINAL_PUNCT = ".!"
-TERMINAL_PUNCT_ACCEPTABLE = ".!?…"
+
+# What counts as "the translation still ends with a mark" — not just the
+# Latin ".!?…". Many of our target languages end sentences with their own
+# script's stop: Bengali/Hindi/other Indic scripts use the danda ("।"/"॥"),
+# CJK uses fullwidth stops ("。！？"), Arabic/Urdu use "۔", Armenian "։",
+# Ethiopic "።", Myanmar "။", Khmer "។". A translation ending in any of these
+# is complete — flagging it as "missing punctuation" was simply wrong.
+TERMINAL_PUNCT_ACCEPTABLE = ".!?…" + "।॥" + "。！？" + "۔" + "։" + "።" + "။" + "។"
+
+# Languages that conventionally don't end sentences with any terminal mark
+# at all (Thai and Lao script don't use one) — nothing to require here.
+NO_TERMINAL_PUNCT_LANGS = {"th", "lo"}
 
 
-def check_punctuation(source: str, translation: str) -> list[dict]:
+def check_punctuation(source: str, translation: str, lang_code: str = "") -> list[dict]:
     findings = []
     src = source.rstrip()
     tr = translation.rstrip()
+    lang_base = lang_code.split("-")[0].lower() if lang_code else ""
 
-    if src and src[-1] in TERMINAL_PUNCT:
+    if lang_base not in NO_TERMINAL_PUNCT_LANGS and src and src[-1] in TERMINAL_PUNCT:
         if not tr or tr[-1] not in TERMINAL_PUNCT_ACCEPTABLE:
             findings.append({
                 "type": "punctuation",
@@ -111,6 +123,7 @@ def run_rule_checks(
     translation: str,
     checks: list[str],
     max_length: int | None = None,
+    lang_code: str = "",
 ) -> list[dict]:
     findings = []
     if not translation.strip():
@@ -122,5 +135,5 @@ def run_rule_checks(
     if "max_length" in checks:
         findings += check_max_length(translation, max_length)
     if "punctuation" in checks:
-        findings += check_punctuation(source, translation)
+        findings += check_punctuation(source, translation, lang_code)
     return findings

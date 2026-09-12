@@ -4,8 +4,10 @@ from pydantic import BaseModel
 
 # Every check type a single-check or multi-check can run. "missing" isn't
 # here — it always runs automatically whenever a translation is empty.
+# "numerals" and "register" (tone of address) each require their matching
+# project document to be uploaded at all — see app.main._require_doc.
 DEFAULT_CHECKS = [
-    "numbers", "placeholders", "glossary", "register", "typo",
+    "numbers", "placeholders", "glossary", "numerals", "register", "typo",
     "untranslatable", "completeness", "punctuation",
 ]
 
@@ -28,9 +30,22 @@ class ManagerUnlockIn(BaseModel):
     code: str
 
 
+class ManagerChangePasswordIn(BaseModel):
+    current_code: str
+    new_code: str
+
+
 class ProjectIn(BaseModel):
     name: str
     manager_id: int
+    # Optional — deep-copies another project's glossary/numerals/tone rows
+    # into the new one as a starting point (fully independent afterward).
+    copy_from_project_id: int | None = None
+
+
+class ProjectDeleteIn(BaseModel):
+    manager_id: int
+    code: str
 
 
 class ProjectOut(BaseModel):
@@ -38,6 +53,10 @@ class ProjectOut(BaseModel):
     name: str
     glossary_filename: str
     glossary_uploaded_at: datetime.datetime | None
+    numerals_filename: str
+    numerals_uploaded_at: datetime.datetime | None
+    tone_filename: str
+    tone_uploaded_at: datetime.datetime | None
     created_by_name: str
 
     class Config:
@@ -45,38 +64,39 @@ class ProjectOut(BaseModel):
 
 
 class GlossaryStatusOut(BaseModel):
-    """The glossary is now a structured document uploaded as a file (admin
-    only) — this is what every folder sees to know what's loaded, without
-    exposing the full table."""
+    """Every one of the three project documents (glossary, numerals,
+    tone-of-address) is a structured file uploaded by the admin — this is
+    what every folder sees to know what's loaded, without exposing the
+    full table."""
 
     filename: str
     uploaded_at: datetime.datetime | None
     term_count: int
 
 
-class LanguageIn(BaseModel):
-    lang_code: str
-    manager_id: int
+class NumeralsStatusOut(BaseModel):
+    filename: str
+    uploaded_at: datetime.datetime | None
+    rule_count: int
 
 
-class LanguageOut(BaseModel):
-    id: int
-    lang_code: str
-
-    class Config:
-        from_attributes = True
+class ToneStatusOut(BaseModel):
+    filename: str
+    uploaded_at: datetime.datetime | None
+    rule_count: int
 
 
 class CheckIn(BaseModel):
     source: str
     translation: str
     checks: list[str] = DEFAULT_CHECKS
-    # Optional — when provided, the check is saved into that project's
-    # language-folder history and the project's glossary (narrowed to
-    # EN + RU + this language) is used automatically.
+    # Optional — when provided, the check is saved into the project's
+    # shared history and the project's glossary/numerals/tone documents
+    # (narrowed to EN + RU + this one target language) are used automatically.
     project_id: int | None = None
-    language_id: int | None = None
-    # Only used when project_id/language_id are not given (standalone check).
+    source_lang: str = ""
+    target_lang: str = ""
+    # Only used when project_id is not given (standalone check).
     glossary: str = ""
     # One-off instruction for this specific task only (e.g. "in this task,
     # 'Golden Spin' should be translated, not left as-is") — never saved to
@@ -99,6 +119,8 @@ class CheckOut(BaseModel):
 
 class SingleCheckHistoryOut(BaseModel):
     id: int
+    source_lang: str
+    target_lang: str
     source: str
     translation: str
     checks_run: list
@@ -115,6 +137,7 @@ class MultiCheckHistoryOut(BaseModel):
     filename: str
     source_lang: str
     summary: dict
+    status: str
     performed_by_name: str
     created_at: str
 

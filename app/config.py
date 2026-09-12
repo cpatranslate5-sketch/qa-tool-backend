@@ -14,6 +14,13 @@ class Settings:
     # of API calls (one per language). Override via the CLAUDE_MODEL env var
     # on Railway if a particular project needs Sonnet's extra judgment.
     CLAUDE_MODEL: str = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+    # A short list of languages (see app.claude_client.HARD_LANGUAGE_BASES)
+    # get this stronger, ~2x-the-price model instead — agreed with
+    # Александр after costing it out: kazakh/kyrgyz/tajik/uzbek/swahili/
+    # telugu/marathi/azerbaijani are less common in the base model's
+    # training data, so the extra reliability is worth the modest total
+    # cost impact (only these languages' calls use it, not the whole job).
+    CLAUDE_MODEL_HARD: str = os.environ.get("CLAUDE_MODEL_HARD", "claude-sonnet-4-5-20250929")
     ALLOWED_ORIGINS: list[str] = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 

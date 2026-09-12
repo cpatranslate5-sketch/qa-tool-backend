@@ -1,7 +1,7 @@
 """Quick local smoke test for the shared-folders / admin model, the
-structured glossary upload, and the new check types. Uses a throwaway
-SQLite DB (no DATABASE_URL set) and no AI key, so only rule-based findings
-are expected, not AI ones."""
+structured glossary/numerals/tone documents, and the new check types. Uses
+a throwaway SQLite DB (no DATABASE_URL set) and no AI key, so only
+rule-based findings are expected, not AI ones."""
 import io
 import os
 import sys
@@ -48,6 +48,16 @@ assert len(r.json()) == 2
 check("unlock wrong code", client.post(f"/managers/{regular_id}/unlock", json={"code": "wrong"}), expect=401)
 check("unlock correct code", client.post(f"/managers/{regular_id}/unlock", json={"code": "5678"}))
 
+# --- password change: available to every folder, not just admin ---
+check("wrong current password rejected", client.post(
+    f"/managers/{regular_id}/change-password", json={"current_code": "nope", "new_code": "9999"}
+), expect=401)
+check("password change succeeds", client.post(
+    f"/managers/{regular_id}/change-password", json={"current_code": "5678", "new_code": "9999"}
+))
+check("old password no longer works", client.post(f"/managers/{regular_id}/unlock", json={"code": "5678"}), expect=401)
+check("new password works", client.post(f"/managers/{regular_id}/unlock", json={"code": "9999"}))
+
 # --- non-admin blocked from structural changes ---
 check("non-admin create project blocked", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": regular_id}), expect=403)
 
@@ -56,23 +66,12 @@ r = check("admin create project", client.post("/projects", json={"name": "Pragma
 project_id = r.json()["id"]
 assert r.json()["created_by_name"] == "Александр"
 assert r.json()["glossary_filename"] == ""
-
-# --- new project auto-gets the standard set of language folders ---
-r = check("auto-created language folders", client.get(f"/projects/{project_id}/languages"))
-auto_langs = {l["lang_code"] for l in r.json()}
-expected = {
-    "en", "ar", "az", "bd", "de", "el", "es", "es-mx", "es-ar", "fr-ci",
-    "hi", "hing", "id", "it", "jp", "kz", "ko", "kg", "mr", "ms", "pl",
-    "pt-br", "ro", "ru", "sw", "te", "tj", "th", "tl", "tr", "ua", "ur",
-    "uz", "vi", "cn",
-}
-assert auto_langs == expected, f"missing: {expected - auto_langs}, extra: {auto_langs - expected}"
-print(f"   {len(auto_langs)} language folders auto-created")
+assert r.json()["numerals_filename"] == ""
+assert r.json()["tone_filename"] == ""
 
 check("duplicate project name", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}), expect=409)
 
-r = check("ru language id lookup", client.get(f"/projects/{project_id}/languages"))
-language_id = next(l["id"] for l in r.json() if l["lang_code"] == "ru")
+# --- no more language folders: everything runs directly against the project ---
 
 # --- build a glossary workbook matching the agency's real doc shape:
 # EN | Пояснение | RU | ES (MX) | ...
@@ -105,16 +104,114 @@ assert r.json()["filename"] == "glossary.xlsx"
 r = check("glossary status (visible to any folder)", client.get(f"/projects/{project_id}/glossary/status"))
 assert r.json()["term_count"] == 3
 
-# --- non-admin blocked from adding language ---
-check("non-admin add language blocked", client.post(
-    f"/projects/{project_id}/languages", json={"lang_code": "xx-test", "manager_id": regular_id}
-), expect=403)
+# --- doc-gating: numerals/tone checks refuse to run until their doc exists ---
+check("numerals check blocked with no doc uploaded", client.post("/check", json={
+    "source": "Bet $0.40 now.",
+    "translation": "Ставка 0,40$ сейчас.",
+    "checks": ["numerals"],
+    "project_id": project_id,
+    "source_lang": "en",
+    "target_lang": "ru",
+    "manager_name": "Мария",
+}), expect=400)
+check("tone (register) check blocked with no doc uploaded", client.post("/check", json={
+    "source": "Play now.",
+    "translation": "Играйте сейчас.",
+    "checks": ["register"],
+    "project_id": project_id,
+    "source_lang": "en",
+    "target_lang": "ru",
+    "manager_name": "Мария",
+}), expect=400)
 
-# --- BOTH folders see the same shared project/language (no manager scoping) ---
+# --- Numerals doc: real multi-column format (several distinct format
+# columns per language, region-qualified codes) matching the agency's
+# actual export — "ru-ru" here deliberately differs in granularity from
+# the glossary's plain "ru" column, exercising the base-subtag fallback
+# used throughout the app (see resolve_lang_code unit tests below too).
+nwb = openpyxl.Workbook()
+nws = nwb.active
+nws.append(["Language", "Currency + >9999", "Currency + <10 000", "Decimal", "Date"])
+nws.append(["ru-RU", "11 500 €", "2 500 €", "—,50", "16.08.2023"])
+nws.append(["es-mx", "$11,500", "$2,500", "—.50", "08/16/2023"])
+nws.append(["ko-KR", "11,500 €", "2,500 €", "—.50", "2023.08.16"])
+# a country-code-style label ("KZ" for Kazakh) will need to bridge to this
+# real ISO language-region code ("kk-KZ") — see the resolve_lang_code unit
+# tests below, and Александр's real Tone doc which uses exactly this style
+nws.append(["kk-KZ", "11 500 ₸", "2 500 ₸", "—,50", "16.08.2023"])
+nbuf = io.BytesIO()
+nwb.save(nbuf)
+nbuf.seek(0)
+
+check("non-admin numerals upload blocked", client.post(
+    f"/projects/{project_id}/numerals/upload",
+    files={"file": ("numerals.xlsx", nbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": regular_id},
+), expect=403)
+nbuf.seek(0)
+r = check("admin numerals upload", client.post(
+    f"/projects/{project_id}/numerals/upload",
+    files={"file": ("numerals.xlsx", nbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": admin_id},
+))
+assert r.json()["rule_count"] == 4, r.json()
+
+r = check("numerals status (visible to any folder)", client.get(f"/projects/{project_id}/numerals/status"))
+assert r.json()["rule_count"] == 4
+
+# --- Tone-of-address doc: real layout, matching the agency's actual
+# export — mirrors the Glossary (language codes as header-row columns,
+# not one row per language as originally assumed), with the register in
+# the data row below each column. "KZ" here is the same country-code-style
+# label as the real file uses for Kazakh, exercising the subtag bridge to
+# Numerals' "kk-KZ" above.
+twb = openpyxl.Workbook()
+tws = twb.active
+tws.append(["EN", "RU", "KZ", "ES (MX)"])
+tws.append(["Формальное", "Формальное", "Формальное", "Неформальное"])
+tbuf = io.BytesIO()
+twb.save(tbuf)
+tbuf.seek(0)
+r = check("admin tone upload", client.post(
+    f"/projects/{project_id}/tone/upload",
+    files={"file": ("tone.xlsx", tbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": admin_id},
+))
+assert r.json()["rule_count"] == 4, r.json()
+
+# --- known-languages union across the three docs: "ru" (glossary/tone)
+# and "ru-ru" (numerals) collapse into the one specific spelling, and the
+# bare country-style "kz" (Tone) merges into numerals' "kk-KZ" the same
+# way — merge_lang_codes bridges both granularity styles for display ---
+r = check("known languages union", client.get(f"/projects/{project_id}/known-languages"))
+assert set(r.json()["languages"]) == {"ru-ru", "es-mx", "ko-kr", "kk-kz", "en"}, r.json()
+
+# --- now that docs exist, the previously-blocked checks run fine. Also
+# confirms the granularity fallback in a real request: target_lang="ru"
+# resolves to the numerals doc's "ru-ru" row (the only Russian variant),
+# per Александр's live question about "KO" vs "ko-KR" style mismatches ---
+check("numerals check now runs (base-subtag fallback: ru -> ru-ru)", client.post("/check", json={
+    "source": "Bet $0.40 now.",
+    "translation": "Ставка 0,40$ сейчас.",
+    "checks": ["numerals"],
+    "project_id": project_id,
+    "source_lang": "en",
+    "target_lang": "ru",
+    "manager_name": "Мария",
+}))
+check("tone check now runs", client.post("/check", json={
+    "source": "Play now.",
+    "translation": "Играйте сейчас.",
+    "checks": ["register"],
+    "project_id": project_id,
+    "source_lang": "en",
+    "target_lang": "ru",
+    "manager_name": "Мария",
+}))
+
+# --- BOTH folders see the same shared project (no manager scoping) ---
 r = check("list projects (shared)", client.get("/projects"))
 assert len(r.json()) == 1
-r = check("list languages (shared)", client.get(f"/projects/{project_id}/languages"))
-assert len(r.json()) == 35
 
 # --- non-admin CAN run a single check, glossary narrowed to EN+RU+target ---
 r = check("non-admin single check (ru)", client.post("/check", json={
@@ -122,7 +219,8 @@ r = check("non-admin single check (ru)", client.post("/check", json={
     "translation": "Бонус составляет $500 и истекает через 3 дня",
     "checks": ["numbers", "placeholders", "glossary", "register", "typo", "untranslatable", "completeness", "punctuation"],
     "project_id": project_id,
-    "language_id": language_id,
+    "source_lang": "en",
+    "target_lang": "ru",
     "manager_name": "Мария",
 }))
 findings = r.json()["findings"]
@@ -148,16 +246,19 @@ check("check with extra_instructions", client.post("/check", json={
     "translation": "Играйте в Golden Spin сейчас!",
     "checks": ["untranslatable"],
     "project_id": project_id,
-    "language_id": language_id,
+    "source_lang": "en",
+    "target_lang": "ru",
     "extra_instructions": "В этой задаче 'Golden Spin' нужно переводить как 'Голден Спин'.",
     "manager_name": "Мария",
 }))
 
-# --- history shows who performed it ---
-r = check("history shows attribution", client.get(f"/projects/{project_id}/languages/{language_id}/history"))
-assert len(r.json()) == 2  # the ru single check + the extra_instructions one; the double-space check was standalone
-assert r.json()[0]["performed_by_name"] == "Мария"
-print("   performed_by_name:", r.json()[0]["performed_by_name"])
+# --- history shows who performed it, keyed by project only (no language folder) ---
+r = check("history shows attribution", client.get(f"/projects/{project_id}/history"))
+history = r.json()
+assert len(history) == 4  # numerals + tone + full-checks + extra_instructions check (double-space was standalone)
+assert history[0]["performed_by_name"] == "Мария"
+assert history[0]["source_lang"] == "en" and history[0]["target_lang"] == "ru"
+print("   performed_by_name:", history[0]["performed_by_name"])
 
 # --- non-admin CAN run a multi-check upload ---
 sample_path = "/root/.claude/uploads/aee9e6e5-e96f-5b4b-aa4e-8aad6284c8c9/147efc1b-Promo_Rules_Localization.xlsx"
@@ -170,12 +271,98 @@ with open(sample_path, "rb") as f:
 multi_data = r.json()
 multi_check_id = multi_data["multi_check_id"]
 print("   summary:", multi_data["summary"])
+# This sample file is above BATCH_THRESHOLD_CHARS (many languages), so it
+# would normally go through the Message Batches path — but with no API key
+# configured there's nothing to submit, so it finalizes immediately with
+# just the rule-based findings, same as the old fully-synchronous behavior.
+assert multi_data["status"] == "completed", multi_data
+
+# --- target_langs filter: checking just 2 of the file's many languages
+# should only touch those 2 in the summary ---
+with open(sample_path, "rb") as f:
+    r = check("multi-check with target_langs filter", client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"source_lang": "", "manager_name": "Мария", "extra_instructions": "", "target_langs": "ru,es-mx"},
+    ))
+filtered_data = r.json()
+assert filtered_data["status"] == "completed", filtered_data
+assert set(filtered_data["summary"]["languages_checked"]) == {"ru", "es-mx"}, filtered_data["summary"]
+print("   filtered languages_checked:", filtered_data["summary"]["languages_checked"])
 
 r = check("multi-check history shows attribution", client.get(f"/projects/{project_id}/multi-check"))
 assert r.json()[0]["performed_by_name"] == "Мария"
+assert r.json()[0]["status"] == "completed"
 
 check("multi-check report download", client.get(
     f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx"
+))
+
+# --- large multi-check actually goes through the Message Batches path when
+# a batch can be submitted — simulate that here (no real Anthropic key in
+# this sandbox) by faking the three network calls, to prove the
+# submit -> poll -> merge-AI-findings-into-the-rule-based-skeleton pipeline
+# actually produces a correct, complete result. ---
+import app.excel_multi as excel_multi_mod
+
+
+async def _fake_create_message_batch(requests):
+    assert requests, "expected at least one per-language batch request to be built"
+    return "msgbatch_test123"
+
+
+async def _fake_get_batch_status(batch_id):
+    assert batch_id == "msgbatch_test123"
+    return {"processing_status": "ended", "results_url": "fake://results"}
+
+
+async def _fake_get_batch_results(results_url):
+    assert results_url == "fake://results"
+    # One fake AI finding for the "ru" target language of the (only) sheet —
+    # custom_id format is "s{sheet_index}-{lang}" (see build_batch_plan).
+    return {"s0-ru": '[{"row": 1, "type": "typo", "severity": "medium", "message": "тестовая ИИ-находка"}]'}
+
+
+excel_multi_mod.create_message_batch = _fake_create_message_batch
+excel_multi_mod.get_batch_status = _fake_get_batch_status
+excel_multi_mod.get_batch_results = _fake_get_batch_results
+
+with open(sample_path, "rb") as f:
+    r = check("large multi-check submits as a batch", client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"source_lang": "", "manager_name": "Мария", "extra_instructions": ""},
+    ))
+batch_multi_data = r.json()
+assert batch_multi_data["status"] == "processing", batch_multi_data
+batch_multi_check_id = batch_multi_data["multi_check_id"]
+
+r = check("history shows the batch entry as processing", client.get(f"/projects/{project_id}/multi-check"))
+assert r.json()[0]["status"] == "processing", r.json()[0]
+
+check("report download blocked while processing", client.get(
+    f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx"
+), expect=409)
+
+# First poll: our fake get_batch_status already says "ended", so this same
+# call both notices completion and merges the results in.
+r = check("polling finalizes the batch", client.get(
+    f"/projects/{project_id}/multi-check/{batch_multi_check_id}"
+))
+finalized = r.json()
+assert finalized["status"] == "completed", finalized
+ru_findings = finalized["sheets"][0]["languages"].get("ru", [])
+assert any(
+    any(f["type"] == "typo" and "тестовая ИИ-находка" in f["message"] for f in row["findings"])
+    for row in ru_findings
+), ru_findings
+print("   ru findings after batch merge:", ru_findings)
+
+r = check("history now shows completed", client.get(f"/projects/{project_id}/multi-check"))
+assert r.json()[0]["status"] == "completed"
+
+check("report download works once completed", client.get(
+    f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx"
 ))
 
 # --- re-uploading the glossary replaces it, doesn't accumulate ---
@@ -193,6 +380,49 @@ r = check("admin re-uploads glossary (replaces)", client.post(
 ))
 assert r.json()["term_count"] == 1, r.json()
 
+# --- project template copy: new project starts with the same docs, fully
+# independent afterward (editing one never touches the other) ---
+r = check("create project copying requirements from the first", client.post(
+    "/projects", json={"name": "LS Promo", "manager_id": admin_id, "copy_from_project_id": project_id}
+))
+copy_project_id = r.json()["id"]
+assert r.json()["glossary_filename"] == "glossary2.xlsx", r.json()
+
+r = check("copied project's glossary status matches source", client.get(f"/projects/{copy_project_id}/glossary/status"))
+assert r.json()["term_count"] == 1, r.json()
+r = check("copied project's numerals status matches source", client.get(f"/projects/{copy_project_id}/numerals/status"))
+assert r.json()["rule_count"] == 4, r.json()
+
+# re-uploading the ORIGINAL project's glossary must not affect the copy
+gwb3 = openpyxl.Workbook()
+gws3 = gwb3.active
+gws3.append(["EN", "RU"])
+gws3.append(["Term A", "Термин А"])
+gws3.append(["Term B", "Термин Б"])
+gbuf3 = io.BytesIO()
+gwb3.save(gbuf3)
+gbuf3.seek(0)
+check("re-upload original project's glossary again", client.post(
+    f"/projects/{project_id}/glossary/upload",
+    files={"file": ("glossary3.xlsx", gbuf3, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": admin_id},
+))
+r = check("copy's glossary is untouched by the original's re-upload", client.get(f"/projects/{copy_project_id}/glossary/status"))
+assert r.json()["term_count"] == 1, r.json()
+
+# --- project deletion requires the admin's password ---
+check("delete project wrong password rejected", client.request(
+    "DELETE", f"/projects/{copy_project_id}", json={"manager_id": admin_id, "code": "wrong"}
+), expect=401)
+check("delete project by non-admin rejected", client.request(
+    "DELETE", f"/projects/{copy_project_id}", json={"manager_id": regular_id, "code": "9999"}
+), expect=403)
+check("delete project with correct password", client.request(
+    "DELETE", f"/projects/{copy_project_id}", json={"manager_id": admin_id, "code": "1234"}
+))
+r = check("deleted project no longer listed", client.get("/projects"))
+assert len(r.json()) == 1, r.json()
+
 # --- re-running migrations on an already-migrated DB should be a no-op ---
 dbmod.init_db()
 r = check("managers survive re-migration", client.get("/managers"))
@@ -200,6 +430,100 @@ assert len(r.json()) == 2
 r = check("projects survive re-migration", client.get("/projects"))
 assert len(r.json()) == 1
 r = check("glossary survives re-migration", client.get(f"/projects/{project_id}/glossary/status"))
-assert r.json()["term_count"] == 1
+assert r.json()["term_count"] == 2
+
+# --- unit tests: language-code granularity bridging (resolve_lang_code /
+# merge_lang_codes) and the real multi-sheet Numerals document shape ---
+from app.excel_multi import resolve_lang_code, merge_lang_codes
+from app.project_docs import parse_numerals_workbook, parse_tone_workbook
+
+# exact match wins even when a base-subtag match would also be possible
+assert resolve_lang_code("ko-kr", ["ko-kr", "ko"]) == "ko-kr"
+# plain code resolves to the one region-qualified entry that shares its base
+assert resolve_lang_code("ko", ["ko-KR", "en-us"]) == "ko-KR"
+# ...and the reverse direction: a region-qualified request resolves to a
+# plain entry sharing its base
+assert resolve_lang_code("ko-kr", ["ko", "en-us"]) == "ko"
+# several distinct regions for the same base -> refuses to guess
+assert resolve_lang_code("es", ["es-ES", "es-AR", "es-MX"]) is None
+# unknown language entirely -> no match
+assert resolve_lang_code("de", ["ko-KR", "es-MX"]) is None
+# several same-base candidates, but with `values` supplied: if they all
+# carry the identical rule anyway (Argentina and "rest of Latin America"
+# sometimes do), it's safe to resolve rather than refuse — this is the
+# real case Александр described: es-MX/es-CL/es-PE-style codes that all
+# mean the same "not Spain, not Argentina" format
+latam_values = {"es-ar": {"decimal": "—.50"}, "es-mx": {"decimal": "—.50"}}
+assert resolve_lang_code("es", ["es-ar", "es-mx"], values=latam_values) == "es-ar"  # identical values -> safe to resolve either way
+distinct_values = {"es-es": {"decimal": "—,50"}, "es-ar": {"decimal": "—.50"}}
+assert resolve_lang_code("es", ["es-es", "es-ar"], values=distinct_values) is None  # genuinely different -> still refuses
+# country-code-style label (Tone's real doc names Kazakh "KZ", Bengali
+# "BD", Tajik "TJ" — the COUNTRY, not the ISO language subtag) bridges to
+# the real language-region code via the region half, not the base half
+assert resolve_lang_code("kz", ["kk-KR", "kk-KZ", "en-US"]) == "kk-KZ"
+assert resolve_lang_code("bd", ["bn-BD", "hi-IN"]) == "bn-BD"
+print("[OK] resolve_lang_code: exact match, any-subtag fallback (base or region, both "
+      "directions), ambiguous multi-region refusal, unknown language, value-equality fallback")
+
+assert merge_lang_codes(["ko", "ko-KR"]) == ["ko-KR"]
+assert merge_lang_codes(["es", "es-ES", "es-AR", "es-MX"]) == ["es-AR", "es-ES", "es-MX"]
+assert merge_lang_codes(["ru", "fr"]) == ["fr", "ru"]
+# the same country-code-style bridging as above, but for the display list
+assert merge_lang_codes(["kz", "kk-KZ"]) == ["kk-KZ"]
+print("[OK] merge_lang_codes: collapses same-granularity duplicates, "
+      "keeps genuinely distinct regional variants, bridges country-code-style "
+      "labels to their region subtag, leaves unrelated codes alone")
+
+# parse_tone_workbook: real layout is column-per-language (Glossary-style),
+# not row-per-language as originally assumed — including a country-code
+# label ("KZ") and a combined "/"-separated header applying to two codes
+twb2 = openpyxl.Workbook()
+tws2 = twb2.active
+tws2.append(["EN", "RU", "KZ", "FR-CI / FR-FR", "ES (MX)"])
+tws2.append(["Формальное", "Формальное", "Формальное", "Неформальное", "Неформальное"])
+tbuf2 = io.BytesIO()
+twb2.save(tbuf2)
+tbuf2.seek(0)
+tone_rows = {r["lang_code"]: r["register"] for r in parse_tone_workbook(tbuf2.read())}
+assert tone_rows == {
+    "en": "formal", "ru": "formal", "kz": "formal",
+    "fr-ci": "informal", "fr-fr": "informal", "es-mx": "informal",
+}, tone_rows
+print("[OK] parse_tone_workbook: column-per-language layout (not row-per-language), "
+      "combined header split across both codes")
+
+# multi-sheet workbook: a master reference sheet plus a smaller
+# per-project sheet that overrides one of its languages, and a combined
+# "fr-CI / fr-FR" language cell applying one row to both codes
+mswb = openpyxl.Workbook()
+master_ws = mswb.active
+master_ws.title = "Numerals_Format_Issues"
+master_ws.append(["Language", "Currency + >9999", "Decimal"])
+master_ws.append(["de-DE", "11.500 €", "—,50"])
+master_ws.append(["fr-CI / fr-FR", "11 500 €", "—,50"])
+project_ws = mswb.create_sheet("numerals ProjectX")
+project_ws.append(["Language", "Currency + >9999", "Decimal"])
+project_ws.append(["de-DE", "11.500 EUR (проектная правка)", "—,50"])
+msbuf = io.BytesIO()
+mswb.save(msbuf)
+msbuf.seek(0)
+parsed = {row["lang_code"]: row["fields"] for row in parse_numerals_workbook(msbuf.read())}
+assert parsed["de-de"]["валюта при числах от 10 000"] == "11.500 EUR (проектная правка)", parsed
+assert parsed["fr-ci"]["разделитель дробной части"] == "—,50", parsed
+assert parsed["fr-fr"]["разделитель дробной части"] == "—,50", parsed
+print("[OK] parse_numerals_workbook: multi-sheet merge (later sheet overrides), "
+      "combined language cell split across both codes")
+
+# --- model tiering: confirmed "hard" languages get the stronger model,
+# matched by base subtag so any region variant of them qualifies too ---
+from app.claude_client import _model_for_lang
+from app.config import settings
+
+for hard in ["kk", "kk-KZ", "ky-KG", "tg-TJ", "uz", "sw-KE", "te-IN", "mr-IN", "az-AZ"]:
+    assert _model_for_lang(hard) == settings.CLAUDE_MODEL_HARD, hard
+for normal in ["ru", "es-mx", "en", "de-DE", "fr"]:
+    assert _model_for_lang(normal) == settings.CLAUDE_MODEL, normal
+print("[OK] _model_for_lang: confirmed hard-language list (kk/ky/tg/uz/sw/te/mr/az) "
+      "routes to CLAUDE_MODEL_HARD by base subtag, everything else to CLAUDE_MODEL")
 
 print("\nALL SMOKETEST CHECKS PASSED")

@@ -37,7 +37,11 @@ class Manager(Base):
 
 class Project(Base):
     """Shared/global — every folder sees the same set of projects. Only the
-    admin folder can create one (see _require_admin in main.py)."""
+    admin folder can create one (see _require_admin in main.py). No more
+    per-language sub-folders (removed — see the dropped ProjectLanguage
+    model): a project instead carries three optional reference documents
+    (glossary, numerals/number-format, tone-of-address), each gating its
+    matching AI check until uploaded — see app.main's _require_doc."""
 
     __tablename__ = "projects"
 
@@ -46,12 +50,17 @@ class Project(Base):
     created_by_name: Mapped[str] = mapped_column(String(120), default="")
     glossary_filename: Mapped[str] = mapped_column(String(300), default="")
     glossary_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    numerals_filename: Mapped[str] = mapped_column(String(300), default="")
+    numerals_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    tone_filename: Mapped[str] = mapped_column(String(300), default="")
+    tone_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
-    languages: Mapped[list["ProjectLanguage"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     glossary_terms: Mapped[list["GlossaryTerm"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    numeral_rules: Mapped[list["NumeralRule"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    tone_rules: Mapped[list["ToneRule"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
 class GlossaryTerm(Base):
@@ -74,28 +83,59 @@ class GlossaryTerm(Base):
     project: Mapped["Project"] = relationship(back_populates="glossary_terms")
 
 
-class ProjectLanguage(Base):
-    __tablename__ = "project_languages"
+class NumeralRule(Base):
+    """One row of the project's "Нумералс" doc: for a given language, the
+    full set of number/currency/date/etc. format columns (see `fields`
+    below). Row-based (one row per language), unlike the glossary's
+    per-language columns."""
+
+    __tablename__ = "numeral_rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
     lang_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # Every number/currency/date/etc. format column found for this language
+    # in the uploaded document, keyed by its (Russian) column label — e.g.
+    # {"валюта при числах от 10 000": "11 500 €", "формат даты": "16.08.2023"}.
+    # The real document has around a dozen such columns per language rather
+    # than one free-text rule, and the agency may add more over time, so
+    # every column present is kept rather than assuming a fixed set.
+    fields: Mapped[dict] = mapped_column(JSON, default=dict)
 
-    project: Mapped["Project"] = relationship(back_populates="languages")
-    single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="language", cascade="all, delete-orphan")
+    project: Mapped["Project"] = relationship(back_populates="numeral_rules")
 
-    __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_lang_per_project"),)
+    __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_numeral_rule_per_project_lang"),)
+
+
+class ToneRule(Base):
+    """One row of the project's "Тон обращения" doc: for a given language,
+    whether the required register is formal or informal. Row-based, same
+    simple list style as NumeralRule."""
+
+    __tablename__ = "tone_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    lang_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    # "formal" or "informal" — parsed from the doc's Russian wording.
+    register: Mapped[str] = mapped_column(String(20), default="")
+
+    project: Mapped["Project"] = relationship(back_populates="tone_rules")
+
+    __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_tone_rule_per_project_lang"),)
 
 
 class SingleCheck(Base):
-    """One source/translation pair checked inside a project's language folder."""
+    """One source/translation pair, checked directly against a project (no
+    more per-language sub-folder — source_lang/target_lang are recorded on
+    the check itself, chosen at run time)."""
 
     __tablename__ = "single_checks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
-    language_id: Mapped[int] = mapped_column(ForeignKey("project_languages.id"), nullable=False)
+    source_lang: Mapped[str] = mapped_column(String(20), default="")
+    target_lang: Mapped[str] = mapped_column(String(20), default="")
     source: Mapped[str] = mapped_column(Text, nullable=False)
     translation: Mapped[str] = mapped_column(Text, nullable=False)
     checks_run: Mapped[list] = mapped_column(JSON, default=list)
@@ -104,11 +144,18 @@ class SingleCheck(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     project: Mapped["Project"] = relationship(back_populates="single_checks")
-    language: Mapped["ProjectLanguage"] = relationship(back_populates="single_checks")
 
 
 class MultiCheck(Base):
-    """One multi-language Excel upload, checked in a project's "Мульти" section."""
+    """One multi-language Excel upload, checked in a project's "Мульти" section.
+
+    Small/medium uploads run synchronously (status="completed" right away).
+    Large ones (see excel_multi.BATCH_THRESHOLD_CHARS) are submitted through
+    Anthropic's Message Batches API instead — half the per-token price, but
+    not instant — and start out as status="processing", with `results`
+    holding the not-yet-AI-checked skeleton (see excel_multi.build_batch_plan)
+    and `batch_id` the Anthropic batch to poll. app.main's detail endpoint
+    checks the batch and flips the record to "completed" once it's ended."""
 
     __tablename__ = "multi_checks"
 
@@ -119,6 +166,8 @@ class MultiCheck(Base):
     checks_run: Mapped[list] = mapped_column(JSON, default=list)
     summary: Mapped[dict] = mapped_column(JSON, default=dict)
     results: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="completed")
+    batch_id: Mapped[str] = mapped_column(String(200), default="")
     performed_by_name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 

@@ -71,25 +71,87 @@ def _run_migrations():
                 conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_filename VARCHAR(300) NOT NULL DEFAULT ''"))
             if "glossary_uploaded_at" not in cols:
                 conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_uploaded_at TIMESTAMPTZ"))
+            # Two more optional reference documents alongside the glossary —
+            # numerals (number/currency format) and tone-of-address.
+            if "numerals_filename" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN numerals_filename VARCHAR(300) NOT NULL DEFAULT ''"))
+            if "numerals_uploaded_at" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN numerals_uploaded_at TIMESTAMPTZ"))
+            if "tone_filename" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN tone_filename VARCHAR(300) NOT NULL DEFAULT ''"))
+            if "tone_uploaded_at" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN tone_uploaded_at TIMESTAMPTZ"))
 
-    # The project/language/check tables changed shape (projects used to be
-    # owned by one manager; now they're shared, and single_checks/multi_checks
-    # gained a performed_by_name column). Rather than hand-write an ALTER for
-    # every case, just drop and let create_all() below rebuild them fresh —
-    # there's no meaningful data yet to preserve there, and managers (the
-    # actual folders/logins) are left untouched.
+    # Very old shape only (projects used to be owned by one manager) — if
+    # this ever fires, there's genuinely nothing compatible to preserve, so
+    # the whole cluster is rebuilt fresh. On an already-migrated database
+    # (which by now includes any project the user has actually set up,
+    # with real uploaded glossary data) this is always False and nothing
+    # here is touched.
     insp = inspect(engine)  # re-inspect: the block above may have altered "projects"
     existing_tables = set(insp.get_table_names())
     if "projects" in existing_tables:
         cols = {c["name"] for c in insp.get_columns("projects")}
-        needs_reset = "manager_id" in cols or "name" not in cols
-        if not needs_reset and "single_checks" in existing_tables:
-            sc_cols = {c["name"] for c in insp.get_columns("single_checks")}
-            needs_reset = "performed_by_name" not in sc_cols
-        if needs_reset:
+        needs_full_reset = "manager_id" in cols or "name" not in cols
+        if needs_full_reset:
             with engine.begin() as conn:
                 for table in ("multi_checks", "single_checks", "project_languages", "projects"):
                     conn.execute(text(f"DROP TABLE IF EXISTS {table}{cascade}"))
+
+    # Language folders are being removed — single_checks now records
+    # source_lang/target_lang directly instead of a language_id FK into the
+    # (also removed) project_languages table. Reset ONLY single_checks (a
+    # log of individual segment checks, not project setup — safe to lose)
+    # rather than projects/multi_checks, which hold real project
+    # configuration, uploaded glossary/numerals/tone documents, and
+    # multi-check history/reports that must survive this upgrade.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "single_checks" in existing_tables:
+        sc_cols = {c["name"] for c in insp.get_columns("single_checks")}
+        if "performed_by_name" not in sc_cols or "language_id" in sc_cols:
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS single_checks{cascade}"))
+
+    # project_languages (language folders) is removed entirely — no model
+    # references it anymore, and it holds nothing worth keeping (just a
+    # list of lang codes, easily re-derived from the new reference docs).
+    existing_tables = set(insp.get_table_names())
+    if "project_languages" in existing_tables:
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS project_languages{cascade}"))
+
+    # The Numerals document turned out to have ~a dozen distinct format
+    # columns per language (currency, decimal separator, date, percent,
+    # number grouping, ...) rather than one free-text rule — numeral_rules
+    # moves from a single rule_text column to a JSON "fields" dict holding
+    # all of them. This table has no real historical data worth preserving
+    # (nothing has been uploaded through it in production yet), so it's
+    # safe to just add the new column and drop the old one outright.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "numeral_rules" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("numeral_rules")}
+        with engine.begin() as conn:
+            if "fields" not in cols:
+                json_type = "JSONB" if engine.dialect.name == "postgresql" else "JSON"
+                conn.execute(text(f"ALTER TABLE numeral_rules ADD COLUMN fields {json_type}"))
+            if "rule_text" in cols:
+                conn.execute(text("ALTER TABLE numeral_rules DROP COLUMN rule_text"))
+
+    # Large multi-checks now go through Anthropic's (cheaper, slower) Message
+    # Batches API instead of running live — add the columns that track that
+    # without touching any existing multi_checks rows (they're simply
+    # already-completed, non-batched checks).
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "multi_checks" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("multi_checks")}
+        with engine.begin() as conn:
+            if "status" not in cols:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'completed'"))
+            if "batch_id" not in cols:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN batch_id VARCHAR(200) NOT NULL DEFAULT ''"))
 
 
 def _ensure_admin_exists():
