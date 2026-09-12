@@ -506,6 +506,24 @@ assert check_numbers("$50,000 prize", "50 тысяч приз") != []
 print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no longer "
       "false-flagged as a numbers mismatch; real mismatches and thousands-grouping still caught")
 
+# --- a DATE must not be flagged just because the target language writes
+# the day/month/year in a different order and/or with a different
+# separator — Александр hit this live: a source date "09/22/2026"
+# (MM/DD/YYYY, slash-separated) was correctly localized as "22.09.2026"
+# (DD.MM.YYYY, dot-separated), and the check flagged it as a numbers
+# mismatch even though every digit was correct — only the grouping/order
+# changed, which is expected and fine. ---
+date_source = "The tournament runs from 09/22/2026 (3:00 UTC) to 09/28/2026 (22:59 UTC)."
+date_translation_ru = "Турнир проходит с 22.09.2026 (03:00 UTC) по 28.09.2026 (22:59 UTC)."
+assert check_numbers(date_source, date_translation_ru) == [], check_numbers(date_source, date_translation_ru)
+# But an actually WRONG date (a real digit changed, not just reordered)
+# must still be caught.
+date_translation_wrong = "Турнир проходит с 23.09.2026 (03:00 UTC) по 28.09.2026 (22:59 UTC)."
+assert check_numbers(date_source, date_translation_wrong) != []
+print("[OK] check_numbers: a date's day/month/year order and separator style "
+      "(dots vs slashes) can change freely between languages without being flagged, "
+      "while an actual wrong date digit is still caught")
+
 # --- the "typo" AI check catches a WRONG CURRENCY entirely (e.g. euro
 # instead of dollar) as a genuine translation error, not just a stylistic
 # quirk — Александр hit a real case where $0.40 was mistranslated as

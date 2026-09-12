@@ -37,8 +37,38 @@ def _normalize_number(tok: str) -> str:
     return normalized
 
 
+def _decompose_grouped(tok: str) -> list[str]:
+    """A token with 2+ separators (','/'.' combined) is almost always a
+    DATE written as one glued-together run — "22.09.2026" — rather than an
+    ordinary decimal or a single thousands-grouping comma (those have at
+    most one separator). Dates are exactly the case where the grouping
+    itself is expected to change between languages: day/month/year can
+    come in a different order, and the separator can be "." or "/" (a
+    slash-separated date like "09/22/2026" never even reaches here as one
+    token, since '/' isn't part of NUMBER_RE — it's already three separate
+    atoms). So a dotted date is split into its individual digit groups and
+    compared as a multiset, order and separator both ignored — only the
+    actual digits have to survive translation, exactly as Александр asked
+    for after "22.09.2026" (from a $0.40-style source date written
+    "09/22/2026") was wrongly flagged against its own, correctly
+    reordered/reformatted translation.
+    A token with 0-1 separators (an ordinary decimal, or a single
+    thousands-grouping comma like "50,000") is left as one atom via
+    _normalize_number, so a genuinely different number is still caught."""
+    if tok.count(".") + tok.count(",") < 2:
+        return [_normalize_number(tok)]
+    return [_normalize_number(part) for part in re.split(r"[.,]", tok) if part]
+
+
 def _extract_numbers(text: str) -> list[str]:
     return NUMBER_RE.findall(text)
+
+
+def _flatten_numbers(nums: list[str]) -> list[str]:
+    out: list[str] = []
+    for n in nums:
+        out.extend(_decompose_grouped(n))
+    return out
 
 
 def _extract_placeholders(text: str) -> list[str]:
@@ -49,7 +79,7 @@ def check_numbers(source: str, translation: str) -> list[dict]:
     src_nums = _extract_numbers(source)
     tr_nums = _extract_numbers(translation)
     findings = []
-    if sorted(map(_normalize_number, src_nums)) != sorted(map(_normalize_number, tr_nums)):
+    if sorted(_flatten_numbers(src_nums)) != sorted(_flatten_numbers(tr_nums)):
         findings.append({
             "type": "numbers",
             "severity": "high",
