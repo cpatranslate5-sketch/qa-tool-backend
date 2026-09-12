@@ -606,6 +606,18 @@ from app.claude_client import CHECK_LABELS
 assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
 print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки»")
 
+# --- a plain misspelling in the translation itself ("resulits" for
+# "results") must be in scope too, even though the meaning is still
+# perfectly clear from context — Александр hit this live: the AI didn't
+# report it because the old wording scoped "опечатки/ошибки" to ONLY
+# meaning-distorting errors, which technically excludes an obvious
+# spelling slip a reader can still understand. The label now explicitly
+# names plain misspellings as their own always-in-scope category,
+# distinct from a stylistic/synonym choice (which stays out of scope). ---
+assert "неправильно написанное слово" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
+print("[OK] a plain spelling mistake is explicitly in scope for «опечатки/ошибки» even when the "
+      "meaning is still clear from context, distinct from a stylistic/synonym choice which isn't")
+
 # --- but when the free "numbers" rule check is ALSO running in the same
 # request, the AI must not also report a plain digit/date mismatch under
 # "typo" — that's the exact duplicate Александр hit: the same wrong-year
