@@ -647,6 +647,22 @@ assert "НЕ пиши здесь" in numerals_desc, numerals_desc  # numerals ex
 print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки», "
       "while «формат чисел и валют» only ever comments on spacing/separator/symbol-position formatting")
 
+# --- the Numerals document has several independent fields (currency
+# symbol/position, decimal separator, date format, ...) — Александр hit a
+# case where the currency field's example happened to use "." (just to show
+# symbol placement) while the SEPARATE "разделитель дробной части" field
+# correctly said ","; the model cross-applied the currency example's period
+# onto the decimal-separator question instead of using the dedicated field ---
+mixed_rule_desc = _checks_description(
+    ["numerals"],
+    numeral_rule={"валюта при числах до 10 000": "0.40 $", "разделитель дробной части": ","},
+)
+assert mixed_rule_desc is not None
+assert "бери его строго из поля «разделитель дробной части»" in mixed_rule_desc, mixed_rule_desc
+assert "не переноси" in mixed_rule_desc, mixed_rule_desc
+print("[OK] numerals check instruction keeps each rule field to its own aspect — a decimal separator "
+      "question is answered only from «разделитель дробной части», never from a currency field's example")
+
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something
 # else anyway (Александр hit this live: with only "Нумералс" ticked, the
