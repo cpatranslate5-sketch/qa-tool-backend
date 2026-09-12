@@ -549,6 +549,21 @@ from app.claude_client import CHECK_LABELS
 assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
 print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки»")
 
+# --- Александр hit a real case where, with only "glossary" ticked, the
+# model still reported a currency-identity mismatch, mislabeling it as
+# type "glossary" since that was the only type the schema allowed it to
+# use — the hard type-filter can't catch this because the label itself
+# WAS one of the allowed types, just attached to the wrong kind of finding.
+# Fixed by explicitly scoping "glossary" to term-matching only, and by
+# telling the model not to squeeze an out-of-scope finding into whichever
+# type happens to be available. ---
+from app.claude_client import SINGLE_PROMPT, BATCH_PROMPT
+
+assert "НЕ входит ничего" in CHECK_LABELS["glossary"], CHECK_LABELS["glossary"]
+assert "Не подгоняй" in SINGLE_PROMPT and "Не подгоняй" in BATCH_PROMPT
+print("[OK] glossary check is scoped to term-matching only, and the prompt explicitly forbids "
+      "squeezing an out-of-scope finding into whichever type happens to be the only one allowed")
+
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something
 # else anyway ---
