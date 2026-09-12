@@ -629,14 +629,23 @@ print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no lo
 # real case where the numerals rule's example happened to show "€" and the
 # model concluded the translation must be converted to euros, even though
 # the source used "$" throughout and only the spacing was actually wrong ---
-from app.claude_client import _checks_description
+from app.claude_client import CHECK_LABELS, _checks_description
 
 numerals_desc = _checks_description(["numerals"], numeral_rule={"валюта при числах до 10 000": "0,40€"})
 assert numerals_desc is not None
-assert "не диктует, какая валюта" in numerals_desc, numerals_desc
-assert "валюта исходника" in numerals_desc, numerals_desc
+assert "не по общим представлениям о формате" in numerals_desc, numerals_desc
 print("[OK] numerals check instruction separates the rule's example currency (illustrative) "
       "from its binding format, so a $ source isn't reformatted into the rule's example currency (€)")
+
+# --- currency IDENTITY (wrong currency entirely, e.g. € instead of $) and
+# currency FORMAT (spacing/separator/symbol position) are now split cleanly
+# between "typo" and "numerals" respectively, so selecting both criteria on
+# the same real mistake ($0.40 mistranslated as "0,40 €" with a stray space)
+# yields two distinct findings instead of one that conflates both ---
+assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
+assert "НЕ пиши здесь" in numerals_desc, numerals_desc  # numerals explicitly stays out of currency identity
+print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки», "
+      "while «формат чисел и валют» only ever comments on spacing/separator/symbol-position formatting")
 
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something
