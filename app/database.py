@@ -172,6 +172,22 @@ def _run_migrations():
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN manager_id INTEGER"))
 
+    # Actual Anthropic API cost per check, in USD — see
+    # claude_client._usage_cost. Existing rows get 0.0 (their real cost was
+    # never tracked), which reads the same as "no AI check ran".
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "single_checks" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("single_checks")}
+        if "cost_usd" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE single_checks ADD COLUMN cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0"))
+    if "multi_checks" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("multi_checks")}
+        if "cost_usd" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0"))
+
 
 def _ensure_admin_exists():
     from app import models

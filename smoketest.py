@@ -372,7 +372,13 @@ async def _fake_get_batch_results(results_url):
     assert results_url == "fake://results"
     # One fake AI finding for the "ru" target language of the (only) sheet —
     # custom_id format is "s{sheet_index}-{lang}" (see build_batch_plan).
-    return {"s0-ru": '[{"row": 1, "type": "typo", "severity": "medium", "message": "тестовая ИИ-находка"}]'}
+    # Shape matches the real get_batch_results: {custom_id: {"text": ..., "usage": ...}}.
+    return {
+        "s0-ru": {
+            "text": '[{"row": 1, "type": "typo", "severity": "medium", "message": "тестовая ИИ-находка"}]',
+            "usage": {"input_tokens": 1000, "output_tokens": 200},
+        }
+    }
 
 
 excel_multi_mod.create_message_batch = _fake_create_message_batch
@@ -411,6 +417,15 @@ assert any(
     for row in ru_findings
 ), ru_findings
 print("   ru findings after batch merge:", ru_findings)
+# The batch's real Anthropic usage (faked above) must translate into a
+# non-zero cost, computed with the batch discount, and persisted on the
+# record (not just present in the one-off response).
+assert finalized["cost_usd"] > 0, finalized
+r2 = check("multi-check detail re-fetch still shows the persisted cost", client.get(
+    f"/projects/{project_id}/multi-check/{batch_multi_check_id}", params={"manager_id": regular_id}
+))
+assert r2.json()["cost_usd"] == finalized["cost_usd"], r2.json()
+print(f"   batch cost_usd: {finalized['cost_usd']}")
 
 r = check("history now shows completed", client.get(
     f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
@@ -609,6 +624,20 @@ assert check_numbers("$50,000 prize", "50 тысяч приз") != []
 print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no longer "
       "false-flagged as a numbers mismatch; real mismatches and thousands-grouping still caught")
 
+# --- the "numerals" AI check's instruction must separate the rule's example
+# CURRENCY (illustrative only) from its FORMAT (binding) — Александр hit a
+# real case where the numerals rule's example happened to show "€" and the
+# model concluded the translation must be converted to euros, even though
+# the source used "$" throughout and only the spacing was actually wrong ---
+from app.claude_client import _checks_description
+
+numerals_desc = _checks_description(["numerals"], numeral_rule={"валюта при числах до 10 000": "0,40€"})
+assert numerals_desc is not None
+assert "не диктует, какая валюта" in numerals_desc, numerals_desc
+assert "валюта исходника" in numerals_desc, numerals_desc
+print("[OK] numerals check instruction separates the rule's example currency (illustrative) "
+      "from its binding format, so a $ source isn't reformatted into the rule's example currency (€)")
+
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something
 # else anyway (Александр hit this live: with only "Нумералс" ticked, the
@@ -633,26 +662,46 @@ async def _fake_call_claude(prompt, model=None):
     captured_prompts.append(prompt)
     # Simulates a model that ignores "проверяй только numerals" and
     # reports an untranslatable-text issue anyway.
-    return (
+    text = (
         '[{"type": "numerals", "severity": "medium", "message": "формат валюты не совпадает"},'
         '{"type": "untranslatable", "severity": "high", "message": "слово не переведено"}]'
     )
+    return (text, {"input_tokens": 500, "output_tokens": 100})
 
 
 claude_client_mod._call_claude = _fake_call_claude
-findings = asyncio.get_event_loop().run_until_complete(
+findings, ai_cost = asyncio.get_event_loop().run_until_complete(
     run_ai_checks(
         "source", "translation", "", ["numerals"], target_lang="az-az",
         numeral_rule={"формат валюты": "0,40 ₼"},
     )
 )
 assert findings == [raw_findings[0]], findings
+assert ai_cost > 0, ai_cost
 # The JSON schema shown to the model is also scoped down to just the
 # requested check(s), not a fixed always-all-6 list.
 type_enum_line = next(line for line in captured_prompts[0].splitlines() if '"type":' in line)
 assert "numerals" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
-settings.ANTHROPIC_API_KEY = ""
 print("[OK] AI findings hard-filtered to requested checks even when the model reports "
       "an out-of-scope finding anyway (prompt's type list is also scoped down, in addition)")
+
+# --- the /check endpoint itself surfaces the real AI cost, not just the
+# internal run_ai_checks helper (Александр asked to see the cost of each
+# check after it runs) ---
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+r = check("standalone /check surfaces cost_usd for an AI-backed check", client.post(
+    "/check",
+    json={
+        "source": "source text",
+        "translation": "translation text",
+        # "typo" needs no project document to run (unlike "numerals", which
+        # is dropped with nothing to check against — see _checks_description).
+        "checks": ["typo"],
+    },
+))
+check_cost_data = r.json()
+assert check_cost_data["cost_usd"] > 0, check_cost_data
+print(f"   /check cost_usd: {check_cost_data['cost_usd']}")
+settings.ANTHROPIC_API_KEY = ""
 
 print("\nALL SMOKETEST CHECKS PASSED")

@@ -486,10 +486,11 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         payload.source, payload.translation, payload.checks,
         lang_code=payload.target_lang,
     )
-    findings += await run_ai_checks(
+    ai_findings, cost_usd = await run_ai_checks(
         payload.source, payload.translation, glossary, payload.checks, payload.extra_instructions,
         numeral_rule, tone_register, payload.target_lang, payload.source_lang,
     )
+    findings += ai_findings
 
     single_check_id = None
     if project is not None:
@@ -503,13 +504,14 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
             findings=findings,
             performed_by_name=payload.manager_name.strip(),
             manager_id=payload.manager_id,
+            cost_usd=cost_usd,
         )
         db.add(record)
         db.commit()
         db.refresh(record)
         single_check_id = record.id
 
-    return schemas.CheckOut(findings=findings, single_check_id=single_check_id)
+    return schemas.CheckOut(findings=findings, single_check_id=single_check_id, cost_usd=cost_usd)
 
 
 @app.get(
@@ -531,6 +533,7 @@ def single_check_history(project_id: int, manager_id: int, db: Session = Depends
             checks_run=r.checks_run, findings=r.findings,
             performed_by_name=r.performed_by_name,
             created_at=r.created_at.isoformat(),
+            cost_usd=r.cost_usd,
         )
         for r in records
     ]
@@ -604,6 +607,7 @@ async def multi_check(
             status="completed",
             performed_by_name=manager_name.strip(),
             manager_id=manager_id,
+            cost_usd=results["summary"].get("cost_usd", 0.0),
         )
         db.add(record)
         db.commit()
@@ -614,6 +618,7 @@ async def multi_check(
             "source_lang": resolved_source,
             "summary": results["summary"],
             "sheets": results["sheets"],
+            "cost_usd": record.cost_usd,
         }
 
     requests, skeleton = build_batch_plan(
@@ -636,6 +641,7 @@ async def multi_check(
             status="completed",
             performed_by_name=manager_name.strip(),
             manager_id=manager_id,
+            cost_usd=results["summary"].get("cost_usd", 0.0),
         )
         db.add(record)
         db.commit()
@@ -646,6 +652,7 @@ async def multi_check(
             "source_lang": resolved_source,
             "summary": results["summary"],
             "sheets": results["sheets"],
+            "cost_usd": record.cost_usd,
         }
 
     record = models.MultiCheck(
@@ -659,6 +666,9 @@ async def multi_check(
         batch_id=batch_id,
         performed_by_name=manager_name.strip(),
         manager_id=manager_id,
+        # Real cost isn't known until the Anthropic batch ends — see
+        # multi_check_detail, which fills this in once it finalizes.
+        cost_usd=0.0,
     )
     db.add(record)
     db.commit()
@@ -687,6 +697,7 @@ def multi_check_history(project_id: int, manager_id: int, db: Session = Depends(
             id=r.id, filename=r.filename, source_lang=r.source_lang,
             summary=r.summary, status=r.status, performed_by_name=r.performed_by_name,
             created_at=r.created_at.isoformat(),
+            cost_usd=r.cost_usd,
         )
         for r in records
     ]
@@ -705,6 +716,7 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
             record.results = finalized
             record.summary = finalized["summary"]
             record.status = "completed"
+            record.cost_usd = finalized["summary"].get("cost_usd", 0.0)
             db.commit()
             db.refresh(record)
 
@@ -723,6 +735,7 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
         "source_lang": record.source_lang,
         "summary": record.summary,
         "sheets": record.results.get("sheets", []),
+        "cost_usd": record.cost_usd,
     }
 
 

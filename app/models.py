@@ -4,6 +4,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -146,6 +147,10 @@ class SingleCheck(Base):
     checks_run: Mapped[list] = mapped_column(JSON, default=list)
     findings: Mapped[list] = mapped_column(JSON, default=list)
     performed_by_name: Mapped[str] = mapped_column(String(120), default="")
+    # Actual Anthropic API cost of this check's AI calls, in USD — 0 for a
+    # check that used only free rule-based criteria (punctuation, numbers,
+    # placeholders) or ran with no API key configured.
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     project: Mapped["Project"] = relationship(back_populates="single_checks")
@@ -176,6 +181,10 @@ class MultiCheck(Base):
     status: Mapped[str] = mapped_column(String(20), default="completed")
     batch_id: Mapped[str] = mapped_column(String(200), default="")
     performed_by_name: Mapped[str] = mapped_column(String(120), default="")
+    # Same as SingleCheck.cost_usd, above — summed across every language's
+    # AI call for this upload. Filled in once (for a synchronous run) or
+    # once the Message Batches job finalizes (for a "processing" one).
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     project: Mapped["Project"] = relationship(back_populates="multi_checks")

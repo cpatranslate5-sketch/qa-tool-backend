@@ -130,6 +130,9 @@ class Finding(BaseModel):
 class CheckOut(BaseModel):
     findings: list[dict]
     single_check_id: int | None = None
+    # Actual Anthropic API cost of this check's AI calls, in USD (0 when it
+    # only used free rule-based criteria, or no API key is configured).
+    cost_usd: float = 0.0
 
 
 class SingleCheckHistoryOut(BaseModel):
@@ -142,6 +145,7 @@ class SingleCheckHistoryOut(BaseModel):
     findings: list
     performed_by_name: str
     created_at: str
+    cost_usd: float = 0.0
 
     class Config:
         from_attributes = True
@@ -152,6 +156,7 @@ class MultiCheckHistoryOut(BaseModel):
     filename: str
     source_lang: str
     summary: dict
+    cost_usd: float = 0.0
     status: str
     performed_by_name: str
     created_at: str

@@ -154,7 +154,12 @@ def _checks_description(checks: list[str], numeral_rule: dict | None = None, ton
                 continue
             labels.append(
                 f'формат чисел и валют — строго по правилам для этого языка: "{numeral_text}"; '
-                f"не по общим представлениям о формате"
+                f"это ПРАВИЛА ОФОРМЛЕНИЯ (разделитель дробной части, порядок символа/кода валюты относительно "
+                f"числа, пробел или его отсутствие, группировка разрядов и т.п.) — сама валюта (символ или код), "
+                f"показанная в примере правила, лишь иллюстрирует формат и не диктует, какая валюта должна быть "
+                f"в переводе: если в исходнике указана другая валюта (например, $ вместо примера с €), в переводе "
+                f"должна остаться валюта исходника, оформленная по правилу, а смена валюты на ту, что из примера "
+                f"правила, — это ошибка, а не исправление; не по общим представлениям о формате"
             )
         elif c == "register" and tone_register.strip() in ("formal", "informal"):
             word = "формальный (вы/аналог)" if tone_register.strip() == "formal" else "неформальный (ты/аналог)"
@@ -183,10 +188,11 @@ def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[
 
 # Languages that get the stronger CLAUDE_MODEL_HARD instead of the default
 # CLAUDE_MODEL — agreed with Александр after costing out the difference
-# (Sonnet is exactly ~2x Haiku per token, but only these languages' calls
-# use it, so the total impact is modest). Matched against the BASE
-# language subtag of whatever target_lang a check actually runs with, so
-# "kk-KZ", "kk", or any other region variant of Kazakh all get it alike.
+# (Sonnet 4.5 is 3x Haiku 4.5 per token, both input and output, but only
+# these languages' calls use it, so the total impact is modest). Matched
+# against the BASE language subtag of whatever target_lang a check actually
+# runs with, so "kk-KZ", "kk", or any other region variant of Kazakh all
+# get it alike.
 HARD_LANGUAGE_BASES = {"kk", "ky", "tg", "uz", "sw", "te", "mr", "az"}
 
 
@@ -195,9 +201,40 @@ def _model_for_lang(target_lang: str) -> str:
     return settings.CLAUDE_MODEL_HARD if base in HARD_LANGUAGE_BASES else settings.CLAUDE_MODEL
 
 
-async def _call_claude(prompt: str, model: str | None = None) -> str | None:
+# USD per single token (not per million) — verified against
+# platform.claude.com/docs/en/about-claude/pricing. Keyed by the exact
+# model id, since that's what actually gets billed; if CLAUDE_MODEL or
+# CLAUDE_MODEL_HARD is ever pointed at a model not listed here, cost just
+# can't be computed for those calls (see _usage_cost) rather than guessing
+# at a price that may no longer be current — update this table when that
+# happens, or when Anthropic's prices change.
+MODEL_PRICING_PER_TOKEN = {
+    "claude-haiku-4-5-20251001": {"input": 1.00 / 1_000_000, "output": 5.00 / 1_000_000},
+    "claude-sonnet-4-5-20250929": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
+}
+# The Message Batches API (used for large multi-checks — see
+# excel_multi.BATCH_THRESHOLD_CHARS) is half price on both input and output.
+BATCH_PRICE_DISCOUNT = 0.5
+
+
+def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
+    """USD cost of one API call from its token usage. Returns 0.0 (rather
+    than raising) for an unpriced model or missing usage, so a pricing-table
+    gap degrades to "cost not shown" instead of breaking the check itself."""
+    rates = MODEL_PRICING_PER_TOKEN.get(model)
+    if not rates or not usage:
+        return 0.0
+    cost = usage.get("input_tokens", 0) * rates["input"] + usage.get("output_tokens", 0) * rates["output"]
+    return cost * BATCH_PRICE_DISCOUNT if batch else cost
+
+
+async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | None, dict]:
+    """Returns (response_text, usage) — usage is Anthropic's raw {"input_tokens":
+    int, "output_tokens": int, ...} dict (empty when no API key is configured),
+    used by callers to compute and surface this check's actual API cost."""
     if not settings.ANTHROPIC_API_KEY:
-        return None
+        return None, {}
+    resolved_model = model or settings.CLAUDE_MODEL
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -207,7 +244,7 @@ async def _call_claude(prompt: str, model: str | None = None) -> str | None:
                 "content-type": "application/json",
             },
             json={
-                "model": model or settings.CLAUDE_MODEL,
+                "model": resolved_model,
                 "max_tokens": 8000,
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -215,7 +252,8 @@ async def _call_claude(prompt: str, model: str | None = None) -> str | None:
         resp.raise_for_status()
         data = resp.json()
 
-    return next((b["text"] for b in data.get("content", []) if b.get("type") == "text"), None)
+    text = next((b["text"] for b in data.get("content", []) if b.get("type") == "text"), None)
+    return text, data.get("usage", {})
 
 
 def parse_json_array(text_block: str | None) -> list:
@@ -234,10 +272,13 @@ def parse_json_array(text_block: str | None) -> list:
 async def run_ai_checks(
     source: str, translation: str, glossary: str, checks: list[str], extra_instructions: str = "",
     numeral_rule: dict | None = None, tone_register: str = "", target_lang: str = "", source_lang: str = "",
-) -> list[dict]:
+) -> tuple[list[dict], float]:
+    """Returns (findings, cost_usd) — cost_usd is this one API call's actual
+    cost from Anthropic's reported token usage (0.0 when no AI check ran,
+    e.g. no API key configured or nothing to check against)."""
     checks_description = _checks_description(checks, numeral_rule, tone_register)
     if not checks_description:
-        return []
+        return [], 0.0
 
     prompt = SINGLE_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
@@ -250,8 +291,10 @@ async def run_ai_checks(
         checks_description=checks_description,
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
     )
-    text_block = await _call_claude(prompt, model=_model_for_lang(target_lang))
-    return _filter_findings_by_checks(parse_json_array(text_block), checks)
+    model = _model_for_lang(target_lang)
+    text_block, usage = await _call_claude(prompt, model=model)
+    findings = _filter_findings_by_checks(parse_json_array(text_block), checks)
+    return findings, _usage_cost(model, usage)
 
 
 def build_batch_prompt(
@@ -332,18 +375,20 @@ async def run_ai_checks_batch(
     tone_register: str = "",
     target_lang: str = "",
     source_lang: str = "",
-) -> dict[int, list[dict]]:
+) -> tuple[dict[int, list[dict]], float]:
     """Synchronous path: builds the prompt, calls Claude right away, and
-    returns findings keyed by index into items."""
+    returns (findings keyed by index into items, this call's cost_usd)."""
     prompt, number_to_index = build_batch_prompt(
         items, glossary, checks, extra_instructions, numeral_rule, tone_register, target_lang, source_lang
     )
     if prompt is None:
-        return {}
-    text_block = await _call_claude(prompt, model=_model_for_lang(target_lang))
+        return {}, 0.0
+    model = _model_for_lang(target_lang)
+    text_block, usage = await _call_claude(prompt, model=model)
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
-    return {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
+    filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
+    return filtered, _usage_cost(model, usage)
 
 
 # --------------------------------------------------- Message Batches API ---
@@ -398,17 +443,18 @@ async def get_batch_status(batch_id: str) -> dict:
         return resp.json()
 
 
-async def get_batch_results(results_url: str) -> dict[str, str | None]:
+async def get_batch_results(results_url: str) -> dict[str, dict]:
     """Fetches and parses the batch's .jsonl results. Returns
-    {custom_id: text_block}, with None for any request that errored,
-    expired, or was canceled (extremely unlikely, but handled rather than
-    crashing the whole multi-check over one bad language)."""
+    {custom_id: {"text": str | None, "usage": dict}} — text is None for any
+    request that errored, expired, or was canceled (extremely unlikely, but
+    handled rather than crashing the whole multi-check over one bad
+    language); usage is {} in that case too, same as a missing-key cost."""
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.get(results_url, headers=_headers())
         resp.raise_for_status()
         raw_text = resp.text
 
-    out: dict[str, str | None] = {}
+    out: dict[str, dict] = {}
     for line in raw_text.splitlines():
         line = line.strip()
         if not line:
@@ -419,8 +465,10 @@ async def get_batch_results(results_url: str) -> dict[str, str | None]:
             continue
         result = entry.get("result", {})
         text = None
+        usage = {}
         if result.get("type") == "succeeded":
             message = result.get("message", {})
             text = next((b["text"] for b in message.get("content", []) if b.get("type") == "text"), None)
-        out[custom_id] = text
+            usage = message.get("usage", {})
+        out[custom_id] = {"text": text, "usage": usage}
     return out

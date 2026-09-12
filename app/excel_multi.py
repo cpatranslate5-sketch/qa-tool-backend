@@ -13,6 +13,7 @@ import openpyxl
 from app.claude_client import (
     _filter_findings_by_checks,
     _model_for_lang,
+    _usage_cost,
     build_batch_prompt,
     create_message_batch,
     get_batch_results,
@@ -326,7 +327,7 @@ async def _check_language_for_sheet(
     semaphore: asyncio.Semaphore,
     numeral_rule: str = "",
     tone_register: str = "",
-) -> list[dict]:
+) -> tuple[list[dict], float]:
     relevant_rows = []
     ai_items = []
     for row in sheet["rows"]:
@@ -338,10 +339,10 @@ async def _check_language_for_sheet(
         ai_items.append({"context": row["context"], "source": src, "translation": tgt})
 
     if not relevant_rows:
-        return []
+        return [], 0.0
 
     async with semaphore:
-        ai_findings_by_idx = await run_ai_checks_batch(
+        ai_findings_by_idx, cost_usd = await run_ai_checks_batch(
             ai_items, glossary, checks, extra_instructions, numeral_rule, tone_register, lang, source_lang
         )
 
@@ -359,7 +360,7 @@ async def _check_language_for_sheet(
                 "translation": tgt,
                 "findings": findings,
             })
-    return out
+    return out, cost_usd
 
 
 async def run_multi_check(
@@ -390,6 +391,7 @@ async def run_multi_check(
     result_sheets = []
     total_findings = 0
     total_rows_checked = 0
+    total_cost_usd = 0.0
 
     for sheet in sheets:
         target_langs = [l for l in sheet["languages"] if l != source_lang]
@@ -405,9 +407,10 @@ async def run_multi_check(
         per_lang_results = await asyncio.gather(*tasks) if tasks else []
 
         languages_out = {}
-        for lang, findings_list in zip(target_langs, per_lang_results):
+        for lang, (findings_list, lang_cost) in zip(target_langs, per_lang_results):
             languages_out[lang] = findings_list
             total_findings += sum(len(f["findings"]) for f in findings_list)
+            total_cost_usd += lang_cost
 
         total_rows_checked += len(sheet["rows"])
         result_sheets.append({
@@ -423,6 +426,7 @@ async def run_multi_check(
         "rows_checked": total_rows_checked,
         "languages_checked": sorted({l for s in result_sheets for l in s["languages_checked"]}),
         "total_findings": total_findings,
+        "cost_usd": total_cost_usd,
     }
     return {"sheets": result_sheets, "summary": summary}
 
@@ -519,15 +523,19 @@ def build_batch_plan(
                 })
 
             custom_id = f"s{s_idx}-{lang}"
+            model = _model_for_lang(lang)
             prompt, number_to_index = build_batch_prompt(
                 ai_items, glossary_for_lang(lang), checks, extra_instructions,
                 numerals_for_lang(lang), tone_for_lang(lang), lang, source_lang,
             )
             if prompt is not None:
-                requests.append({"custom_id": custom_id, "prompt": prompt, "model": _model_for_lang(lang)})
+                requests.append({"custom_id": custom_id, "prompt": prompt, "model": model})
 
             languages_skeleton[lang] = {
                 "custom_id": custom_id if prompt is not None else None,
+                # Needed later by finalize_batch_results to price this
+                # language's usage at the right per-token rate.
+                "model": model,
                 "number_to_index": {str(k): v for k, v in number_to_index.items()},
                 "rows": base_rows,
             }
@@ -548,13 +556,18 @@ def build_batch_plan(
     return requests, skeleton
 
 
-def finalize_batch_results(skeleton: dict, ai_text_by_custom_id: dict[str, str | None]) -> dict:
+def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, dict]) -> dict:
     """Merges AI findings (once the Anthropic batch has ended) into the
     rule-based skeleton from build_batch_plan, producing the same
-    {"sheets": [...], "summary": {...}} shape run_multi_check returns."""
+    {"sheets": [...], "summary": {...}} shape run_multi_check returns.
+
+    ai_results_by_custom_id: {custom_id: {"text": str | None, "usage": dict}}
+    — see claude_client.get_batch_results. Missing/empty entries (e.g. no
+    batch was actually submitted) simply contribute no findings and no cost."""
     result_sheets = []
     total_findings = 0
     total_rows_checked = 0
+    total_cost_usd = 0.0
 
     for sheet in skeleton["sheets"]:
         languages_out = {}
@@ -562,8 +575,8 @@ def finalize_batch_results(skeleton: dict, ai_text_by_custom_id: dict[str, str |
             ai_grouped: dict[int, list[dict]] = {}
             custom_id = lang_skel["custom_id"]
             if custom_id is not None:
-                text_block = ai_text_by_custom_id.get(custom_id)
-                raw = parse_json_array(text_block)
+                ai_result = ai_results_by_custom_id.get(custom_id) or {}
+                raw = parse_json_array(ai_result.get("text"))
                 # JSON round-trips dict keys as strings — restore int keys.
                 number_to_index = {int(k): v for k, v in lang_skel["number_to_index"].items()}
                 ai_grouped = group_batch_findings(raw, number_to_index)
@@ -574,6 +587,7 @@ def finalize_batch_results(skeleton: dict, ai_text_by_custom_id: dict[str, str |
                     idx: _filter_findings_by_checks(fs, skeleton.get("checks", []))
                     for idx, fs in ai_grouped.items()
                 }
+                total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
 
             findings_list = []
             for idx, row in enumerate(lang_skel["rows"]):
@@ -603,6 +617,7 @@ def finalize_batch_results(skeleton: dict, ai_text_by_custom_id: dict[str, str |
         "rows_checked": total_rows_checked,
         "languages_checked": sorted({l for s in result_sheets for l in s["languages_checked"]}),
         "total_findings": total_findings,
+        "cost_usd": total_cost_usd,
     }
     return {"sheets": result_sheets, "summary": summary}
 
@@ -619,8 +634,8 @@ async def try_finalize_batch(batch_id: str, skeleton: dict) -> dict | None:
     if status.get("processing_status") != "ended":
         return None
     results_url = status.get("results_url")
-    ai_text_by_custom_id = await get_batch_results(results_url) if results_url else {}
-    return finalize_batch_results(skeleton, ai_text_by_custom_id)
+    ai_results_by_custom_id = await get_batch_results(results_url) if results_url else {}
+    return finalize_batch_results(skeleton, ai_results_by_custom_id)
 
 
 def build_report_workbook(filename: str, source_lang: str, results: dict) -> bytes:
