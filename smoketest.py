@@ -533,6 +533,26 @@ from app.claude_client import CHECK_LABELS
 assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
 print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки»")
 
+# --- but when the free "numbers" rule check is ALSO running in the same
+# request, the AI must not also report a plain digit/date mismatch under
+# "typo" — that's the exact duplicate Александр hit: the same wrong-year
+# date shown once as "numbers" and again, reworded, as "typo". The AI is
+# told to leave plain digits to the rule check and only still flag
+# currency IDENTITY (not itself a digit) under "typo". When "numbers"
+# ISN'T part of this run, the AI keeps acting as the sole backstop for a
+# wrong number, exactly as before this fix. ---
+from app.claude_client import _calibration
+
+calib_with_numbers = _calibration(["typo", "numbers"])
+calib_without_numbers = _calibration(["typo"])
+assert "не сообщай о них здесь" in calib_with_numbers, calib_with_numbers
+assert "не сообщай о них здесь" not in calib_without_numbers, calib_without_numbers
+assert "валюта или число не совпадают" in calib_without_numbers, calib_without_numbers
+print("[OK] the AI is told to skip plain digit/date mismatches under «опечатки/ошибки» whenever "
+      "the free «numbers» rule check is also part of the same run (avoids the same error being "
+      "reported twice under two different labels), and stays the sole backstop for numbers "
+      "otherwise")
+
 # --- the prompt also tells the model not to squeeze an out-of-scope
 # finding into whichever type happens to be the only one allowed —
 # Александр hit exactly this with the (now-removed) glossary check, but

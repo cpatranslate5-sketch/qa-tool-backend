@@ -32,13 +32,39 @@ CHECK_LABELS = {
     ),
 }
 
-CALIBRATION = (
+CALIBRATION_BASE = (
     "Общее правило: сообщай, только если уверен(а), что это настоящая ошибка. Сомневаешься или это может быть "
     "допустимым вариантом — не включай. Лучше меньше, но точных находок. Порядок символа валюты относительно числа, "
-    "разделители тысяч/десятичных знаков и подобное оформление чисел — это НЕ ошибка перевода сама по себе, и об "
-    "этом никогда не нужно сообщать; настоящая ошибка — это когда сама валюта или число не совпадают с исходником "
-    "по смыслу (см. «опечатки/ошибки»), а не то, как они оформлены."
+    "разделители тысяч/десятичных знаков, а также сам порядок частей даты (день/месяц/год) и то, точкой или "
+    "слэшем они разделены — это НЕ ошибка перевода сама по себе, и об этом никогда не нужно сообщать."
 )
+
+# When "numbers" is also running (a free, 100%-reliable rule check — see
+# app.rule_checks.check_numbers — auto-included whenever "Оформление" is
+# selected), it already catches every plain digit/date mismatch on its own.
+# Telling the AI to still report those under "опечатки/ошибки" too just
+# duplicates the same finding twice under two different labels — Александр
+# hit exactly this (a wrong year in a date, shown once as "numbers" and
+# again, reworded, as "typo"). So when it's running alongside, the AI is
+# told to leave plain digits to it and only flag currency IDENTITY (a
+# symbol/code that doesn't match — not itself a digit, so "numbers" can't
+# catch it). When "numbers" ISN'T selected for this run, the AI keeps
+# acting as the only backstop for a wrong number/date, exactly as before.
+_CALIBRATION_WITH_NUMBERS_CHECK = (
+    "Расхождения в самих цифрах (неверное число, неверная дата и т.п.) уже ловит отдельная бесплатная "
+    "автоматическая проверка чисел, включённая в эту проверку — не сообщай о них здесь, даже если заметишь; "
+    "в «опечатки/ошибки» сообщай только о несовпадении самой валюты (символ или код, например евро вместо "
+    "доллара), а не о цифрах."
+)
+_CALIBRATION_WITHOUT_NUMBERS_CHECK = (
+    "настоящая ошибка — это когда сама валюта или число не совпадают с исходником по смыслу "
+    "(см. «опечатки/ошибки»), а не то, как они оформлены."
+)
+
+
+def _calibration(checks: list[str]) -> str:
+    tail = _CALIBRATION_WITH_NUMBERS_CHECK if "numbers" in checks else _CALIBRATION_WITHOUT_NUMBERS_CHECK
+    return f"{CALIBRATION_BASE} {tail}"
 
 
 SINGLE_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
@@ -255,7 +281,7 @@ async def run_ai_checks(
 
     prompt = SINGLE_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
-        calibration=CALIBRATION,
+        calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang),
         source=source,
         translation=translation,
@@ -310,7 +336,7 @@ def build_batch_prompt(
     )
     prompt = BATCH_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
-        calibration=CALIBRATION,
+        calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang),
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description,
