@@ -111,9 +111,8 @@ def _freeze(value):
 def resolve_lang_code(requested: str, available, values: dict | None = None):
     """Matches a requested language code against a set/dict/iterable of
     codes actually present in one document, bridging granularity mismatches
-    between the project's different reference documents — e.g. the
-    Glossary may use a plain "ko" while another document uses region-
-    qualified "ko-KR" for the same language.
+    within that document — e.g. a target language selected as a plain "ko"
+    still finds a region-qualified "ko-KR" row, and vice versa.
 
     Tries an exact (case-insensitive) match first. Failing that, falls
     back to matching the requested code against any subtag (language part
@@ -321,7 +320,6 @@ async def _check_language_for_sheet(
     sheet: dict,
     lang: str,
     source_lang: str,
-    glossary: str,
     checks: list[str],
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
@@ -342,7 +340,7 @@ async def _check_language_for_sheet(
 
     async with semaphore:
         ai_findings_by_idx, cost_usd = await run_ai_checks_batch(
-            ai_items, glossary, checks, extra_instructions, tone_register, lang, source_lang
+            ai_items, checks, extra_instructions, tone_register, lang, source_lang
         )
 
     out = []
@@ -365,18 +363,17 @@ async def _check_language_for_sheet(
 async def run_multi_check(
     sheets: list[dict],
     source_lang: str,
-    glossary_for_lang,
     checks: list[str],
     extra_instructions: str = "",
     tone_for_lang=None,
     target_langs_filter: set[str] | None = None,
 ) -> dict:
     """
-    glossary_for_lang / tone_for_lang: each a callable(lang_code) -> prompt
-    text (or "" if nothing for that language), already narrowed to just
-    what this one target language needs — see app.glossary / app.project_docs.
-    Each target language gets its own call, so the AI prompt for e.g.
-    "es-mx" never carries the other 34 languages' rows.
+    tone_for_lang: a callable(lang_code) -> "formal"/"informal"/"" (or ""
+    if nothing for that language), already narrowed to just what this one
+    target language needs — see app.project_docs. Each target language gets
+    its own call, so the AI prompt for e.g. "es-mx" never carries the other
+    34 languages' rows.
 
     target_langs_filter: when given, only these languages are checked even
     if the file has more columns — lets a manager check a subset of a
@@ -395,7 +392,7 @@ async def run_multi_check(
             target_langs = [l for l in target_langs if l in target_langs_filter]
         tasks = [
             _check_language_for_sheet(
-                sheet, lang, source_lang, glossary_for_lang(lang), checks, extra_instructions, semaphore,
+                sheet, lang, source_lang, checks, extra_instructions, semaphore,
                 tone_for_lang(lang),
             )
             for lang in target_langs
@@ -463,7 +460,6 @@ def estimate_check_volume(
 def build_batch_plan(
     sheets: list[dict],
     source_lang: str,
-    glossary_for_lang,
     checks: list[str],
     extra_instructions: str = "",
     tone_for_lang=None,
@@ -519,7 +515,7 @@ def build_batch_plan(
             custom_id = f"s{s_idx}-{lang}"
             model = _model_for_lang(lang)
             prompt, number_to_index = build_batch_prompt(
-                ai_items, glossary_for_lang(lang), checks, extra_instructions,
+                ai_items, checks, extra_instructions,
                 tone_for_lang(lang), lang, source_lang,
             )
             if prompt is not None:

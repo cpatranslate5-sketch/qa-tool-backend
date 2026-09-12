@@ -7,7 +7,7 @@ from pydantic import BaseModel
 # "register" (tone of address) requires its matching project document to
 # be uploaded at all — see app.main._require_doc.
 DEFAULT_CHECKS = [
-    "numbers", "placeholders", "glossary", "register", "typo",
+    "numbers", "placeholders", "register", "typo",
     "untranslatable", "completeness", "punctuation",
 ]
 
@@ -48,8 +48,8 @@ class ManagerAdminEnterIn(BaseModel):
 class ProjectIn(BaseModel):
     name: str
     manager_id: int
-    # Optional — deep-copies another project's glossary/tone rows into the
-    # new one as a starting point (fully independent afterward).
+    # Optional — deep-copies another project's tone-of-address rows into
+    # the new one as a starting point (fully independent afterward).
     copy_from_project_id: int | None = None
 
 
@@ -61,8 +61,6 @@ class ProjectDeleteIn(BaseModel):
 class ProjectOut(BaseModel):
     id: int
     name: str
-    glossary_filename: str
-    glossary_uploaded_at: datetime.datetime | None
     tone_filename: str
     tone_uploaded_at: datetime.datetime | None
     created_by_name: str
@@ -71,17 +69,11 @@ class ProjectOut(BaseModel):
         from_attributes = True
 
 
-class GlossaryStatusOut(BaseModel):
-    """Both project documents (glossary, tone-of-address) are structured
-    files uploaded by the admin — this is what every folder sees to know
-    what's loaded, without exposing the full table."""
-
-    filename: str
-    uploaded_at: datetime.datetime | None
-    term_count: int
-
-
 class ToneStatusOut(BaseModel):
+    """The project's Tone-of-address document is a structured file uploaded
+    by the admin — this is what every folder sees to know what's loaded,
+    without exposing the full table."""
+
     filename: str
     uploaded_at: datetime.datetime | None
     rule_count: int
@@ -93,16 +85,14 @@ class CheckIn(BaseModel):
     checks: list[str] = DEFAULT_CHECKS
     # Optional — when provided, the check is saved into the requesting
     # folder's own history (see manager_id below) and the project's
-    # glossary/tone documents (narrowed to EN + RU + this one target
-    # language) are used automatically.
+    # tone-of-address document (narrowed to this one target language) is
+    # used automatically.
     project_id: int | None = None
     source_lang: str = ""
     target_lang: str = ""
-    # Only used when project_id is not given (standalone check).
-    glossary: str = ""
     # One-off instruction for this specific task only (e.g. "in this task,
     # 'Golden Spin' should be translated, not left as-is") — never saved to
-    # the project, unlike the glossary.
+    # the project.
     extra_instructions: str = ""
     # Who's running it — manager_name is just for display attribution,
     # manager_id is what scopes this check into that folder's own history

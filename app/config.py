@@ -27,10 +27,11 @@ class Settings:
 settings = Settings()
 
 if not settings.ANTHROPIC_API_KEY:
-    # AI-based checks (glossary/register/typo) are silently skipped when no
-    # key is configured — rule-based checks (numbers/placeholders/length)
-    # still work. This lets the app boot locally without a key; Railway
-    # must have ANTHROPIC_API_KEY set for AI checks to actually run.
+    # AI-based checks (register/typo/untranslatable/completeness) are
+    # silently skipped when no key is configured — rule-based checks
+    # (numbers/placeholders/length) still work. This lets the app boot
+    # locally without a key; Railway must have ANTHROPIC_API_KEY set for
+    # AI checks to actually run.
     import warnings
 
     warnings.warn("ANTHROPIC_API_KEY is not set — AI-based checks will be skipped.")

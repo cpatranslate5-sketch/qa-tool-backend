@@ -6,15 +6,12 @@ import httpx
 from app.config import settings
 
 CHECK_LABELS = {
-    # Purely term-matching — glossary is about vocabulary, not number/date
-    # format (see the "typo" entry below for currency identity mismatches;
-    # the separate rule-based "numbers" check in rule_checks.py handles raw
-    # digit mismatches between source and translation).
-    "glossary": (
-        "глоссарий — термины из глоссария должны быть переведены ровно как там указано. Сюда НЕ входит ничего "
-        "другое (валюта, грамматика, числа, стиль и т.п.), даже если это очевидная и серьёзная ошибка — для этого "
-        "есть свои отдельные критерии"
-    ),
+    # (A "glossary" check used to live here too — required-term matching
+    # against an uploaded glossary document. Removed: unlike the other AI
+    # checks, that one never actually needed a probabilistic model — a term
+    # either matches the glossary or it doesn't, a plain text comparison —
+    # so it kept missing/mislabeling things for no good reason. See git
+    # history for the removal.)
     "register": "регистр обращения (ты/вы и аналоги) — должен быть единым по всему тексту",
     "typo": (
         "опечатки/ошибки — только те, что искажают смысл (пропущенное отрицание, спутанные число/род, потеря смысла, "
@@ -59,9 +56,6 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 Перевод:
 \"\"\"{translation}\"\"\"
 
-Глоссарий (обязательные соответствия и формат чисел, если есть):
-{glossary}
-
 Особые указания к задаче (важнее общих правил, если есть):
 {extra_instructions}
 
@@ -85,9 +79,6 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 {calibration}
 
 {source_lang_note}
-
-Глоссарий (обязательные соответствия и формат чисел, если есть, для всех пар):
-{glossary}
 
 Особые указания к задаче (важнее общих правил, если есть):
 {extra_instructions}
@@ -252,7 +243,7 @@ def parse_json_array(text_block: str | None) -> list:
 
 
 async def run_ai_checks(
-    source: str, translation: str, glossary: str, checks: list[str], extra_instructions: str = "",
+    source: str, translation: str, checks: list[str], extra_instructions: str = "",
     tone_register: str = "", target_lang: str = "", source_lang: str = "",
 ) -> tuple[list[dict], float]:
     """Returns (findings, cost_usd) — cost_usd is this one API call's actual
@@ -268,7 +259,6 @@ async def run_ai_checks(
         source_lang_note=_source_lang_note(source_lang),
         source=source,
         translation=translation,
-        glossary=glossary.strip() or "не указан",
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description,
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
@@ -281,7 +271,6 @@ async def run_ai_checks(
 
 def build_batch_prompt(
     items: list[dict],
-    glossary: str,
     checks: list[str],
     extra_instructions: str = "",
     tone_register: str = "",
@@ -323,7 +312,6 @@ def build_batch_prompt(
         target_lang_line=_target_lang_line(target_lang),
         calibration=CALIBRATION,
         source_lang_note=_source_lang_note(source_lang),
-        glossary=glossary.strip() or "не указан",
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description,
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
@@ -349,7 +337,6 @@ def group_batch_findings(raw: list, number_to_index: dict[int, int]) -> dict[int
 
 async def run_ai_checks_batch(
     items: list[dict],
-    glossary: str,
     checks: list[str],
     extra_instructions: str = "",
     tone_register: str = "",
@@ -359,7 +346,7 @@ async def run_ai_checks_batch(
     """Synchronous path: builds the prompt, calls Claude right away, and
     returns (findings keyed by index into items, this call's cost_usd)."""
     prompt, number_to_index = build_batch_prompt(
-        items, glossary, checks, extra_instructions, tone_register, target_lang, source_lang
+        items, checks, extra_instructions, tone_register, target_lang, source_lang
     )
     if prompt is None:
         return {}, 0.0

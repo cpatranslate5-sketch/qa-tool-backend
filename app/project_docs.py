@@ -1,20 +1,21 @@
 """
 Parsing for the project's Tone-of-address reference document
-(formal/informal register per language).
+(formal/informal register per language) — the only reference document
+this app still has.
 
-The real file mirrors the Glossary's layout: language codes run across
-the header row as columns, with the register sitting in the row(s) below
-(see parse_tone_workbook).
+Language codes run across the header row as columns, with the register
+sitting in the row(s) below (see parse_tone_workbook).
 
 Governs an AI check that refuses to run at all for a project with no
 rows uploaded (see app.main._require_doc) — but a doc uploaded without a
 column for some particular language just means that language's check is
 skipped for that language, not blocked.
 
-(A second document, Numerals — number/currency/date format per language —
-used to live here too, but was removed: the AI check built on it kept
-misreading it in ways that weren't worth patching further, so the whole
-feature was dropped.)
+(Two other documents used to live alongside this one but were removed:
+Numerals — number/currency/date format per language — and Glossary —
+required term-by-term translations. Both AI checks built on them kept
+getting things wrong in ways that weren't worth patching further, so
+both features were dropped rather than fixed again.)
 """
 import io
 import re
@@ -43,9 +44,8 @@ def _classify_tone(raw: str) -> str:
 def parse_tone_workbook(file_bytes: bytes) -> list[dict]:
     """Returns [{"lang_code": "es-mx", "register": "formal"|"informal"}, ...].
 
-    The real document mirrors the Glossary's layout, not a simple
-    row-per-language list: language codes run across the header row as
-    columns (same style, including the "ES (MX)" display variant and a
+    Not a simple row-per-language list: language codes run across the
+    header row as columns (including the "ES (MX)" display variant and a
     "/"-separated combined header applying to several codes at once), and
     the register ("Формальное"/"Неформальное") sits in the row(s) below —
     normally just one data row, but every row under a language column is

@@ -1,5 +1,5 @@
 """Quick local smoke test for the shared-folders / admin model, the
-structured glossary/tone documents, and the new check types. Uses
+structured tone-of-address document, and the new check types. Uses
 a throwaway SQLite DB (no DATABASE_URL set) and no AI key, so only
 rule-based findings are expected, not AI ones."""
 import asyncio
@@ -78,43 +78,12 @@ check("non-admin create project blocked", client.post("/projects", json={"name":
 r = check("admin create project", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}))
 project_id = r.json()["id"]
 assert r.json()["created_by_name"] == "Александр"
-assert r.json()["glossary_filename"] == ""
 assert r.json()["tone_filename"] == ""
 
 check("duplicate project name", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}), expect=409)
 
 # --- no more language folders: everything runs directly against the project ---
-
-# --- build a glossary workbook matching the agency's real doc shape:
-# EN | Пояснение | RU | ES (MX) | ...
 import openpyxl
-gwb = openpyxl.Workbook()
-gws = gwb.active
-gws.append(["EN", "Пояснение", "RU", "ES (MX)"])
-gws.append(["Mission Rush", "название турнира, не переводить", "Mission Rush", "Mission Rush"])
-gws.append(["Golden Spin", "название бонуса", "Голден Спин", "Golden Spin"])
-gws.append(["$5,000", "формат валюты для примера", "5 000$", "$5,000"])
-gbuf = io.BytesIO()
-gwb.save(gbuf)
-gbuf.seek(0)
-
-check("non-admin glossary upload blocked", client.post(
-    f"/projects/{project_id}/glossary/upload",
-    files={"file": ("glossary.xlsx", gbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": regular_id},
-), expect=403)
-
-gbuf.seek(0)
-r = check("admin glossary upload", client.post(
-    f"/projects/{project_id}/glossary/upload",
-    files={"file": ("glossary.xlsx", gbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": admin_id},
-))
-assert r.json()["term_count"] == 3, r.json()
-assert r.json()["filename"] == "glossary.xlsx"
-
-r = check("glossary status (visible to any folder)", client.get(f"/projects/{project_id}/glossary/status"))
-assert r.json()["term_count"] == 3
 
 # --- doc-gating: tone (register) check refuses to run until its doc exists ---
 check("tone (register) check blocked with no doc uploaded", client.post("/check", json={
@@ -129,10 +98,10 @@ check("tone (register) check blocked with no doc uploaded", client.post("/check"
 }), expect=400)
 
 # --- Tone-of-address doc: real layout, matching the agency's actual
-# export — mirrors the Glossary (language codes as header-row columns,
-# not one row per language as originally assumed), with the register in
-# the data row below each column. "KZ" is the same country-code-style
-# label the real file uses for Kazakh.
+# export — language codes as header-row columns, not one row per language
+# as originally assumed, with the register in the data row below each
+# column. "KZ" is the same country-code-style label the real file uses
+# for Kazakh.
 twb = openpyxl.Workbook()
 tws = twb.active
 tws.append(["EN", "RU", "KZ", "ES (MX)"])
@@ -147,10 +116,8 @@ r = check("admin tone upload", client.post(
 ))
 assert r.json()["rule_count"] == 4, r.json()
 
-# --- known-languages union across the two remaining docs (glossary, tone):
-# just the union of every language column named in either, with no
-# granularity-bridging needed here since both docs already use the same
-# plain codes ---
+# --- known languages come from the tone-of-address document alone now
+# (the only reference document left) — just every language column it names ---
 r = check("known languages union", client.get(f"/projects/{project_id}/known-languages"))
 assert set(r.json()["languages"]) == {"ru", "es-mx", "kz", "en"}, r.json()
 
@@ -170,11 +137,11 @@ check("tone check now runs", client.post("/check", json={
 r = check("list projects (shared)", client.get("/projects"))
 assert len(r.json()) == 1
 
-# --- non-admin CAN run a single check, glossary narrowed to EN+RU+target ---
+# --- non-admin CAN run a single check across every remaining check type ---
 r = check("non-admin single check (ru)", client.post("/check", json={
     "source": "The bonus is $50 and expires in 3 days.",
     "translation": "Бонус составляет $500 и истекает через 3 дня",
-    "checks": ["numbers", "placeholders", "glossary", "register", "typo", "untranslatable", "completeness", "punctuation"],
+    "checks": ["numbers", "placeholders", "register", "typo", "untranslatable", "completeness", "punctuation"],
     "project_id": project_id,
     "source_lang": "en",
     "target_lang": "ru",
@@ -376,20 +343,20 @@ check("report download works once completed", client.get(
     f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx", params={"manager_id": regular_id}
 ))
 
-# --- re-uploading the glossary replaces it, doesn't accumulate ---
-gwb2 = openpyxl.Workbook()
-gws2 = gwb2.active
-gws2.append(["EN", "Пояснение", "RU"])
-gws2.append(["Free Spins", "бонусные вращения", "Фриспины"])
-gbuf2 = io.BytesIO()
-gwb2.save(gbuf2)
-gbuf2.seek(0)
-r = check("admin re-uploads glossary (replaces)", client.post(
-    f"/projects/{project_id}/glossary/upload",
-    files={"file": ("glossary2.xlsx", gbuf2, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+# --- re-uploading the tone doc replaces it, doesn't accumulate ---
+twb3 = openpyxl.Workbook()
+tws3 = twb3.active
+tws3.append(["EN", "RU"])
+tws3.append(["Формальное", "Формальное"])
+tbuf3 = io.BytesIO()
+twb3.save(tbuf3)
+tbuf3.seek(0)
+r = check("admin re-uploads tone doc (replaces)", client.post(
+    f"/projects/{project_id}/tone/upload",
+    files={"file": ("tone2.xlsx", tbuf3, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     data={"manager_id": admin_id},
 ))
-assert r.json()["term_count"] == 1, r.json()
+assert r.json()["rule_count"] == 2, r.json()
 
 # --- project template copy: new project starts with the same docs, fully
 # independent afterward (editing one never touches the other) ---
@@ -397,27 +364,26 @@ r = check("create project copying requirements from the first", client.post(
     "/projects", json={"name": "LS Promo", "manager_id": admin_id, "copy_from_project_id": project_id}
 ))
 copy_project_id = r.json()["id"]
-assert r.json()["glossary_filename"] == "glossary2.xlsx", r.json()
+assert r.json()["tone_filename"] == "tone2.xlsx", r.json()
 
-r = check("copied project's glossary status matches source", client.get(f"/projects/{copy_project_id}/glossary/status"))
-assert r.json()["term_count"] == 1, r.json()
+r = check("copied project's tone status matches source", client.get(f"/projects/{copy_project_id}/tone/status"))
+assert r.json()["rule_count"] == 2, r.json()
 
-# re-uploading the ORIGINAL project's glossary must not affect the copy
-gwb3 = openpyxl.Workbook()
-gws3 = gwb3.active
-gws3.append(["EN", "RU"])
-gws3.append(["Term A", "Термин А"])
-gws3.append(["Term B", "Термин Б"])
-gbuf3 = io.BytesIO()
-gwb3.save(gbuf3)
-gbuf3.seek(0)
-check("re-upload original project's glossary again", client.post(
-    f"/projects/{project_id}/glossary/upload",
-    files={"file": ("glossary3.xlsx", gbuf3, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+# re-uploading the ORIGINAL project's tone doc must not affect the copy
+twb4 = openpyxl.Workbook()
+tws4 = twb4.active
+tws4.append(["EN", "RU", "ES (MX)"])
+tws4.append(["Формальное", "Формальное", "Неформальное"])
+tbuf4 = io.BytesIO()
+twb4.save(tbuf4)
+tbuf4.seek(0)
+check("re-upload original project's tone doc again", client.post(
+    f"/projects/{project_id}/tone/upload",
+    files={"file": ("tone3.xlsx", tbuf4, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     data={"manager_id": admin_id},
 ))
-r = check("copy's glossary is untouched by the original's re-upload", client.get(f"/projects/{copy_project_id}/glossary/status"))
-assert r.json()["term_count"] == 1, r.json()
+r = check("copy's tone doc is untouched by the original's re-upload", client.get(f"/projects/{copy_project_id}/tone/status"))
+assert r.json()["rule_count"] == 2, r.json()
 
 # --- project deletion requires the admin's password ---
 check("delete project wrong password rejected", client.request(
@@ -438,8 +404,8 @@ r = check("managers survive re-migration", client.get("/managers"))
 assert len(r.json()) == 2
 r = check("projects survive re-migration", client.get("/projects"))
 assert len(r.json()) == 1
-r = check("glossary survives re-migration", client.get(f"/projects/{project_id}/glossary/status"))
-assert r.json()["term_count"] == 2
+r = check("tone doc survives re-migration", client.get(f"/projects/{project_id}/tone/status"))
+assert r.json()["rule_count"] == 3
 
 # --- unit tests: language-code granularity bridging (resolve_lang_code /
 # merge_lang_codes) ---
@@ -483,8 +449,8 @@ print("[OK] merge_lang_codes: collapses same-granularity duplicates, "
       "keeps genuinely distinct regional variants, bridges country-code-style "
       "labels to their region subtag, leaves unrelated codes alone")
 
-# parse_tone_workbook: real layout is column-per-language (Glossary-style),
-# not row-per-language as originally assumed — including a country-code
+# parse_tone_workbook: real layout is column-per-language, not
+# row-per-language as originally assumed — including a country-code
 # label ("KZ") and a combined "/"-separated header applying to two codes
 twb2 = openpyxl.Workbook()
 tws2 = twb2.active
@@ -549,20 +515,16 @@ from app.claude_client import CHECK_LABELS
 assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
 print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки»")
 
-# --- Александр hit a real case where, with only "glossary" ticked, the
-# model still reported a currency-identity mismatch, mislabeling it as
-# type "glossary" since that was the only type the schema allowed it to
-# use — the hard type-filter can't catch this because the label itself
-# WAS one of the allowed types, just attached to the wrong kind of finding.
-# Fixed by explicitly scoping "glossary" to term-matching only, and by
-# telling the model not to squeeze an out-of-scope finding into whichever
-# type happens to be available. ---
+# --- the prompt also tells the model not to squeeze an out-of-scope
+# finding into whichever type happens to be the only one allowed —
+# Александр hit exactly this with the (now-removed) glossary check, but
+# the instruction itself is generic, not glossary-specific, so it stays
+# relevant for any single-check-type run. ---
 from app.claude_client import SINGLE_PROMPT, BATCH_PROMPT
 
-assert "НЕ входит ничего" in CHECK_LABELS["glossary"], CHECK_LABELS["glossary"]
 assert "Не подгоняй" in SINGLE_PROMPT and "Не подгоняй" in BATCH_PROMPT
-print("[OK] glossary check is scoped to term-matching only, and the prompt explicitly forbids "
-      "squeezing an out-of-scope finding into whichever type happens to be the only one allowed")
+print("[OK] the prompt explicitly forbids squeezing an out-of-scope finding into whichever "
+      "type happens to be the only one allowed")
 
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something
@@ -597,7 +559,7 @@ async def _fake_call_claude(prompt, model=None):
 claude_client_mod._call_claude = _fake_call_claude
 findings, ai_cost = asyncio.get_event_loop().run_until_complete(
     run_ai_checks(
-        "source", "translation", "", ["typo"], target_lang="az-az",
+        "source", "translation", ["typo"], target_lang="az-az",
     )
 )
 assert findings == [raw_findings[0]], findings

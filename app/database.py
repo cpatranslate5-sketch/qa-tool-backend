@@ -61,19 +61,16 @@ def _run_migrations():
     if "projects" in existing_tables:
         cols = {c["name"] for c in insp.get_columns("projects")}
         with engine.begin() as conn:
-            # The free-text glossary field was replaced by the structured
-            # glossary_terms table (a file upload, not a textbox) — drop it
-            # rather than leave a stale NOT NULL column that would break
-            # every future insert (the ORM no longer sets it).
+            # A much older free-text glossary field, from before there was
+            # any structured document upload at all — long gone by now, but
+            # dropped here rather than left as a stale NOT NULL column that
+            # would break every future insert (the ORM no longer sets it).
             if "glossary" in cols:
                 conn.execute(text("ALTER TABLE projects DROP COLUMN glossary"))
-            if "glossary_filename" not in cols:
-                conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_filename VARCHAR(300) NOT NULL DEFAULT ''"))
-            if "glossary_uploaded_at" not in cols:
-                conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_uploaded_at TIMESTAMPTZ"))
-            # One more optional reference document alongside the glossary —
-            # tone-of-address. (A third, Numerals, existed too but was
-            # removed — see the migration further below that drops it.)
+            # The structured glossary (glossary_filename/glossary_uploaded_at
+            # + the glossary_terms table) was later removed entirely too —
+            # see the migration further below that drops it, alongside
+            # Numerals. Tone-of-address is the only reference document left.
             if "tone_filename" not in cols:
                 conn.execute(text("ALTER TABLE projects ADD COLUMN tone_filename VARCHAR(300) NOT NULL DEFAULT ''"))
             if "tone_uploaded_at" not in cols:
@@ -100,8 +97,8 @@ def _run_migrations():
     # (also removed) project_languages table. Reset ONLY single_checks (a
     # log of individual segment checks, not project setup — safe to lose)
     # rather than projects/multi_checks, which hold real project
-    # configuration, uploaded glossary/numerals/tone documents, and
-    # multi-check history/reports that must survive this upgrade.
+    # configuration, uploaded reference documents, and multi-check
+    # history/reports that must survive this upgrade.
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())
     if "single_checks" in existing_tables:
@@ -171,8 +168,10 @@ def _run_migrations():
     # on it kept misreading it in ways that weren't worth patching further
     # (currency identity vs. format, date examples turning into ISO
     # gibberish, cross-referencing unrelated fields). Drops its table and
-    # the two project columns that tracked its upload; nothing else
-    # (glossary, tone-of-address, check history) is affected.
+    # the two project columns that tracked its upload; nothing else is
+    # affected by THIS migration (glossary is dropped by the migration
+    # further below; tone-of-address and check history aren't touched at
+    # all).
     insp = inspect(engine)
     existing_tables = set(insp.get_table_names())
     if "numeral_rules" in existing_tables:
@@ -185,6 +184,25 @@ def _run_migrations():
                 conn.execute(text("ALTER TABLE projects DROP COLUMN numerals_filename"))
             if "numerals_uploaded_at" in cols:
                 conn.execute(text("ALTER TABLE projects DROP COLUMN numerals_uploaded_at"))
+
+    # The Glossary document/check is removed entirely too — unlike Numerals,
+    # this one never needed AI judgment at all (a term either matches the
+    # glossary or it doesn't, a plain text comparison), so a probabilistic
+    # model was never the right tool for it and it kept missing/mislabeling
+    # things as a result. Drops its table and the two project columns that
+    # tracked its upload; tone-of-address and check history are unaffected.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "glossary_terms" in existing_tables:
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS glossary_terms{cascade}"))
+    if "projects" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("projects")}
+        with engine.begin() as conn:
+            if "glossary_filename" in cols:
+                conn.execute(text("ALTER TABLE projects DROP COLUMN glossary_filename"))
+            if "glossary_uploaded_at" in cols:
+                conn.execute(text("ALTER TABLE projects DROP COLUMN glossary_uploaded_at"))
 
 
 def _ensure_admin_exists():

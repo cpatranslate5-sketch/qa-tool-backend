@@ -23,7 +23,7 @@ def _now() -> datetime.datetime:
 class Manager(Base):
     """A "folder" in the user's terms. The very first manager ever created
     is automatically the admin — only the admin folder may create projects,
-    language folders, or edit a project's glossary (see main.py's
+    language folders, or edit a project's reference documents (see main.py's
     _require_admin). Every other folder can use whatever the admin has
     already set up (single checks, multi-uploads) but not restructure it."""
 
@@ -40,51 +40,37 @@ class Project(Base):
     """Shared/global — every folder sees the same set of projects. Only the
     admin folder can create one (see _require_admin in main.py). No more
     per-language sub-folders (removed — see the dropped ProjectLanguage
-    model): a project instead carries two optional reference documents
-    (glossary, tone-of-address), each gating its matching AI check until
-    uploaded — see app.main's _require_doc.
+    model): a project carries one optional reference document
+    (tone-of-address), gating its matching AI check until uploaded — see
+    app.main's _require_doc.
 
-    A third document, Numerals (number/currency/date format per language),
-    existed here too but was removed — the AI check built on it kept
-    misreading the document (currency identity vs. format, date examples,
-    cross-referencing unrelated fields) and wasn't worth the reliability
-    cost, so the whole feature was dropped rather than patched further."""
+    Two other documents existed here too but were removed:
+
+    - Numerals (number/currency/date format per language) — the AI check
+      built on it kept misreading the document (currency identity vs.
+      format, date examples, cross-referencing unrelated fields) and
+      wasn't worth the reliability cost.
+    - Glossary (term-by-term required translations) — unlike Numerals,
+      this one didn't need AI judgment at all (a term either matches the
+      glossary or it doesn't, a plain text comparison), so letting a
+      probabilistic model decide it was never the right tool to begin
+      with, and it kept missing/mislabeling things as a result.
+
+    Both were dropped rather than patched further — see git history for
+    the removal commits."""
 
     __tablename__ = "projects"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     created_by_name: Mapped[str] = mapped_column(String(120), default="")
-    glossary_filename: Mapped[str] = mapped_column(String(300), default="")
-    glossary_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     tone_filename: Mapped[str] = mapped_column(String(300), default="")
     tone_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-    glossary_terms: Mapped[list["GlossaryTerm"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     tone_rules: Mapped[list["ToneRule"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-
-
-class GlossaryTerm(Base):
-    """One row of the project's master glossary doc: an EN term, an optional
-    free-text description/context, and a translation per target language
-    (keyed by lang_code, e.g. {"ru": "...", "es-mx": "...", ...}). Re-uploading
-    the glossary file replaces all of a project's rows. A check for a given
-    language only ever needs EN + RU + that one target column — see
-    app.glossary.terms_for_language."""
-
-    __tablename__ = "glossary_terms"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
-    term_en: Mapped[str] = mapped_column(Text, nullable=False)
-    description: Mapped[str] = mapped_column(Text, default="")
-    translations: Mapped[dict] = mapped_column(JSON, default=dict)
-    row_order: Mapped[int] = mapped_column(Integer, default=0)
-
-    project: Mapped["Project"] = relationship(back_populates="glossary_terms")
 
 
 class ToneRule(Base):
