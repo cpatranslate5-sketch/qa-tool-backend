@@ -17,19 +17,36 @@ PLACEHOLDER_RE = re.compile(r"\{\{?[^}]+\}?\}|%\d*\$?[sd]|<[^>]+>|\[[^\]]+\]")
 # (e.g. "50,000"), which really is a different number if it doesn't match.
 _DECIMAL_COMMA_RE = re.compile(r"^(\d+),(\d{1,2})$")
 
+# A comma used purely to GROUP thousands, e.g. "1,400", "1,500,000" — one or
+# more commas, each followed by exactly 3 digits. Distinct from the decimal
+# comma above by that 3-digit group size (a decimal comma is always 1-2
+# digits), so the two patterns never collide. The grouping itself is pure
+# formatting: some target languages/translators drop it (or space it, which
+# NUMBER_RE never captures as part of the number to begin with), so "1,400"
+# and "1400" are the same value and must compare equal.
+_THOUSANDS_GROUPED_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$")
+
 
 def _normalize_number(tok: str) -> str:
     """Normalizes cosmetic-only formatting differences that are *expected*
     to differ between source and a correctly localized translation, so
     they aren't flagged as a real numbers mismatch:
+      - a thousands-grouping comma ("1,400", "1,500,000") is removed
+        entirely, since keeping or dropping it doesn't change the value —
+        Александр hit a translation that correctly kept some of a promo's
+        numbers grouped ("1,500,000") but wrote smaller ones ungrouped
+        ("1400" for the source's "1,400"), and it was flagged as a mismatch
+        even though the value never changed.
       - a decimal comma ("0,40") is unified with a decimal point ("0.40") —
         the source is usually English (period), while many of the agency's
         target languages correctly use a comma for the same value.
       - a leading zero on an otherwise-plain digit run ("03" for a
         zero-padded hour) is unified with its unpadded form ("3") — both
         are the same time, just padded differently.
-    Real numeric differences (50 vs 500, 0.40 vs 0.04) are untouched and
-    still compare as different."""
+    Real numeric differences (50 vs 500, 0.40 vs 0.04, 1,400 vs 1,500) are
+    untouched and still compare as different."""
+    if _THOUSANDS_GROUPED_RE.match(tok):
+        return tok.replace(",", "")
     m = _DECIMAL_COMMA_RE.match(tok)
     normalized = f"{m.group(1)}.{m.group(2)}" if m else tok
     if "." not in normalized and len(normalized) > 1:
@@ -38,25 +55,28 @@ def _normalize_number(tok: str) -> str:
 
 
 def _decompose_grouped(tok: str) -> list[str]:
-    """A token with 2+ separators (','/'.' combined) is almost always a
-    DATE written as one glued-together run — "22.09.2026" — rather than an
-    ordinary decimal or a single thousands-grouping comma (those have at
-    most one separator). Dates are exactly the case where the grouping
-    itself is expected to change between languages: day/month/year can
-    come in a different order, and the separator can be "." or "/" (a
-    slash-separated date like "09/22/2026" never even reaches here as one
-    token, since '/' isn't part of NUMBER_RE — it's already three separate
-    atoms). So a dotted date is split into its individual digit groups and
-    compared as a multiset, order and separator both ignored — only the
-    actual digits have to survive translation, exactly as Александр asked
-    for after "22.09.2026" (from a $0.40-style source date written
-    "09/22/2026") was wrongly flagged against its own, correctly
-    reordered/reformatted translation.
+    """A token that's unambiguously a comma-grouped THOUSANDS number
+    ("1,400", "1,500,000") is one single value — _normalize_number above
+    already merges its commas away, so it stays one atom. What's left with
+    2+ separators is a DATE written as one glued-together run —
+    "22.09.2026" — since an ordinary decimal or a recognized thousands
+    grouping never reaches this branch. Dates are exactly the case where
+    the grouping itself is expected to change between languages:
+    day/month/year can come in a different order, and the separator can be
+    "." or "/" (a slash-separated date like "09/22/2026" never even
+    reaches here as one token, since '/' isn't part of NUMBER_RE — it's
+    already three separate atoms). So a dotted date is split into its
+    individual digit groups and compared as a multiset, order and
+    separator both ignored — only the actual digits have to survive
+    translation, exactly as Александр asked for after "22.09.2026" (from a
+    $0.40-style source date written "09/22/2026") was wrongly flagged
+    against its own, correctly reordered/reformatted translation.
     A token with 0-1 separators (an ordinary decimal, or a single
     thousands-grouping comma like "50,000") is left as one atom via
     _normalize_number, so a genuinely different number is still caught."""
-    if tok.count(".") + tok.count(",") < 2:
-        return [_normalize_number(tok)]
+    normalized = _normalize_number(tok)
+    if normalized != tok or (tok.count(".") + tok.count(",")) < 2:
+        return [normalized]
     return [_normalize_number(part) for part in re.split(r"[.,]", tok) if part]
 
 

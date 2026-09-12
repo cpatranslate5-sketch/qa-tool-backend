@@ -449,6 +449,27 @@ print("[OK] merge_lang_codes: collapses same-granularity duplicates, "
       "keeps genuinely distinct regional variants, bridges country-code-style "
       "labels to their region subtag, leaves unrelated codes alone")
 
+# --- pick_source_lang must bridge the same granularity mismatches as
+# everything else in this file (via resolve_lang_code), not do a literal
+# string match — Александр hit this live: he picked "Русский" as the
+# source language, but his file's Russian column wasn't spelled exactly
+# "ru" (a region-qualified "ru-RU"), the old literal check silently missed
+# it, and the source language silently fell back to whatever column was
+# labeled "en-001" instead — his check ran source-vs-source against the
+# wrong pair of columns without any error or warning. ---
+from app.excel_multi import pick_source_lang
+
+fake_sheets = [{"languages": ["ru-RU", "en-001", "kz"]}]
+assert pick_source_lang(fake_sheets, "ru") == "ru-RU", pick_source_lang(fake_sheets, "ru")
+assert pick_source_lang(fake_sheets, "kk-KZ") == "kz", pick_source_lang(fake_sheets, "kk-KZ")
+# still falls back to English, then alphabetically first, when the
+# requested language genuinely isn't in the file at all
+assert pick_source_lang(fake_sheets, "de") == "en-001", pick_source_lang(fake_sheets, "de")
+assert pick_source_lang([{"languages": ["kz", "en-001"]}], None) == "en-001"
+print("[OK] pick_source_lang: resolves the manager's chosen source language against "
+      "a differently-granular spelling of the same language in the file, instead of "
+      "silently falling back to English")
+
 # parse_tone_workbook: real layout is column-per-language, not
 # row-per-language as originally assumed — including a country-code
 # label ("KZ") and a combined "/"-separated header applying to two codes
@@ -505,6 +526,18 @@ assert check_numbers("The bonus is $50.", "Бонус составляет $500.
 assert check_numbers("$50,000 prize", "50 тысяч приз") != []
 print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no longer "
       "false-flagged as a numbers mismatch; real mismatches and thousands-grouping still caught")
+
+# --- dropping (or keeping) a thousands-grouping comma must not be flagged
+# either — Александр hit this live: a translation correctly kept some of a
+# promo's big numbers grouped ("1,500,000") but wrote a smaller one
+# ungrouped ("1400" for the source's "1,400"), and it was flagged as a
+# mismatch even though the value never changed. ---
+assert check_numbers("Win up to $1,400 today", "Выиграйте до $1400 сегодня") == []
+assert check_numbers("Prize: $1,500,000", "Приз: $1500000") == []
+# But an actually different grouped number must still be caught.
+assert check_numbers("Win up to $1,400 today", "Выиграйте до $1,500 сегодня") != []
+print("[OK] check_numbers: a thousands-grouping comma can be freely added or dropped "
+      "without being flagged, while an actually different grouped number is still caught")
 
 # --- a DATE must not be flagged just because the target language writes
 # the day/month/year in a different order and/or with a different

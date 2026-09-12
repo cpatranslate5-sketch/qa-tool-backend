@@ -306,11 +306,24 @@ def parse_workbook(file_bytes: bytes) -> list[dict]:
 
 
 def pick_source_lang(sheets: list[dict], preferred: str | None) -> str:
+    """Resolves the manager's chosen source language (e.g. "ru", from the
+    RU/EN buttons in the UI) against the language codes actually found as
+    column headers in the uploaded file. Uses resolve_lang_code rather than
+    a literal match, since the file's own column can be a differently
+    granular spelling of the same language (e.g. "ru-RU" for a plain "ru")
+    — Александр hit this: his file's Russian column wasn't spelled exactly
+    "ru", the literal check silently missed it, and the source language
+    silently fell back to English (whatever column happened to be labeled
+    "en-001"), even though he'd picked Russian. Falls back to English, then
+    alphabetically first, only when the requested language truly isn't in
+    the file at all."""
     all_langs: set[str] = set()
     for s in sheets:
         all_langs.update(s["languages"])
-    if preferred and preferred in all_langs:
-        return preferred
+    if preferred:
+        resolved = resolve_lang_code(preferred, all_langs)
+        if resolved:
+            return resolved
     if "en" in all_langs:
         return "en"
     return sorted(all_langs)[0] if all_langs else "en"
