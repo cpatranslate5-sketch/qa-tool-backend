@@ -153,6 +153,25 @@ def _run_migrations():
             if "batch_id" not in cols:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN batch_id VARCHAR(200) NOT NULL DEFAULT ''"))
 
+    # History is now scoped per-folder (each manager only sees their own
+    # check/upload history) instead of shared across the whole project —
+    # add the column that records who ran each one. Existing rows simply
+    # have no manager_id (NULL) and so won't show up in anyone's scoped
+    # history anymore, which is fine — there's no real production history
+    # riding on this yet.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "single_checks" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("single_checks")}
+        if "manager_id" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE single_checks ADD COLUMN manager_id INTEGER"))
+    if "multi_checks" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("multi_checks")}
+        if "manager_id" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN manager_id INTEGER"))
+
 
 def _ensure_admin_exists():
     from app import models

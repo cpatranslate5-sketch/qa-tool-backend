@@ -134,6 +134,11 @@ class SingleCheck(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    # Which folder ran this check — history is now scoped per-folder (each
+    # manager only ever sees their own runs), not shared across the whole
+    # project like it used to be. Nullable only because rows created before
+    # this column existed have no value to backfill.
+    manager_id: Mapped[int | None] = mapped_column(ForeignKey("managers.id"), nullable=True)
     source_lang: Mapped[str] = mapped_column(String(20), default="")
     target_lang: Mapped[str] = mapped_column(String(20), default="")
     source: Mapped[str] = mapped_column(Text, nullable=False)
@@ -161,6 +166,8 @@ class MultiCheck(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    # Same per-folder history scoping as SingleCheck.manager_id, above.
+    manager_id: Mapped[int | None] = mapped_column(ForeignKey("managers.id"), nullable=True)
     filename: Mapped[str] = mapped_column(String(300), default="")
     source_lang: Mapped[str] = mapped_column(String(20), default="en")
     checks_run: Mapped[list] = mapped_column(JSON, default=list)

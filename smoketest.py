@@ -40,13 +40,25 @@ assert r.json()["is_admin"] is False
 
 check("duplicate folder name", client.post("/managers", json={"name": "Александр", "code": "0000"}), expect=409)
 
-# --- listing folders (public, no code) ---
+# --- listing folders (public, no code) — admin folder always first
+# (point 2 of Александр's folder-access spec) ---
 r = check("list managers", client.get("/managers"))
 assert len(r.json()) == 2
+assert r.json()[0]["is_admin"] is True and r.json()[0]["name"] == "Александр"
 
 # --- unlock flow ---
 check("unlock wrong code", client.post(f"/managers/{regular_id}/unlock", json={"code": "wrong"}), expect=401)
 check("unlock correct code", client.post(f"/managers/{regular_id}/unlock", json={"code": "5678"}))
+
+# --- admin bypass: whoever already has admin access on this device can
+# open any other folder without typing that folder's own password ---
+check("admin-enter refuses a non-admin claimed id", client.post(
+    f"/managers/{regular_id}/admin-enter", json={"admin_manager_id": regular_id}
+), expect=403)
+r = check("real admin opens Мария's folder with no password", client.post(
+    f"/managers/{regular_id}/admin-enter", json={"admin_manager_id": admin_id}
+))
+assert r.json()["id"] == regular_id and r.json()["name"] == "Мария"
 
 # --- password change: available to every folder, not just admin ---
 check("wrong current password rejected", client.post(
@@ -113,6 +125,7 @@ check("numerals check blocked with no doc uploaded", client.post("/check", json=
     "source_lang": "en",
     "target_lang": "ru",
     "manager_name": "Мария",
+    "manager_id": regular_id,
 }), expect=400)
 check("tone (register) check blocked with no doc uploaded", client.post("/check", json={
     "source": "Play now.",
@@ -122,6 +135,7 @@ check("tone (register) check blocked with no doc uploaded", client.post("/check"
     "source_lang": "en",
     "target_lang": "ru",
     "manager_name": "Мария",
+    "manager_id": regular_id,
 }), expect=400)
 
 # --- Numerals doc: real multi-column format (several distinct format
@@ -198,6 +212,7 @@ check("numerals check now runs (base-subtag fallback: ru -> ru-ru)", client.post
     "source_lang": "en",
     "target_lang": "ru",
     "manager_name": "Мария",
+    "manager_id": regular_id,
 }))
 check("tone check now runs", client.post("/check", json={
     "source": "Play now.",
@@ -207,6 +222,7 @@ check("tone check now runs", client.post("/check", json={
     "source_lang": "en",
     "target_lang": "ru",
     "manager_name": "Мария",
+    "manager_id": regular_id,
 }))
 
 # --- BOTH folders see the same shared project (no manager scoping) ---
@@ -222,6 +238,7 @@ r = check("non-admin single check (ru)", client.post("/check", json={
     "source_lang": "en",
     "target_lang": "ru",
     "manager_name": "Мария",
+    "manager_id": regular_id,
 }))
 findings = r.json()["findings"]
 print("   findings:", findings)
@@ -250,15 +267,35 @@ check("check with extra_instructions", client.post("/check", json={
     "target_lang": "ru",
     "extra_instructions": "В этой задаче 'Golden Spin' нужно переводить как 'Голден Спин'.",
     "manager_name": "Мария",
+    "manager_id": regular_id,
 }))
 
-# --- history shows who performed it, keyed by project only (no language folder) ---
-r = check("history shows attribution", client.get(f"/projects/{project_id}/history"))
+# --- history shows who performed it, keyed by project + folder (each
+# manager only sees their own runs — point 1 of Александр's spec) ---
+r = check("history shows attribution", client.get(f"/projects/{project_id}/history", params={"manager_id": regular_id}))
 history = r.json()
 assert len(history) == 4  # numerals + tone + full-checks + extra_instructions check (double-space was standalone)
 assert history[0]["performed_by_name"] == "Мария"
 assert history[0]["source_lang"] == "en" and history[0]["target_lang"] == "ru"
 print("   performed_by_name:", history[0]["performed_by_name"])
+
+# --- history is scoped per folder, not shared across every folder that
+# touches the project ---
+check("admin runs a check on the same shared project", client.post("/check", json={
+    "source": "Hello.",
+    "translation": "Привет.",
+    "checks": ["punctuation"],
+    "project_id": project_id,
+    "source_lang": "en",
+    "target_lang": "ru",
+    "manager_name": "Александр",
+    "manager_id": admin_id,
+}))
+r = check("Мария's history unaffected by admin's check", client.get(f"/projects/{project_id}/history", params={"manager_id": regular_id}))
+assert len(r.json()) == 4, r.json()
+r = check("admin's own history shows only admin's check", client.get(f"/projects/{project_id}/history", params={"manager_id": admin_id}))
+assert len(r.json()) == 1, r.json()
+assert r.json()[0]["performed_by_name"] == "Александр"
 
 # --- non-admin CAN run a multi-check upload ---
 sample_path = "/root/.claude/uploads/aee9e6e5-e96f-5b4b-aa4e-8aad6284c8c9/147efc1b-Promo_Rules_Localization.xlsx"
@@ -266,7 +303,7 @@ with open(sample_path, "rb") as f:
     r = check("non-admin multi-check upload", client.post(
         f"/projects/{project_id}/multi-check",
         files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        data={"source_lang": "", "manager_name": "Мария", "extra_instructions": ""},
+        data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": ""},
     ))
 multi_data = r.json()
 multi_check_id = multi_data["multi_check_id"]
@@ -283,20 +320,34 @@ with open(sample_path, "rb") as f:
     r = check("multi-check with target_langs filter", client.post(
         f"/projects/{project_id}/multi-check",
         files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        data={"source_lang": "", "manager_name": "Мария", "extra_instructions": "", "target_langs": "ru,es-mx"},
+        data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "target_langs": "ru,es-mx"},
     ))
 filtered_data = r.json()
 assert filtered_data["status"] == "completed", filtered_data
 assert set(filtered_data["summary"]["languages_checked"]) == {"ru", "es-mx"}, filtered_data["summary"]
 print("   filtered languages_checked:", filtered_data["summary"]["languages_checked"])
 
-r = check("multi-check history shows attribution", client.get(f"/projects/{project_id}/multi-check"))
+r = check("multi-check history shows attribution", client.get(
+    f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
+))
 assert r.json()[0]["performed_by_name"] == "Мария"
 assert r.json()[0]["status"] == "completed"
 
 check("multi-check report download", client.get(
-    f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx"
+    f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx", params={"manager_id": regular_id}
 ))
+
+# --- multi-check history/detail/report are also scoped per folder ---
+r = check("admin's multi-check history is empty (Мария's uploads aren't his)", client.get(
+    f"/projects/{project_id}/multi-check", params={"manager_id": admin_id}
+))
+assert r.json() == [], r.json()
+check("admin can't fetch Мария's multi-check detail by id", client.get(
+    f"/projects/{project_id}/multi-check/{multi_check_id}", params={"manager_id": admin_id}
+), expect=404)
+check("admin can't download Мария's multi-check report", client.get(
+    f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx", params={"manager_id": admin_id}
+), expect=404)
 
 # --- large multi-check actually goes through the Message Batches path when
 # a batch can be submitted — simulate that here (no real Anthropic key in
@@ -331,23 +382,25 @@ with open(sample_path, "rb") as f:
     r = check("large multi-check submits as a batch", client.post(
         f"/projects/{project_id}/multi-check",
         files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        data={"source_lang": "", "manager_name": "Мария", "extra_instructions": ""},
+        data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": ""},
     ))
 batch_multi_data = r.json()
 assert batch_multi_data["status"] == "processing", batch_multi_data
 batch_multi_check_id = batch_multi_data["multi_check_id"]
 
-r = check("history shows the batch entry as processing", client.get(f"/projects/{project_id}/multi-check"))
+r = check("history shows the batch entry as processing", client.get(
+    f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
+))
 assert r.json()[0]["status"] == "processing", r.json()[0]
 
 check("report download blocked while processing", client.get(
-    f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx"
+    f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx", params={"manager_id": regular_id}
 ), expect=409)
 
 # First poll: our fake get_batch_status already says "ended", so this same
 # call both notices completion and merges the results in.
 r = check("polling finalizes the batch", client.get(
-    f"/projects/{project_id}/multi-check/{batch_multi_check_id}"
+    f"/projects/{project_id}/multi-check/{batch_multi_check_id}", params={"manager_id": regular_id}
 ))
 finalized = r.json()
 assert finalized["status"] == "completed", finalized
@@ -358,11 +411,13 @@ assert any(
 ), ru_findings
 print("   ru findings after batch merge:", ru_findings)
 
-r = check("history now shows completed", client.get(f"/projects/{project_id}/multi-check"))
+r = check("history now shows completed", client.get(
+    f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
+))
 assert r.json()[0]["status"] == "completed"
 
 check("report download works once completed", client.get(
-    f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx"
+    f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx", params={"manager_id": regular_id}
 ))
 
 # --- re-uploading the glossary replaces it, doesn't accumulate ---

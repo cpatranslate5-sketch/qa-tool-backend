@@ -35,6 +35,16 @@ class ManagerChangePasswordIn(BaseModel):
     new_code: str
 
 
+class ManagerAdminEnterIn(BaseModel):
+    # Lets someone who already has admin access on this device open any
+    # other folder without typing that folder's own password — see
+    # app.main.admin_enter. Only the claimed admin id is checked (it must
+    # really be an admin); no password is re-verified here, matching the
+    # rest of this app's device-side trust model (a folder, once unlocked
+    # on a device, is simply remembered there — see FolderPicker.tsx).
+    admin_manager_id: int
+
+
 class ProjectIn(BaseModel):
     name: str
     manager_id: int
@@ -90,9 +100,10 @@ class CheckIn(BaseModel):
     source: str
     translation: str
     checks: list[str] = DEFAULT_CHECKS
-    # Optional — when provided, the check is saved into the project's
-    # shared history and the project's glossary/numerals/tone documents
-    # (narrowed to EN + RU + this one target language) are used automatically.
+    # Optional — when provided, the check is saved into the requesting
+    # folder's own history (see manager_id below) and the project's
+    # glossary/numerals/tone documents (narrowed to EN + RU + this one
+    # target language) are used automatically.
     project_id: int | None = None
     source_lang: str = ""
     target_lang: str = ""
@@ -102,8 +113,12 @@ class CheckIn(BaseModel):
     # 'Golden Spin' should be translated, not left as-is") — never saved to
     # the project, unlike the glossary.
     extra_instructions: str = ""
-    # Who's running it, for shared-history attribution (any folder may check).
+    # Who's running it — manager_name is just for display attribution,
+    # manager_id is what scopes this check into that folder's own history
+    # (see app.main.single_check_history: history is per-folder now, not
+    # shared across every folder that touches a project).
     manager_name: str = ""
+    manager_id: int | None = None
 
 
 class Finding(BaseModel):

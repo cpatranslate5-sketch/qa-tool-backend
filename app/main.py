@@ -56,7 +56,10 @@ def health():
 
 @app.get("/managers", response_model=list[schemas.ManagerOut])
 def list_managers(db: Session = Depends(get_db)):
-    return db.query(models.Manager).order_by(models.Manager.id.asc()).all()
+    # Admin folder always first (point 2 of Александр's folder-access
+    # spec) — the frontend highlights whichever entry comes first, so the
+    # ordering itself is what decides that, not just a display convention.
+    return db.query(models.Manager).order_by(models.Manager.is_admin.desc(), models.Manager.id.asc()).all()
 
 
 @app.post("/managers", response_model=schemas.ManagerOut)
@@ -102,6 +105,19 @@ def change_password(manager_id: int, payload: schemas.ManagerChangePasswordIn, d
     db.commit()
     db.refresh(manager)
     return manager
+
+
+@app.post("/managers/{manager_id}/admin-enter", response_model=schemas.ManagerOut)
+def admin_enter(manager_id: int, payload: schemas.ManagerAdminEnterIn, db: Session = Depends(get_db)):
+    """Lets someone who already has admin access on this device open any
+    other folder without typing that folder's own password (point 2 of
+    Александр's spec). Trusts the client's already-established admin
+    unlock the same way this app trusts its per-device remembered-folder
+    cache everywhere else (there's no server-side session at all) — it
+    only checks that the claimed admin id genuinely is an admin, not a
+    fresh password for either folder."""
+    _require_admin(payload.admin_manager_id, db)
+    return _get_manager(manager_id, db)
 
 
 def _get_manager(manager_id: int, db: Session) -> models.Manager:
@@ -486,6 +502,7 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
             checks_run=payload.checks,
             findings=findings,
             performed_by_name=payload.manager_name.strip(),
+            manager_id=payload.manager_id,
         )
         db.add(record)
         db.commit()
@@ -499,10 +516,13 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     "/projects/{project_id}/history",
     response_model=list[schemas.SingleCheckHistoryOut],
 )
-def single_check_history(project_id: int, db: Session = Depends(get_db)):
+def single_check_history(project_id: int, manager_id: int, db: Session = Depends(get_db)):
+    """Scoped to the requesting folder only — each manager sees their own
+    check history, not every folder's (point 1 of Александр's spec)."""
     _get_project(project_id, db)
     records = db.query(models.SingleCheck).filter(
-        models.SingleCheck.project_id == project_id
+        models.SingleCheck.project_id == project_id,
+        models.SingleCheck.manager_id == manager_id,
     ).order_by(models.SingleCheck.created_at.desc()).limit(50).all()
     return [
         schemas.SingleCheckHistoryOut(
@@ -530,6 +550,9 @@ async def multi_check(
     file: UploadFile = File(...),
     source_lang: str = Form(""),
     manager_name: str = Form(""),
+    # Whose folder this upload belongs to — scopes it into that folder's
+    # own history (see multi_check_history) rather than every folder's.
+    manager_id: int = Form(...),
     extra_instructions: str = Form(""),
     # Comma-separated check keys from the UI's checkboxes; empty/absent falls
     # back to the full default set.
@@ -541,6 +564,7 @@ async def multi_check(
     db: Session = Depends(get_db),
 ):
     _get_project(project_id, db)
+    _get_manager(manager_id, db)
     file_bytes = await file.read()
 
     try:
@@ -579,6 +603,7 @@ async def multi_check(
             results=results,
             status="completed",
             performed_by_name=manager_name.strip(),
+            manager_id=manager_id,
         )
         db.add(record)
         db.commit()
@@ -610,6 +635,7 @@ async def multi_check(
             results=results,
             status="completed",
             performed_by_name=manager_name.strip(),
+            manager_id=manager_id,
         )
         db.add(record)
         db.commit()
@@ -632,6 +658,7 @@ async def multi_check(
         status="processing",
         batch_id=batch_id,
         performed_by_name=manager_name.strip(),
+        manager_id=manager_id,
     )
     db.add(record)
     db.commit()
@@ -647,10 +674,13 @@ async def multi_check(
     "/projects/{project_id}/multi-check",
     response_model=list[schemas.MultiCheckHistoryOut],
 )
-def multi_check_history(project_id: int, db: Session = Depends(get_db)):
+def multi_check_history(project_id: int, manager_id: int, db: Session = Depends(get_db)):
+    """Scoped to the requesting folder only — same per-folder history
+    scoping as single_check_history, above."""
     _get_project(project_id, db)
     records = db.query(models.MultiCheck).filter(
-        models.MultiCheck.project_id == project_id
+        models.MultiCheck.project_id == project_id,
+        models.MultiCheck.manager_id == manager_id,
     ).order_by(models.MultiCheck.created_at.desc()).limit(50).all()
     return [
         schemas.MultiCheckHistoryOut(
@@ -663,10 +693,10 @@ def multi_check_history(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/projects/{project_id}/multi-check/{multi_check_id}")
-async def multi_check_detail(project_id: int, multi_check_id: int, db: Session = Depends(get_db)):
+async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: int, db: Session = Depends(get_db)):
     _get_project(project_id, db)
     record = db.get(models.MultiCheck, multi_check_id)
-    if record is None or record.project_id != project_id:
+    if record is None or record.project_id != project_id or record.manager_id != manager_id:
         raise HTTPException(404, "Проверка не найдена.")
 
     if record.status == "processing" and record.batch_id:
@@ -697,10 +727,10 @@ async def multi_check_detail(project_id: int, multi_check_id: int, db: Session =
 
 
 @app.get("/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx")
-def multi_check_report(project_id: int, multi_check_id: int, db: Session = Depends(get_db)):
+def multi_check_report(project_id: int, multi_check_id: int, manager_id: int, db: Session = Depends(get_db)):
     _get_project(project_id, db)
     record = db.get(models.MultiCheck, multi_check_id)
-    if record is None or record.project_id != project_id:
+    if record is None or record.project_id != project_id or record.manager_id != manager_id:
         raise HTTPException(404, "Проверка не найдена.")
     if record.status != "completed":
         raise HTTPException(409, "Проверка ещё обрабатывается — отчёт будет доступен после завершения.")
