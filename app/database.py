@@ -71,12 +71,9 @@ def _run_migrations():
                 conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_filename VARCHAR(300) NOT NULL DEFAULT ''"))
             if "glossary_uploaded_at" not in cols:
                 conn.execute(text("ALTER TABLE projects ADD COLUMN glossary_uploaded_at TIMESTAMPTZ"))
-            # Two more optional reference documents alongside the glossary —
-            # numerals (number/currency format) and tone-of-address.
-            if "numerals_filename" not in cols:
-                conn.execute(text("ALTER TABLE projects ADD COLUMN numerals_filename VARCHAR(300) NOT NULL DEFAULT ''"))
-            if "numerals_uploaded_at" not in cols:
-                conn.execute(text("ALTER TABLE projects ADD COLUMN numerals_uploaded_at TIMESTAMPTZ"))
+            # One more optional reference document alongside the glossary —
+            # tone-of-address. (A third, Numerals, existed too but was
+            # removed — see the migration further below that drops it.)
             if "tone_filename" not in cols:
                 conn.execute(text("ALTER TABLE projects ADD COLUMN tone_filename VARCHAR(300) NOT NULL DEFAULT ''"))
             if "tone_uploaded_at" not in cols:
@@ -120,24 +117,6 @@ def _run_migrations():
     if "project_languages" in existing_tables:
         with engine.begin() as conn:
             conn.execute(text(f"DROP TABLE IF EXISTS project_languages{cascade}"))
-
-    # The Numerals document turned out to have ~a dozen distinct format
-    # columns per language (currency, decimal separator, date, percent,
-    # number grouping, ...) rather than one free-text rule — numeral_rules
-    # moves from a single rule_text column to a JSON "fields" dict holding
-    # all of them. This table has no real historical data worth preserving
-    # (nothing has been uploaded through it in production yet), so it's
-    # safe to just add the new column and drop the old one outright.
-    insp = inspect(engine)
-    existing_tables = set(insp.get_table_names())
-    if "numeral_rules" in existing_tables:
-        cols = {c["name"] for c in insp.get_columns("numeral_rules")}
-        with engine.begin() as conn:
-            if "fields" not in cols:
-                json_type = "JSONB" if engine.dialect.name == "postgresql" else "JSON"
-                conn.execute(text(f"ALTER TABLE numeral_rules ADD COLUMN fields {json_type}"))
-            if "rule_text" in cols:
-                conn.execute(text("ALTER TABLE numeral_rules DROP COLUMN rule_text"))
 
     # Large multi-checks now go through Anthropic's (cheaper, slower) Message
     # Batches API instead of running live — add the columns that track that
@@ -187,6 +166,25 @@ def _run_migrations():
         if "cost_usd" not in cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0"))
+
+    # The Numerals document/check is removed entirely — the AI check built
+    # on it kept misreading it in ways that weren't worth patching further
+    # (currency identity vs. format, date examples turning into ISO
+    # gibberish, cross-referencing unrelated fields). Drops its table and
+    # the two project columns that tracked its upload; nothing else
+    # (glossary, tone-of-address, check history) is affected.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "numeral_rules" in existing_tables:
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS numeral_rules{cascade}"))
+    if "projects" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("projects")}
+        with engine.begin() as conn:
+            if "numerals_filename" in cols:
+                conn.execute(text("ALTER TABLE projects DROP COLUMN numerals_filename"))
+            if "numerals_uploaded_at" in cols:
+                conn.execute(text("ALTER TABLE projects DROP COLUMN numerals_uploaded_at"))
 
 
 def _ensure_admin_exists():

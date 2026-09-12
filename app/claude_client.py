@@ -6,21 +6,17 @@ import httpx
 from app.config import settings
 
 CHECK_LABELS = {
-    # Purely term-matching now — number/currency FORMAT lives entirely in
-    # the separate "numerals" check below, driven by the project's actual
-    # Numerals document rather than anything the model has to guess.
+    # Purely term-matching — glossary is about vocabulary, not number/date
+    # format (see the "typo" entry below for currency identity mismatches;
+    # the separate rule-based "numbers" check in rule_checks.py handles raw
+    # digit mismatches between source and translation).
     "glossary": "глоссарий — термины переводить ровно как в глоссарии",
-    # Base wording for when no Numerals-doc rule exists for this language
-    # (см. _checks_description — normally replaced by the real rule text,
-    # so the model is never left guessing at a format on its own).
-    "numerals": "формат чисел и валют — строго по примеру/правилу для этого языка (см. ниже)",
     "register": "регистр обращения (ты/вы и аналоги) — должен быть единым по всему тексту",
     "typo": (
         "опечатки/ошибки — только те, что искажают смысл (пропущенное отрицание, спутанные число/род, потеря смысла, "
         "грамматика, ломающая понимание); не придирайся к стилю и синонимам с тем же смыслом. Сюда же относится "
         "ДРУГАЯ ВАЛЮТА, чем в исходнике (например, евро вместо доллара, или другой ISO-код) — это меняет смысл "
-        "суммы, а не просто оформление, и относится именно сюда, а не к проверке «формат чисел и валют» (та "
-        "проверяет только оформление верной валюты — разделители, положение символа, пробелы — не саму валюту)"
+        "суммы, а не просто стиль"
     ),
     "untranslatable": (
         "непереводимые термины — имена турниров/игр/брендов/продуктов. Сообщай, только если термин в переводе изменён, "
@@ -38,9 +34,9 @@ CHECK_LABELS = {
 CALIBRATION = (
     "Общее правило: сообщай, только если уверен(а), что это настоящая ошибка. Сомневаешься или это может быть "
     "допустимым вариантом — не включай. Лучше меньше, но точных находок. Порядок символа валюты относительно числа, "
-    "разделители тысяч/десятичных знаков и подобное оформление чисел — это НЕ ошибка перевода сама по себе; "
-    "сообщай об этом, только по проверке «формат чисел и валют» и только если это прямо противоречит указанному "
-    "правилу для этого языка, а не по общим представлениям о формате."
+    "разделители тысяч/десятичных знаков и подобное оформление чисел — это НЕ ошибка перевода сама по себе, и об "
+    "этом никогда не нужно сообщать; настоящая ошибка — это когда сама валюта или число не совпадают с исходником "
+    "по смыслу (см. «опечатки/ошибки»), а не то, как они оформлены."
 )
 
 
@@ -127,52 +123,17 @@ def _target_lang_line(target_lang: str) -> str:
     return f"Целевой язык перевода: {code}. Ориентируйся конкретно на этот язык — не путай с родственными языками."
 
 
-def _format_numeral_rule(fields: dict | None) -> str:
-    """Turns the project's per-language Numerals fields (e.g. {"формат
-    даты": "16.08.2023", "разделитель дробной части": "—,50", ...}) into a
-    single readable line for the prompt."""
-    if not fields:
-        return ""
-    return "; ".join(f"{label} — {value}" for label, value in fields.items())
-
-
-def _checks_description(checks: list[str], numeral_rule: dict | None = None, tone_register: str = "") -> str | None:
-    """numeral_rule and tone_register come from the project's actual
-    Numerals/Tone-of-address documents for this specific target language
-    (see app.main's per-language lookups) — never guessed by the model.
-
-    If "numerals" is selected but there's no rule for this language, it's
-    dropped from the description entirely rather than left as a vague
-    instruction — same principle as before: never give the model an idea
-    it has nothing concrete to check against."""
+def _checks_description(checks: list[str], tone_register: str = "") -> str | None:
+    """tone_register comes from the project's actual Tone-of-address
+    document for this specific target language (see app.main's per-language
+    lookup) — never guessed by the model."""
     ai_checks = [c for c in checks if c in CHECK_LABELS]
     if not ai_checks:
         return None
 
-    numeral_text = _format_numeral_rule(numeral_rule)
     labels = []
     for c in ai_checks:
-        if c == "numerals":
-            if not numeral_text:
-                continue
-            labels.append(
-                f'формат чисел и валют — строго по правилам для этого языка: "{numeral_text}"; '
-                f"проверяй ТОЛЬКО ОФОРМЛЕНИЕ (разделитель дробной части, порядок символа/кода валюты относительно "
-                f"числа, пробел или его отсутствие, группировка разрядов и т.п.) — и проверяй его у той валюты, "
-                f"что реально стоит в переводе, даже если это не та валюта, что в исходнике. То, ПРАВИЛЬНАЯ ли это "
-                f"валюта (совпадает ли она вообще с исходником — например, евро вместо доллара) — НЕ пиши здесь "
-                f"вообще, ни словом: это отдельная проверка «опечатки/ошибки», не эта. Валюта (символ или код), "
-                f"показанная в примере правила выше, — это только образец оформления, а не требование сменить "
-                f"валюту. ВАЖНО: правило состоит из НЕСКОЛЬКИХ отдельных полей (перечислены через «;» выше), и "
-                f"каждое поле отвечает СТРОГО за свой аспект и ни за какой другой: например, поле «разделитель "
-                f"дробной части» задаёт исключительно символ (точка или запятая) между целой и дробной частью "
-                f"числа, а поля «валюта при числах ...» задают только сам символ/код валюты и его положение "
-                f"относительно числа — они не имеют отношения к разделителю. Никогда не переноси деталь (например, "
-                f"точку или запятую), увиденную в примере ОДНОГО поля, на аспект, за который отвечает ДРУГОЕ поле — "
-                f"если нужен разделитель дробной части, бери его строго из поля «разделитель дробной части», а не "
-                f"из примера про валюту; не по общим представлениям о формате"
-            )
-        elif c == "register" and tone_register.strip() in ("formal", "informal"):
+        if c == "register" and tone_register.strip() in ("formal", "informal"):
             word = "формальный (вы/аналог)" if tone_register.strip() == "formal" else "неформальный (ты/аналог)"
             labels.append(f"регистр обращения — для этого языка должен быть {word} по всему тексту")
         else:
@@ -282,12 +243,12 @@ def parse_json_array(text_block: str | None) -> list:
 
 async def run_ai_checks(
     source: str, translation: str, glossary: str, checks: list[str], extra_instructions: str = "",
-    numeral_rule: dict | None = None, tone_register: str = "", target_lang: str = "", source_lang: str = "",
+    tone_register: str = "", target_lang: str = "", source_lang: str = "",
 ) -> tuple[list[dict], float]:
     """Returns (findings, cost_usd) — cost_usd is this one API call's actual
     cost from Anthropic's reported token usage (0.0 when no AI check ran,
     e.g. no API key configured or nothing to check against)."""
-    checks_description = _checks_description(checks, numeral_rule, tone_register)
+    checks_description = _checks_description(checks, tone_register)
     if not checks_description:
         return [], 0.0
 
@@ -313,7 +274,6 @@ def build_batch_prompt(
     glossary: str,
     checks: list[str],
     extra_instructions: str = "",
-    numeral_rule: dict | None = None,
     tone_register: str = "",
     target_lang: str = "",
     source_lang: str = "",
@@ -335,7 +295,7 @@ def build_batch_prompt(
     back to the caller's original item indices — pass it to
     group_batch_findings once you have the model's response.
     """
-    checks_description = _checks_description(checks, numeral_rule, tone_register)
+    checks_description = _checks_description(checks, tone_register)
     if not checks_description:
         return None, {}
 
@@ -382,7 +342,6 @@ async def run_ai_checks_batch(
     glossary: str,
     checks: list[str],
     extra_instructions: str = "",
-    numeral_rule: dict | None = None,
     tone_register: str = "",
     target_lang: str = "",
     source_lang: str = "",
@@ -390,7 +349,7 @@ async def run_ai_checks_batch(
     """Synchronous path: builds the prompt, calls Claude right away, and
     returns (findings keyed by index into items, this call's cost_usd)."""
     prompt, number_to_index = build_batch_prompt(
-        items, glossary, checks, extra_instructions, numeral_rule, tone_register, target_lang, source_lang
+        items, glossary, checks, extra_instructions, tone_register, target_lang, source_lang
     )
     if prompt is None:
         return {}, 0.0

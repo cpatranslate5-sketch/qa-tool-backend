@@ -90,19 +90,19 @@ def _subtags(code: str) -> set[str]:
     """Every hyphen-separated piece of a code, lowercased — {"kk", "kz"}
     for "kk-KZ". Used to match a bare code against either the language part
     OR the region part of a fuller one, since the agency's own documents
-    are inconsistent about which they use for a short label — the
-    Glossary/Tone docs label some languages by their country's code alone
-    ("KZ" for Kazakh, "TJ" for Tajik, "BD" for Bengali) rather than the
-    actual ISO language subtag ("kk", "tg", "bn") that Numerals uses in
-    "kk-KZ"/"tg-TJ"/"bn-BD" — a plain prefix-only match would miss these
+    are inconsistent about which they use for a short label — the Tone doc
+    labels some languages by their country's code alone ("KZ" for Kazakh,
+    "TJ" for Tajik, "BD" for Bengali) rather than the actual ISO language
+    subtag ("kk", "tg", "bn") that a region-qualified code like "kk-KZ"/
+    "tg-TJ"/"bn-BD" would use — a plain prefix-only match would miss these
     entirely, since "kz" isn't the base of "kk-kz"."""
     return set(code.strip().lower().split("-"))
 
 
 def _freeze(value):
     """Makes a value hashable/comparable for the equality check in
-    resolve_lang_code below — a Numerals row is a dict of fields, a Tone
-    row is a plain string."""
+    resolve_lang_code below — a document's row might be a plain string
+    (e.g. Tone's register) or a dict of fields, depending on the doc."""
     if isinstance(value, dict):
         return tuple(sorted(value.items()))
     return value
@@ -112,14 +112,14 @@ def resolve_lang_code(requested: str, available, values: dict | None = None):
     """Matches a requested language code against a set/dict/iterable of
     codes actually present in one document, bridging granularity mismatches
     between the project's different reference documents — e.g. the
-    Glossary may use a plain "ko" while the Numerals doc uses region-
+    Glossary may use a plain "ko" while another document uses region-
     qualified "ko-KR" for the same language.
 
     Tries an exact (case-insensitive) match first. Failing that, falls
     back to matching the requested code against any subtag (language part
     OR region part — see _subtags) of an available code — but ONLY when
-    exactly one available code contains it; if several do (e.g. Numerals
-    has both "es-ES" and "es-AR" with genuinely different number formats),
+    exactly one available code contains it; if several do (e.g. a document
+    has both "es-ES" and "es-AR" with genuinely different rules for each),
     guessing would silently apply the wrong regional rule, so this returns
     None instead — the caller then treats the language as if it had no
     entry at all, exactly like today's "document uploaded but this
@@ -325,7 +325,6 @@ async def _check_language_for_sheet(
     checks: list[str],
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
-    numeral_rule: str = "",
     tone_register: str = "",
 ) -> tuple[list[dict], float]:
     relevant_rows = []
@@ -343,7 +342,7 @@ async def _check_language_for_sheet(
 
     async with semaphore:
         ai_findings_by_idx, cost_usd = await run_ai_checks_batch(
-            ai_items, glossary, checks, extra_instructions, numeral_rule, tone_register, lang, source_lang
+            ai_items, glossary, checks, extra_instructions, tone_register, lang, source_lang
         )
 
     out = []
@@ -369,23 +368,20 @@ async def run_multi_check(
     glossary_for_lang,
     checks: list[str],
     extra_instructions: str = "",
-    numerals_for_lang=None,
     tone_for_lang=None,
     target_langs_filter: set[str] | None = None,
 ) -> dict:
     """
-    glossary_for_lang / numerals_for_lang / tone_for_lang: each a
-    callable(lang_code) -> prompt text (or "" if nothing for that language),
-    already narrowed to just what this one target language needs — see
-    app.glossary / app.project_docs. Each target language gets its own
-    call, so the AI prompt for e.g. "es-mx" never carries the other 34
-    languages' rows.
+    glossary_for_lang / tone_for_lang: each a callable(lang_code) -> prompt
+    text (or "" if nothing for that language), already narrowed to just
+    what this one target language needs — see app.glossary / app.project_docs.
+    Each target language gets its own call, so the AI prompt for e.g.
+    "es-mx" never carries the other 34 languages' rows.
 
     target_langs_filter: when given, only these languages are checked even
     if the file has more columns — lets a manager check a subset of a
     large upload instead of every language every time.
     """
-    numerals_for_lang = numerals_for_lang or (lambda lang: {})
     tone_for_lang = tone_for_lang or (lambda lang: "")
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
@@ -400,7 +396,7 @@ async def run_multi_check(
         tasks = [
             _check_language_for_sheet(
                 sheet, lang, source_lang, glossary_for_lang(lang), checks, extra_instructions, semaphore,
-                numerals_for_lang(lang), tone_for_lang(lang),
+                tone_for_lang(lang),
             )
             for lang in target_langs
         ]
@@ -470,7 +466,6 @@ def build_batch_plan(
     glossary_for_lang,
     checks: list[str],
     extra_instructions: str = "",
-    numerals_for_lang=None,
     tone_for_lang=None,
     target_langs_filter: set[str] | None = None,
 ) -> tuple[list[dict], dict]:
@@ -485,7 +480,6 @@ def build_batch_plan(
     types were selected at all, in which case there's nothing to submit and
     finalize_batch_results(skeleton, {}) is already the final answer.
     """
-    numerals_for_lang = numerals_for_lang or (lambda lang: {})
     tone_for_lang = tone_for_lang or (lambda lang: "")
     requests: list[dict] = []
     skeleton_sheets = []
@@ -526,7 +520,7 @@ def build_batch_plan(
             model = _model_for_lang(lang)
             prompt, number_to_index = build_batch_prompt(
                 ai_items, glossary_for_lang(lang), checks, extra_instructions,
-                numerals_for_lang(lang), tone_for_lang(lang), lang, source_lang,
+                tone_for_lang(lang), lang, source_lang,
             )
             if prompt is not None:
                 requests.append({"custom_id": custom_id, "prompt": prompt, "model": model})

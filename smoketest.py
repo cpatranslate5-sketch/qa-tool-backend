@@ -1,5 +1,5 @@
 """Quick local smoke test for the shared-folders / admin model, the
-structured glossary/numerals/tone documents, and the new check types. Uses
+structured glossary/tone documents, and the new check types. Uses
 a throwaway SQLite DB (no DATABASE_URL set) and no AI key, so only
 rule-based findings are expected, not AI ones."""
 import asyncio
@@ -79,7 +79,6 @@ r = check("admin create project", client.post("/projects", json={"name": "Pragma
 project_id = r.json()["id"]
 assert r.json()["created_by_name"] == "Александр"
 assert r.json()["glossary_filename"] == ""
-assert r.json()["numerals_filename"] == ""
 assert r.json()["tone_filename"] == ""
 
 check("duplicate project name", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}), expect=409)
@@ -117,17 +116,7 @@ assert r.json()["filename"] == "glossary.xlsx"
 r = check("glossary status (visible to any folder)", client.get(f"/projects/{project_id}/glossary/status"))
 assert r.json()["term_count"] == 3
 
-# --- doc-gating: numerals/tone checks refuse to run until their doc exists ---
-check("numerals check blocked with no doc uploaded", client.post("/check", json={
-    "source": "Bet $0.40 now.",
-    "translation": "Ставка 0,40$ сейчас.",
-    "checks": ["numerals"],
-    "project_id": project_id,
-    "source_lang": "en",
-    "target_lang": "ru",
-    "manager_name": "Мария",
-    "manager_id": regular_id,
-}), expect=400)
+# --- doc-gating: tone (register) check refuses to run until its doc exists ---
 check("tone (register) check blocked with no doc uploaded", client.post("/check", json={
     "source": "Play now.",
     "translation": "Играйте сейчас.",
@@ -139,47 +128,11 @@ check("tone (register) check blocked with no doc uploaded", client.post("/check"
     "manager_id": regular_id,
 }), expect=400)
 
-# --- Numerals doc: real multi-column format (several distinct format
-# columns per language, region-qualified codes) matching the agency's
-# actual export — "ru-ru" here deliberately differs in granularity from
-# the glossary's plain "ru" column, exercising the base-subtag fallback
-# used throughout the app (see resolve_lang_code unit tests below too).
-nwb = openpyxl.Workbook()
-nws = nwb.active
-nws.append(["Language", "Currency + >9999", "Currency + <10 000", "Decimal", "Date"])
-nws.append(["ru-RU", "11 500 €", "2 500 €", "—,50", "16.08.2023"])
-nws.append(["es-mx", "$11,500", "$2,500", "—.50", "08/16/2023"])
-nws.append(["ko-KR", "11,500 €", "2,500 €", "—.50", "2023.08.16"])
-# a country-code-style label ("KZ" for Kazakh) will need to bridge to this
-# real ISO language-region code ("kk-KZ") — see the resolve_lang_code unit
-# tests below, and Александр's real Tone doc which uses exactly this style
-nws.append(["kk-KZ", "11 500 ₸", "2 500 ₸", "—,50", "16.08.2023"])
-nbuf = io.BytesIO()
-nwb.save(nbuf)
-nbuf.seek(0)
-
-check("non-admin numerals upload blocked", client.post(
-    f"/projects/{project_id}/numerals/upload",
-    files={"file": ("numerals.xlsx", nbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": regular_id},
-), expect=403)
-nbuf.seek(0)
-r = check("admin numerals upload", client.post(
-    f"/projects/{project_id}/numerals/upload",
-    files={"file": ("numerals.xlsx", nbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": admin_id},
-))
-assert r.json()["rule_count"] == 4, r.json()
-
-r = check("numerals status (visible to any folder)", client.get(f"/projects/{project_id}/numerals/status"))
-assert r.json()["rule_count"] == 4
-
 # --- Tone-of-address doc: real layout, matching the agency's actual
 # export — mirrors the Glossary (language codes as header-row columns,
 # not one row per language as originally assumed), with the register in
-# the data row below each column. "KZ" here is the same country-code-style
-# label as the real file uses for Kazakh, exercising the subtag bridge to
-# Numerals' "kk-KZ" above.
+# the data row below each column. "KZ" is the same country-code-style
+# label the real file uses for Kazakh.
 twb = openpyxl.Workbook()
 tws = twb.active
 tws.append(["EN", "RU", "KZ", "ES (MX)"])
@@ -194,27 +147,14 @@ r = check("admin tone upload", client.post(
 ))
 assert r.json()["rule_count"] == 4, r.json()
 
-# --- known-languages union across the three docs: "ru" (glossary/tone)
-# and "ru-ru" (numerals) collapse into the one specific spelling, and the
-# bare country-style "kz" (Tone) merges into numerals' "kk-KZ" the same
-# way — merge_lang_codes bridges both granularity styles for display ---
+# --- known-languages union across the two remaining docs (glossary, tone):
+# just the union of every language column named in either, with no
+# granularity-bridging needed here since both docs already use the same
+# plain codes ---
 r = check("known languages union", client.get(f"/projects/{project_id}/known-languages"))
-assert set(r.json()["languages"]) == {"ru-ru", "es-mx", "ko-kr", "kk-kz", "en"}, r.json()
+assert set(r.json()["languages"]) == {"ru", "es-mx", "kz", "en"}, r.json()
 
-# --- now that docs exist, the previously-blocked checks run fine. Also
-# confirms the granularity fallback in a real request: target_lang="ru"
-# resolves to the numerals doc's "ru-ru" row (the only Russian variant),
-# per Александр's live question about "KO" vs "ko-KR" style mismatches ---
-check("numerals check now runs (base-subtag fallback: ru -> ru-ru)", client.post("/check", json={
-    "source": "Bet $0.40 now.",
-    "translation": "Ставка 0,40$ сейчас.",
-    "checks": ["numerals"],
-    "project_id": project_id,
-    "source_lang": "en",
-    "target_lang": "ru",
-    "manager_name": "Мария",
-    "manager_id": regular_id,
-}))
+# --- now that the tone doc exists, the previously-blocked check runs fine ---
 check("tone check now runs", client.post("/check", json={
     "source": "Play now.",
     "translation": "Играйте сейчас.",
@@ -275,7 +215,7 @@ check("check with extra_instructions", client.post("/check", json={
 # manager only sees their own runs — point 1 of Александр's spec) ---
 r = check("history shows attribution", client.get(f"/projects/{project_id}/history", params={"manager_id": regular_id}))
 history = r.json()
-assert len(history) == 4  # numerals + tone + full-checks + extra_instructions check (double-space was standalone)
+assert len(history) == 3  # tone + full-checks + extra_instructions check (double-space was standalone)
 assert history[0]["performed_by_name"] == "Мария"
 assert history[0]["source_lang"] == "en" and history[0]["target_lang"] == "ru"
 print("   performed_by_name:", history[0]["performed_by_name"])
@@ -293,7 +233,7 @@ check("admin runs a check on the same shared project", client.post("/check", jso
     "manager_id": admin_id,
 }))
 r = check("Мария's history unaffected by admin's check", client.get(f"/projects/{project_id}/history", params={"manager_id": regular_id}))
-assert len(r.json()) == 4, r.json()
+assert len(r.json()) == 3, r.json()
 r = check("admin's own history shows only admin's check", client.get(f"/projects/{project_id}/history", params={"manager_id": admin_id}))
 assert len(r.json()) == 1, r.json()
 assert r.json()[0]["performed_by_name"] == "Александр"
@@ -461,8 +401,6 @@ assert r.json()["glossary_filename"] == "glossary2.xlsx", r.json()
 
 r = check("copied project's glossary status matches source", client.get(f"/projects/{copy_project_id}/glossary/status"))
 assert r.json()["term_count"] == 1, r.json()
-r = check("copied project's numerals status matches source", client.get(f"/projects/{copy_project_id}/numerals/status"))
-assert r.json()["rule_count"] == 4, r.json()
 
 # re-uploading the ORIGINAL project's glossary must not affect the copy
 gwb3 = openpyxl.Workbook()
@@ -504,9 +442,9 @@ r = check("glossary survives re-migration", client.get(f"/projects/{project_id}/
 assert r.json()["term_count"] == 2
 
 # --- unit tests: language-code granularity bridging (resolve_lang_code /
-# merge_lang_codes) and the real multi-sheet Numerals document shape ---
+# merge_lang_codes) ---
 from app.excel_multi import resolve_lang_code, merge_lang_codes
-from app.project_docs import parse_numerals_workbook, parse_tone_workbook
+from app.project_docs import parse_tone_workbook
 
 # exact match wins even when a base-subtag match would also be possible
 assert resolve_lang_code("ko-kr", ["ko-kr", "ko"]) == "ko-kr"
@@ -563,52 +501,6 @@ assert tone_rows == {
 print("[OK] parse_tone_workbook: column-per-language layout (not row-per-language), "
       "combined header split across both codes")
 
-# multi-sheet workbook: a master reference sheet plus a smaller
-# per-project sheet that overrides one of its languages, and a combined
-# "fr-CI / fr-FR" language cell applying one row to both codes
-mswb = openpyxl.Workbook()
-master_ws = mswb.active
-master_ws.title = "Numerals_Format_Issues"
-master_ws.append(["Language", "Currency + >9999", "Decimal"])
-master_ws.append(["de-DE", "11.500 €", "—,50"])
-master_ws.append(["fr-CI / fr-FR", "11 500 €", "—,50"])
-project_ws = mswb.create_sheet("numerals ProjectX")
-project_ws.append(["Language", "Currency + >9999", "Decimal"])
-project_ws.append(["de-DE", "11.500 EUR (проектная правка)", "—,50"])
-msbuf = io.BytesIO()
-mswb.save(msbuf)
-msbuf.seek(0)
-parsed = {row["lang_code"]: row["fields"] for row in parse_numerals_workbook(msbuf.read())}
-assert parsed["de-de"]["валюта при числах от 10 000"] == "11.500 EUR (проектная правка)", parsed
-assert parsed["fr-ci"]["разделитель дробной части"] == "—,50", parsed
-assert parsed["fr-fr"]["разделитель дробной части"] == "—,50", parsed
-print("[OK] parse_numerals_workbook: multi-sheet merge (later sheet overrides), "
-      "combined language cell split across both codes")
-
-# --- a "Date" column entered as a real Excel date (not plain text) must
-# still surface its ACTUAL displayed format ("16.08.2023") to the AI check,
-# not Python's ISO str() of the underlying date object ("2023-08-16
-# 00:00:00") — Александр hit this live: az-AZ's Date column was a genuine
-# date cell formatted "dd.mm.yyyy", and the numerals check silently had
-# nothing sensible to compare a "22/09/2026"-style translation against ---
-import datetime as _dt
-
-datewb = openpyxl.Workbook()
-date_ws = datewb.active
-date_ws.append(["Language", "Date"])
-date_ws.append(["az-AZ", _dt.date(2023, 8, 16)])
-date_ws.cell(row=2, column=2).number_format = "dd.mm.yyyy"
-date_ws.append(["en-US", _dt.date(2023, 8, 16)])
-date_ws.cell(row=3, column=2).number_format = "mm/dd/yyyy"
-datebuf = io.BytesIO()
-datewb.save(datebuf)
-datebuf.seek(0)
-date_parsed = {row["lang_code"]: row["fields"] for row in parse_numerals_workbook(datebuf.read())}
-assert date_parsed["az-az"]["формат даты"] == "16.08.2023", date_parsed
-assert date_parsed["en-us"]["формат даты"] == "08/16/2023", date_parsed
-print("[OK] parse_numerals_workbook: a Date column entered as a real Excel date preserves its "
-      "actual displayed format (per-cell number_format), not Python's ISO str() of the date object")
-
 # --- model tiering: confirmed "hard" languages get the stronger model,
 # matched by base subtag so any region variant of them qualifies too ---
 from app.claude_client import _model_for_lang
@@ -648,60 +540,29 @@ assert check_numbers("$50,000 prize", "50 тысяч приз") != []
 print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no longer "
       "false-flagged as a numbers mismatch; real mismatches and thousands-grouping still caught")
 
-# --- the "numerals" AI check's instruction must separate the rule's example
-# CURRENCY (illustrative only) from its FORMAT (binding) — Александр hit a
-# real case where the numerals rule's example happened to show "€" and the
-# model concluded the translation must be converted to euros, even though
-# the source used "$" throughout and only the spacing was actually wrong ---
-from app.claude_client import CHECK_LABELS, _checks_description
+# --- the "typo" AI check catches a WRONG CURRENCY entirely (e.g. euro
+# instead of dollar) as a genuine translation error, not just a stylistic
+# quirk — Александр hit a real case where $0.40 was mistranslated as
+# "0,40 €" ---
+from app.claude_client import CHECK_LABELS
 
-numerals_desc = _checks_description(["numerals"], numeral_rule={"валюта при числах до 10 000": "0,40€"})
-assert numerals_desc is not None
-assert "не по общим представлениям о формате" in numerals_desc, numerals_desc
-print("[OK] numerals check instruction separates the rule's example currency (illustrative) "
-      "from its binding format, so a $ source isn't reformatted into the rule's example currency (€)")
-
-# --- currency IDENTITY (wrong currency entirely, e.g. € instead of $) and
-# currency FORMAT (spacing/separator/symbol position) are now split cleanly
-# between "typo" and "numerals" respectively, so selecting both criteria on
-# the same real mistake ($0.40 mistranslated as "0,40 €" with a stray space)
-# yields two distinct findings instead of one that conflates both ---
 assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
-assert "НЕ пиши здесь" in numerals_desc, numerals_desc  # numerals explicitly stays out of currency identity
-print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки», "
-      "while «формат чисел и валют» only ever comments on spacing/separator/symbol-position formatting")
-
-# --- the Numerals document has several independent fields (currency
-# symbol/position, decimal separator, date format, ...) — Александр hit a
-# case where the currency field's example happened to use "." (just to show
-# symbol placement) while the SEPARATE "разделитель дробной части" field
-# correctly said ","; the model cross-applied the currency example's period
-# onto the decimal-separator question instead of using the dedicated field ---
-mixed_rule_desc = _checks_description(
-    ["numerals"],
-    numeral_rule={"валюта при числах до 10 000": "0.40 $", "разделитель дробной части": ","},
-)
-assert mixed_rule_desc is not None
-assert "бери его строго из поля «разделитель дробной части»" in mixed_rule_desc, mixed_rule_desc
-assert "не переноси" in mixed_rule_desc, mixed_rule_desc
-print("[OK] numerals check instruction keeps each rule field to its own aspect — a decimal separator "
-      "question is answered only from «разделитель дробной части», never from a currency field's example")
+print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки»")
 
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something
-# else anyway (Александр hit this live: with only "Нумералс" ticked, the
-# result still contained "untranslatable" findings) ---
+# else anyway ---
 from app.claude_client import _allowed_ai_types, _filter_findings_by_checks, run_ai_checks
 import app.claude_client as claude_client_mod
 
-assert _allowed_ai_types(["numerals"]) == {"numerals"}
-assert _allowed_ai_types(["numerals", "punctuation", "max_length"]) == {"numerals"}  # rule checks aren't AI types
+assert _allowed_ai_types(["typo"]) == {"typo"}
+assert _allowed_ai_types(["typo", "punctuation", "max_length"]) == {"typo"}  # rule checks aren't AI types
 
 raw_findings = [
-    {"type": "numerals", "severity": "medium", "message": "формат валюты не совпадает"},
+    {"type": "typo", "severity": "medium", "message": "неверная валюта в переводе"},
     {"type": "untranslatable", "severity": "high", "message": "слово не переведено"},
 ]
-assert _filter_findings_by_checks(raw_findings, ["numerals"]) == [raw_findings[0]]
+assert _filter_findings_by_checks(raw_findings, ["typo"]) == [raw_findings[0]]
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 captured_prompts = []
@@ -709,10 +570,10 @@ captured_prompts = []
 
 async def _fake_call_claude(prompt, model=None):
     captured_prompts.append(prompt)
-    # Simulates a model that ignores "проверяй только numerals" and
+    # Simulates a model that ignores "проверяй только typo" and
     # reports an untranslatable-text issue anyway.
     text = (
-        '[{"type": "numerals", "severity": "medium", "message": "формат валюты не совпадает"},'
+        '[{"type": "typo", "severity": "medium", "message": "неверная валюта в переводе"},'
         '{"type": "untranslatable", "severity": "high", "message": "слово не переведено"}]'
     )
     return (text, {"input_tokens": 500, "output_tokens": 100})
@@ -721,16 +582,15 @@ async def _fake_call_claude(prompt, model=None):
 claude_client_mod._call_claude = _fake_call_claude
 findings, ai_cost = asyncio.get_event_loop().run_until_complete(
     run_ai_checks(
-        "source", "translation", "", ["numerals"], target_lang="az-az",
-        numeral_rule={"формат валюты": "0,40 ₼"},
+        "source", "translation", "", ["typo"], target_lang="az-az",
     )
 )
 assert findings == [raw_findings[0]], findings
 assert ai_cost > 0, ai_cost
 # The JSON schema shown to the model is also scoped down to just the
-# requested check(s), not a fixed always-all-6 list.
+# requested check(s), not a fixed always-all list.
 type_enum_line = next(line for line in captured_prompts[0].splitlines() if '"type":' in line)
-assert "numerals" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
+assert "typo" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
 print("[OK] AI findings hard-filtered to requested checks even when the model reports "
       "an out-of-scope finding anyway (prompt's type list is also scoped down, in addition)")
 
@@ -743,8 +603,7 @@ r = check("standalone /check surfaces cost_usd for an AI-backed check", client.p
     json={
         "source": "source text",
         "translation": "translation text",
-        # "typo" needs no project document to run (unlike "numerals", which
-        # is dropped with nothing to check against — see _checks_description).
+        # "typo" needs no project document to run.
         "checks": ["typo"],
     },
 ))

@@ -40,9 +40,15 @@ class Project(Base):
     """Shared/global — every folder sees the same set of projects. Only the
     admin folder can create one (see _require_admin in main.py). No more
     per-language sub-folders (removed — see the dropped ProjectLanguage
-    model): a project instead carries three optional reference documents
-    (glossary, numerals/number-format, tone-of-address), each gating its
-    matching AI check until uploaded — see app.main's _require_doc."""
+    model): a project instead carries two optional reference documents
+    (glossary, tone-of-address), each gating its matching AI check until
+    uploaded — see app.main's _require_doc.
+
+    A third document, Numerals (number/currency/date format per language),
+    existed here too but was removed — the AI check built on it kept
+    misreading the document (currency identity vs. format, date examples,
+    cross-referencing unrelated fields) and wasn't worth the reliability
+    cost, so the whole feature was dropped rather than patched further."""
 
     __tablename__ = "projects"
 
@@ -51,8 +57,6 @@ class Project(Base):
     created_by_name: Mapped[str] = mapped_column(String(120), default="")
     glossary_filename: Mapped[str] = mapped_column(String(300), default="")
     glossary_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    numerals_filename: Mapped[str] = mapped_column(String(300), default="")
-    numerals_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     tone_filename: Mapped[str] = mapped_column(String(300), default="")
     tone_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -60,7 +64,6 @@ class Project(Base):
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     glossary_terms: Mapped[list["GlossaryTerm"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-    numeral_rules: Mapped[list["NumeralRule"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     tone_rules: Mapped[list["ToneRule"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
@@ -84,34 +87,9 @@ class GlossaryTerm(Base):
     project: Mapped["Project"] = relationship(back_populates="glossary_terms")
 
 
-class NumeralRule(Base):
-    """One row of the project's "Нумералс" doc: for a given language, the
-    full set of number/currency/date/etc. format columns (see `fields`
-    below). Row-based (one row per language), unlike the glossary's
-    per-language columns."""
-
-    __tablename__ = "numeral_rules"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
-    lang_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    # Every number/currency/date/etc. format column found for this language
-    # in the uploaded document, keyed by its (Russian) column label — e.g.
-    # {"валюта при числах от 10 000": "11 500 €", "формат даты": "16.08.2023"}.
-    # The real document has around a dozen such columns per language rather
-    # than one free-text rule, and the agency may add more over time, so
-    # every column present is kept rather than assuming a fixed set.
-    fields: Mapped[dict] = mapped_column(JSON, default=dict)
-
-    project: Mapped["Project"] = relationship(back_populates="numeral_rules")
-
-    __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_numeral_rule_per_project_lang"),)
-
-
 class ToneRule(Base):
     """One row of the project's "Тон обращения" doc: for a given language,
-    whether the required register is formal or informal. Row-based, same
-    simple list style as NumeralRule."""
+    whether the required register is formal or informal."""
 
     __tablename__ = "tone_rules"
 

@@ -23,7 +23,7 @@ from app.excel_multi import (
     try_finalize_batch,
 )
 from app.glossary import format_glossary_prompt, parse_glossary_workbook, terms_for_language
-from app.project_docs import parse_numerals_workbook, parse_tone_workbook
+from app.project_docs import parse_tone_workbook
 from app.rule_checks import run_rule_checks
 
 app = FastAPI(title="Translation QA Tool", version="0.4.0")
@@ -137,8 +137,8 @@ def _require_admin(manager_id: int, db: Session) -> models.Manager:
 # -------------------------------------------------------------- projects ----
 # Shared/global: every folder sees the same projects. Only the admin folder
 # may create, delete, or restructure one (reference documents). No more
-# per-language sub-folders — a project instead carries up to three optional
-# reference documents (glossary, numerals, tone-of-address).
+# per-language sub-folders — a project instead carries two optional
+# reference documents (glossary, tone-of-address).
 
 @app.get("/projects", response_model=list[schemas.ProjectOut])
 def list_projects(db: Session = Depends(get_db)):
@@ -146,9 +146,9 @@ def list_projects(db: Session = Depends(get_db)):
 
 
 def _copy_project_documents(from_project_id: int, to_project_id: int, db: Session) -> None:
-    """Deep-copies glossary/numerals/tone rows from one project into
-    another as an independent starting point — editing the new project's
-    copy afterward never touches the original."""
+    """Deep-copies glossary/tone rows from one project into another as an
+    independent starting point — editing the new project's copy afterward
+    never touches the original."""
     from_project = db.get(models.Project, from_project_id)
     if from_project is None:
         raise HTTPException(404, "Проект-образец не найден.")
@@ -159,15 +159,11 @@ def _copy_project_documents(from_project_id: int, to_project_id: int, db: Sessio
             project_id=to_project_id, term_en=t.term_en, description=t.description,
             translations=dict(t.translations), row_order=t.row_order,
         ))
-    for r in db.query(models.NumeralRule).filter(models.NumeralRule.project_id == from_project_id).all():
-        db.add(models.NumeralRule(project_id=to_project_id, lang_code=r.lang_code, fields=dict(r.fields or {})))
     for r in db.query(models.ToneRule).filter(models.ToneRule.project_id == from_project_id).all():
         db.add(models.ToneRule(project_id=to_project_id, lang_code=r.lang_code, register=r.register))
 
     to_project.glossary_filename = from_project.glossary_filename
     to_project.glossary_uploaded_at = from_project.glossary_uploaded_at
-    to_project.numerals_filename = from_project.numerals_filename
-    to_project.numerals_uploaded_at = from_project.numerals_uploaded_at
     to_project.tone_filename = from_project.tone_filename
     to_project.tone_uploaded_at = from_project.tone_uploaded_at
 
@@ -229,9 +225,9 @@ def _glossary_lookup(project_id: int, db: Session):
     EN + RU + that one language — every check (single or multi) uses this
     rather than ever loading the full multi-language table.
 
-    Bridges the same granularity mismatch as _numerals_lookup/_tone_lookup
-    (see there) — e.g. a target language selected as "ko-KR" still finds
-    the Glossary's plain "ko" column, and vice versa."""
+    Bridges the same granularity mismatch as _tone_lookup (see there) —
+    e.g. a target language selected as "ko-KR" still finds the Glossary's
+    plain "ko" column, and vice versa."""
     all_terms = _all_glossary_terms(project_id, db)
     available_langs: set[str] = set()
     for t in all_terms:
@@ -245,34 +241,15 @@ def _glossary_lookup(project_id: int, db: Session):
     return lookup
 
 
-def _numerals_lookup(project_id: int, db: Session):
-    """Returns callable(lang_code) -> fields dict for the closest matching
-    language actually present in the project's Numerals document.
+def _tone_lookup(project_id: int, db: Session):
+    """Returns callable(lang_code) -> "formal"/"informal"/"" for the closest
+    matching language actually present in the project's Tone-of-address
+    document.
 
     Documents can name the same language differently — a plain "ko" in
-    the Glossary vs region-qualified "ko-KR" in Numerals, or even a
-    country-style label like Tone's "KZ" for what Numerals calls "kk-KZ" —
+    the Glossary vs a country-style label like Tone's "KZ" for "kk-KZ" —
     resolve_lang_code bridges that by matching on any shared subtag, but
-    only when it's unambiguous (see its docstring). If the project's
-    Numerals doc has several distinct regional variants of a
-    language (es-ES/es-AR/es-MX) with genuinely different rules, an
-    unqualified request can't be resolved safely and this simply returns
-    no rule, same as a fully missing language — UNLESS every one of those
-    variants happens to carry the exact same fields anyway, in which case
-    applying it is safe regardless of which one is picked (see
-    resolve_lang_code's docstring)."""
-    rows = db.query(models.NumeralRule).filter(models.NumeralRule.project_id == project_id).all()
-    by_lang = {r.lang_code: r.fields for r in rows}
-
-    def lookup(lang_code: str) -> dict:
-        resolved = resolve_lang_code(lang_code, by_lang.keys(), values=by_lang)
-        return by_lang.get(resolved, {}) if resolved else {}
-
-    return lookup
-
-
-def _tone_lookup(project_id: int, db: Session):
-    """Same granularity-bridging lookup as _numerals_lookup, above."""
+    only when it's unambiguous (see its docstring)."""
     rows = db.query(models.ToneRule).filter(models.ToneRule.project_id == project_id).all()
     by_lang = {r.lang_code: r.register for r in rows}
 
@@ -287,7 +264,6 @@ def _tone_lookup(project_id: int, db: Session):
 # _require_doc to block a check that has nothing to check against at all.
 _DOC_REQUIREMENTS = {
     "glossary": ("Глоссарий", models.GlossaryTerm),
-    "numerals": ("Нумералс", models.NumeralRule),
     "register": ("Тон обращения", models.ToneRule),
 }
 
@@ -354,47 +330,6 @@ def glossary_status(project_id: int, db: Session = Depends(get_db)):
     )
 
 
-@app.post("/projects/{project_id}/numerals/upload", response_model=schemas.NumeralsStatusOut)
-async def upload_numerals(
-    project_id: int,
-    file: UploadFile = File(...),
-    manager_id: int = Form(...),
-    db: Session = Depends(get_db),
-):
-    """Admin-only. Replaces the project's whole Numerals doc — a simple
-    list: language, then the number/currency format rule or example for it."""
-    _require_admin(manager_id, db)
-    project = _get_project(project_id, db)
-    file_bytes = await file.read()
-
-    try:
-        rows = parse_numerals_workbook(file_bytes)
-    except Exception:
-        raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx со списком языков.")
-    if not rows:
-        raise HTTPException(400, "В файле не найдено ни одной строки с языком и правилом.")
-
-    db.query(models.NumeralRule).filter(models.NumeralRule.project_id == project_id).delete()
-    for r in rows:
-        db.add(models.NumeralRule(project_id=project_id, lang_code=r["lang_code"], fields=r["fields"]))
-    project.numerals_filename = file.filename or "numerals.xlsx"
-    project.numerals_uploaded_at = models._now()
-    db.commit()
-
-    return schemas.NumeralsStatusOut(
-        filename=project.numerals_filename, uploaded_at=project.numerals_uploaded_at, rule_count=len(rows)
-    )
-
-
-@app.get("/projects/{project_id}/numerals/status", response_model=schemas.NumeralsStatusOut)
-def numerals_status(project_id: int, db: Session = Depends(get_db)):
-    project = _get_project(project_id, db)
-    rule_count = db.query(models.NumeralRule).filter(models.NumeralRule.project_id == project_id).count()
-    return schemas.NumeralsStatusOut(
-        filename=project.numerals_filename, uploaded_at=project.numerals_uploaded_at, rule_count=rule_count
-    )
-
-
 @app.post("/projects/{project_id}/tone/upload", response_model=schemas.ToneStatusOut)
 async def upload_tone(
     project_id: int,
@@ -439,22 +374,20 @@ def tone_status(project_id: int, db: Session = Depends(get_db)):
 
 @app.get("/projects/{project_id}/known-languages")
 def known_languages(project_id: int, db: Session = Depends(get_db)):
-    """Union of every language named across the project's glossary,
-    numerals and tone-of-address documents — the frontend's source for the
+    """Union of every language named across the project's glossary and
+    tone-of-address documents — the frontend's source for the
     target-language checkbox list (see point 8 of the redesign).
 
     Documents can name the same language at different granularities (a
-    plain "ko" in the Glossary, region-qualified "ko-KR" in Numerals) —
+    plain "ko" in the Glossary, region-qualified "ko-KR" elsewhere) —
     merge_lang_codes collapses those into one entry (keeping the more
     specific spelling) while keeping genuinely distinct regional variants
     (es-ES vs es-AR vs es-MX) separate, since those really do mean
-    different number formats and must be picked explicitly."""
+    different rules and must be picked explicitly."""
     _get_project(project_id, db)
     langs: set[str] = set()
     for row in db.query(models.GlossaryTerm.translations).filter(models.GlossaryTerm.project_id == project_id).all():
         langs.update((row[0] or {}).keys())
-    for row in db.query(models.NumeralRule.lang_code).filter(models.NumeralRule.project_id == project_id).all():
-        langs.add(row[0])
     for row in db.query(models.ToneRule.lang_code).filter(models.ToneRule.project_id == project_id).all():
         langs.add(row[0])
     langs.discard("")
@@ -470,7 +403,6 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         return schemas.CheckOut(findings=[])
 
     glossary = payload.glossary
-    numeral_rule = ""
     tone_register = ""
     project = None
     if payload.project_id:
@@ -479,7 +411,6 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         target_lang = payload.target_lang.strip().lower()
         # Narrowed to EN + RU + this one language — never the whole tables.
         glossary = _glossary_lookup(project.id, db)(target_lang)
-        numeral_rule = _numerals_lookup(project.id, db)(target_lang)
         tone_register = _tone_lookup(project.id, db)(target_lang)
 
     findings = run_rule_checks(
@@ -488,7 +419,7 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     )
     ai_findings, cost_usd = await run_ai_checks(
         payload.source, payload.translation, glossary, payload.checks, payload.extra_instructions,
-        numeral_rule, tone_register, payload.target_lang, payload.source_lang,
+        tone_register, payload.target_lang, payload.source_lang,
     )
     findings += ai_findings
 
@@ -542,7 +473,7 @@ def single_check_history(project_id: int, manager_id: int, db: Session = Depends
 # ---------------------------------------------------------- multi check ---
 
 DEFAULT_MULTI_CHECKS = [
-    "numbers", "placeholders", "max_length", "glossary", "numerals", "register", "typo",
+    "numbers", "placeholders", "max_length", "glossary", "register", "typo",
     "untranslatable", "completeness", "punctuation",
 ]
 
@@ -584,7 +515,6 @@ async def multi_check(
     target_filter = {c.strip().lower() for c in target_langs.split(",") if c.strip()} or None
     resolved_source = pick_source_lang(sheets, source_lang.strip().lower() or None)
     glossary_lookup = _glossary_lookup(project_id, db)
-    numerals_lookup = _numerals_lookup(project_id, db)
     tone_lookup = _tone_lookup(project_id, db)
 
     # Small/medium jobs run live, as before. Large ones go through
@@ -595,7 +525,7 @@ async def multi_check(
     if volume <= BATCH_THRESHOLD_CHARS:
         results = await run_multi_check(
             sheets, resolved_source, glossary_lookup, selected_checks, extra_instructions,
-            numerals_lookup, tone_lookup, target_filter,
+            tone_lookup, target_filter,
         )
         record = models.MultiCheck(
             project_id=project_id,
@@ -623,7 +553,7 @@ async def multi_check(
 
     requests, skeleton = build_batch_plan(
         sheets, resolved_source, glossary_lookup, selected_checks, extra_instructions,
-        numerals_lookup, tone_lookup, target_filter,
+        tone_lookup, target_filter,
     )
     batch_id = await submit_multi_check_batch(requests) if requests else None
 

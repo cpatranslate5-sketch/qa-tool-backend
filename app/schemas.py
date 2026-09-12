@@ -4,10 +4,10 @@ from pydantic import BaseModel
 
 # Every check type a single-check or multi-check can run. "missing" isn't
 # here — it always runs automatically whenever a translation is empty.
-# "numerals" and "register" (tone of address) each require their matching
-# project document to be uploaded at all — see app.main._require_doc.
+# "register" (tone of address) requires its matching project document to
+# be uploaded at all — see app.main._require_doc.
 DEFAULT_CHECKS = [
-    "numbers", "placeholders", "glossary", "numerals", "register", "typo",
+    "numbers", "placeholders", "glossary", "register", "typo",
     "untranslatable", "completeness", "punctuation",
 ]
 
@@ -48,8 +48,8 @@ class ManagerAdminEnterIn(BaseModel):
 class ProjectIn(BaseModel):
     name: str
     manager_id: int
-    # Optional — deep-copies another project's glossary/numerals/tone rows
-    # into the new one as a starting point (fully independent afterward).
+    # Optional — deep-copies another project's glossary/tone rows into the
+    # new one as a starting point (fully independent afterward).
     copy_from_project_id: int | None = None
 
 
@@ -63,8 +63,6 @@ class ProjectOut(BaseModel):
     name: str
     glossary_filename: str
     glossary_uploaded_at: datetime.datetime | None
-    numerals_filename: str
-    numerals_uploaded_at: datetime.datetime | None
     tone_filename: str
     tone_uploaded_at: datetime.datetime | None
     created_by_name: str
@@ -74,20 +72,13 @@ class ProjectOut(BaseModel):
 
 
 class GlossaryStatusOut(BaseModel):
-    """Every one of the three project documents (glossary, numerals,
-    tone-of-address) is a structured file uploaded by the admin — this is
-    what every folder sees to know what's loaded, without exposing the
-    full table."""
+    """Both project documents (glossary, tone-of-address) are structured
+    files uploaded by the admin — this is what every folder sees to know
+    what's loaded, without exposing the full table."""
 
     filename: str
     uploaded_at: datetime.datetime | None
     term_count: int
-
-
-class NumeralsStatusOut(BaseModel):
-    filename: str
-    uploaded_at: datetime.datetime | None
-    rule_count: int
 
 
 class ToneStatusOut(BaseModel):
@@ -102,8 +93,8 @@ class CheckIn(BaseModel):
     checks: list[str] = DEFAULT_CHECKS
     # Optional — when provided, the check is saved into the requesting
     # folder's own history (see manager_id below) and the project's
-    # glossary/numerals/tone documents (narrowed to EN + RU + this one
-    # target language) are used automatically.
+    # glossary/tone documents (narrowed to EN + RU + this one target
+    # language) are used automatically.
     project_id: int | None = None
     source_lang: str = ""
     target_lang: str = ""
