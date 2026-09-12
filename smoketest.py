@@ -585,6 +585,30 @@ assert parsed["fr-fr"]["разделитель дробной части"] == "�
 print("[OK] parse_numerals_workbook: multi-sheet merge (later sheet overrides), "
       "combined language cell split across both codes")
 
+# --- a "Date" column entered as a real Excel date (not plain text) must
+# still surface its ACTUAL displayed format ("16.08.2023") to the AI check,
+# not Python's ISO str() of the underlying date object ("2023-08-16
+# 00:00:00") — Александр hit this live: az-AZ's Date column was a genuine
+# date cell formatted "dd.mm.yyyy", and the numerals check silently had
+# nothing sensible to compare a "22/09/2026"-style translation against ---
+import datetime as _dt
+
+datewb = openpyxl.Workbook()
+date_ws = datewb.active
+date_ws.append(["Language", "Date"])
+date_ws.append(["az-AZ", _dt.date(2023, 8, 16)])
+date_ws.cell(row=2, column=2).number_format = "dd.mm.yyyy"
+date_ws.append(["en-US", _dt.date(2023, 8, 16)])
+date_ws.cell(row=3, column=2).number_format = "mm/dd/yyyy"
+datebuf = io.BytesIO()
+datewb.save(datebuf)
+datebuf.seek(0)
+date_parsed = {row["lang_code"]: row["fields"] for row in parse_numerals_workbook(datebuf.read())}
+assert date_parsed["az-az"]["формат даты"] == "16.08.2023", date_parsed
+assert date_parsed["en-us"]["формат даты"] == "08/16/2023", date_parsed
+print("[OK] parse_numerals_workbook: a Date column entered as a real Excel date preserves its "
+      "actual displayed format (per-cell number_format), not Python's ISO str() of the date object")
+
 # --- model tiering: confirmed "hard" languages get the stronger model,
 # matched by base subtag so any region variant of them qualifies too ---
 from app.claude_client import _model_for_lang

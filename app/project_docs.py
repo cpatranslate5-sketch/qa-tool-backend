@@ -15,6 +15,7 @@ rows uploaded (see app.main._require_doc) — but a doc uploaded without a
 row/column for some particular language just means that language's check
 is skipped for that language, not blocked.
 """
+import datetime
 import io
 import re
 
@@ -50,6 +51,58 @@ NUMERAL_FIELD_LABELS = {
 }
 
 _LANG_SPLIT_RE = re.compile(r"\s*/\s*")
+
+# Matches the run of format-code letters Excel uses for a date/time cell's
+# displayed appearance (e.g. "dd.mm.yyyy", "d/m/yy", "hh:mm AM/PM") — used to
+# rebuild that literal display text from a parsed date/time value (see
+# _excel_date_display, below).
+_EXCEL_DATE_TOKEN_RE = re.compile(r"(yyyy|yy|dddd|ddd|dd|d|mmmm|mmm|mm|m|hh|h|ss|s|am/pm|a/p)", re.IGNORECASE)
+
+
+def _excel_date_display(val, number_format: str) -> str:
+    """openpyxl hands back a date/time cell's value as a plain Python
+    date/datetime/time object — str() on that always renders it as ISO
+    ("2023-08-16 00:00:00"), silently throwing away whatever separator and
+    field order the sheet actually displays (e.g. "16.08.2023"). For the
+    Numerals document that display text IS the rule (it's what the AI check
+    is told the correct format looks like for this language), so this
+    rebuilds it from the cell's own number_format instead of assuming any
+    one convention (period vs slash, day-first vs month-first, etc.).
+
+    Falls back to str(val) when number_format is missing, "General", or
+    contains something this doesn't recognize — better to show the model
+    *something* than crash the whole upload over one exotic format string.
+    """
+    fmt = (number_format or "").strip()
+    if not fmt or fmt.lower() == "general":
+        return str(val)
+
+    is_time_only = isinstance(val, datetime.time) and not isinstance(val, datetime.datetime)
+
+    def repl(match: re.Match) -> str:
+        token = match.group(0)
+        lower = token.lower()
+        if lower in ("am/pm", "a/p"):
+            return "%p"
+        if lower.startswith("y"):
+            return "%Y" if len(token) >= 4 else "%y"
+        if lower.startswith("d"):
+            return "%A" if len(token) >= 4 else ("%a" if len(token) == 3 else "%d")
+        if lower.startswith("h"):
+            return "%H"
+        if lower.startswith("s"):
+            return "%S"
+        if lower.startswith("m"):
+            # Excel reuses "m"/"mm" for MONTH in a date value but MINUTES in
+            # a time-only value — it disambiguates by context, so we do too.
+            return "%M" if is_time_only else "%m"
+        return token
+
+    try:
+        py_format = _EXCEL_DATE_TOKEN_RE.sub(repl, fmt)
+        return val.strftime(py_format)
+    except Exception:
+        return str(val)
 
 
 def _find_lang_col(ws, header_row: int) -> int:
@@ -124,8 +177,15 @@ def parse_numerals_workbook(file_bytes: bytes) -> list[dict]:
 
             fields = {}
             for c, ru_label in field_cols:
-                val = ws.cell(row=r, column=c).value
-                text = str(val).strip() if val else ""
+                cell = ws.cell(row=r, column=c)
+                val = cell.value
+                if isinstance(val, (datetime.date, datetime.time)):
+                    # A "Date"/"Time format" column example is usually typed
+                    # as a real Excel date/time, not plain text — see
+                    # _excel_date_display for why that needs special handling.
+                    text = _excel_date_display(val, cell.number_format).strip()
+                else:
+                    text = str(val).strip() if val else ""
                 if text:
                     fields[ru_label] = text
             if not fields:
