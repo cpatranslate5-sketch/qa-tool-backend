@@ -363,6 +363,39 @@ check("report download works once completed", client.get(
     f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx", params={"manager_id": regular_id}
 ))
 
+# --- "Срочно" (urgent) flag forces the live/synchronous path even for a
+# file whose volume would otherwise route it to the batch queue. The batch
+# network calls are still monkeypatched from above, but the urgent path
+# must never call them — it should complete in the same request instead of
+# coming back as "processing". ---
+_batch_calls_seen = []
+_original_fake_create_batch = excel_multi_mod.create_message_batch
+
+
+async def _fake_create_message_batch_tracking(requests):
+    _batch_calls_seen.append(requests)
+    return await _original_fake_create_batch(requests)
+
+
+excel_multi_mod.create_message_batch = _fake_create_message_batch_tracking
+
+with open(sample_path, "rb") as f:
+    r = check("urgent multi-check bypasses the batch queue", client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={
+            "source_lang": "",
+            "manager_name": "Мария",
+            "manager_id": regular_id,
+            "extra_instructions": "",
+            "urgent": "true",
+        },
+    ))
+urgent_multi_data = r.json()
+assert urgent_multi_data["status"] == "completed", urgent_multi_data
+assert not _batch_calls_seen, "urgent=true must not go through the batch queue at all"
+excel_multi_mod.create_message_batch = _original_fake_create_batch
+
 # --- re-uploading the tone doc replaces it, doesn't accumulate ---
 twb3 = openpyxl.Workbook()
 tws3 = twb3.active

@@ -427,6 +427,12 @@ async def multi_check(
     # language column found in the file (a manager can check only a
     # subset of a large upload — see point 8 of the redesign).
     target_langs: str = Form(""),
+    # "Срочно" checkbox — forces the live/synchronous path even for a job
+    # that would otherwise go to Anthropic's cheaper batch queue, so the
+    # manager gets a result in the same request instead of waiting up to
+    # an hour. Costs 2x (the batch queue is exactly half price — see
+    # claude_client.BATCH_PRICE_DISCOUNT — so skipping it is full price).
+    urgent: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     _get_project(project_id, db)
@@ -450,10 +456,12 @@ async def multi_check(
 
     # Small/medium jobs run live, as before. Large ones go through
     # Anthropic's Message Batches API instead — cheaper per token, but the
-    # AI findings aren't ready immediately (see BATCH_THRESHOLD_CHARS).
+    # AI findings aren't ready immediately (see BATCH_THRESHOLD_CHARS) —
+    # unless the manager ticked "Срочно", which forces the live path (and
+    # its full, non-discounted price) regardless of size.
     volume = estimate_check_volume(sheets, resolved_source, target_filter)
 
-    if volume <= BATCH_THRESHOLD_CHARS:
+    if urgent or volume <= BATCH_THRESHOLD_CHARS:
         results = await run_multi_check(
             sheets, resolved_source, selected_checks, extra_instructions,
             tone_lookup, target_filter,
