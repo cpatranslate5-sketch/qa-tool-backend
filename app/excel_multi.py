@@ -29,6 +29,19 @@ from app.rule_checks import run_rule_checks
 LANG_CODE_RE = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,5})?$")
 AI_CONCURRENCY = 5
 
+# Industry-standard placeholder: a translator (or the client) can mark a
+# specific cell "DO NOT TRANSLATE" to mean this string is deliberately left
+# as-is for this language on purpose (a brand name, a code, a string that's
+# only needed in one of several languages) — not a missing or wrong
+# translation. Александр's files use this in exactly that way: some rows
+# need translating into every language, others explicitly don't for a given
+# one. Recognized case-insensitively, with or without surrounding brackets.
+_DO_NOT_TRANSLATE_RE = re.compile(r"^[\[\(]?\s*do\s+not\s+translate\s*[\]\)]?$", re.IGNORECASE)
+
+
+def _is_do_not_translate(text: str) -> bool:
+    return bool(_DO_NOT_TRANSLATE_RE.match((text or "").strip()))
+
 # Above this much combined text (characters, summed across every checkable
 # row × every target language — a rough proxy for total AI cost and how
 # long a synchronous run would take), a multi-check is submitted through
@@ -347,6 +360,8 @@ async def _check_language_for_sheet(
         tgt = row["values"].get(lang, "")
         if not src.strip() and not tgt.strip():
             continue
+        if _is_do_not_translate(tgt):
+            continue
         relevant_rows.append(row)
         ai_items.append({"context": row["context"], "source": src, "translation": tgt})
 
@@ -481,6 +496,8 @@ def estimate_check_volume(
                 tgt = row["values"].get(lang, "")
                 if not src.strip() and not tgt.strip():
                     continue
+                if _is_do_not_translate(tgt):
+                    continue
                 total += len(src) + len(tgt)
     return total
 
@@ -521,6 +538,8 @@ def build_batch_plan(
                 src = row["values"].get(source_lang, "")
                 tgt = row["values"].get(lang, "")
                 if not src.strip() and not tgt.strip():
+                    continue
+                if _is_do_not_translate(tgt):
                     continue
                 relevant_rows.append(row)
                 ai_items.append({"context": row["context"], "source": src, "translation": tgt})

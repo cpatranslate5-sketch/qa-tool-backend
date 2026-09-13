@@ -142,6 +142,20 @@ def _source_lang_note(source_lang: str) -> str:
     )
 
 
+
+# Some client files label a language column with a code that doesn't match
+# its real ISO-639 meaning. Most notably "my" — ISO-639-1 defines that as
+# Burmese (Myanmar), but Александр's exports use it for Malay (short for
+# "Malaysia"). Left to its own knowledge of the ISO standard, the model
+# assumes Burmese, expects Burmese script, and then reports the actual
+# (correct) Malay text as being in the wrong language. Overriding this one
+# code's meaning in the prompt fixes it regardless of which convention the
+# model would otherwise guess.
+LANG_CODE_MEANING_OVERRIDES = {
+    "my": "малайский (Malay, Малайзия) — а НЕ бирманский/мьянманский, хотя по стандарту ISO 639 код «my» формально означает бирманский",
+}
+
+
 def _target_lang_line(target_lang: str) -> str:
     """Explicitly names the target language rather than leaving the model
     to infer it purely from the translated text — closely related
@@ -150,6 +164,12 @@ def _target_lang_line(target_lang: str) -> str:
     code = target_lang.strip().lower()
     if not code:
         return ""
+    override = LANG_CODE_MEANING_OVERRIDES.get(code.split("-")[0])
+    if override:
+        return (
+            f"Целевой язык перевода обозначен кодом «{code}», но здесь этот код означает: {override}. "
+            "Ориентируйся именно на этот язык, а не на формальное значение кода по стандарту ISO."
+        )
     return f"Целевой язык перевода: {code}. Ориентируйся конкретно на этот язык — не путай с родственными языками."
 
 

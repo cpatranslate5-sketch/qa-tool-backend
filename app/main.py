@@ -632,3 +632,17 @@ def multi_check_report(project_id: int, multi_check_id: int, manager_id: int, db
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.delete("/projects/{project_id}/multi-check/{multi_check_id}")
+def delete_multi_check(project_id: int, multi_check_id: int, manager_id: int, db: Session = Depends(get_db)):
+    # Scoped exactly like every other multi-check lookup: a manager can only
+    # ever see/act on their OWN uploads (not every folder's) — same rule as
+    # multi_check_detail and multi_check_report above.
+    _get_project(project_id, db)
+    record = db.get(models.MultiCheck, multi_check_id)
+    if record is None or record.project_id != project_id or record.manager_id != manager_id:
+        raise HTTPException(404, "Проверка не найдена.")
+    db.delete(record)
+    db.commit()
+    return {"ok": True}

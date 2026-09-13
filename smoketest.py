@@ -274,6 +274,49 @@ check("admin can't download Мария's multi-check report", client.get(
     f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx", params={"manager_id": admin_id}
 ), expect=404)
 
+# --- a "DO NOT TRANSLATE" cell means this row is deliberately left
+# untranslated for this language on purpose — it must be skipped entirely
+# (no finding at all), not flagged as a numbers/content mismatch, even
+# though the literal text would otherwise clearly disagree with the
+# source. Александр's files legitimately need some rows translated for one
+# language but not another. ---
+dnt_wb = openpyxl.Workbook()
+dnt_ws = dnt_wb.active
+dnt_ws.append(["EN", "RU"])
+dnt_ws.append(["Price: 500 dollars.", "Цена: 400 долларов."])  # genuine mismatch — must still be caught
+dnt_ws.append(["Price: 500 dollars.", "DO NOT TRANSLATE"])
+dnt_ws.append(["Price: 500 dollars.", " [do NOT Translate] "])  # brackets + mixed case variant
+dnt_buf = io.BytesIO()
+dnt_wb.save(dnt_buf)
+dnt_buf.seek(0)
+r = check("multi-check with DO NOT TRANSLATE cells", client.post(
+    f"/projects/{project_id}/multi-check",
+    files={"file": ("dnt.xlsx", dnt_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "numbers"},
+))
+dnt_data = r.json()
+assert dnt_data["status"] == "completed", dnt_data
+dnt_ru_rows = dnt_data["sheets"][0]["languages"]["ru"]
+assert len(dnt_ru_rows) == 1, dnt_ru_rows  # only the genuine mismatch row, both DNT rows skipped entirely
+assert dnt_ru_rows[0]["translation"] == "Цена: 400 долларов.", dnt_ru_rows
+assert any(f["type"] == "numbers" for f in dnt_ru_rows[0]["findings"]), dnt_ru_rows
+print("   DO NOT TRANSLATE rows correctly skipped, genuine mismatch still caught:", dnt_ru_rows)
+
+# --- deleting a multi-check report/upload from history ---
+check("Мария can delete her own multi-check", client.delete(
+    f"/projects/{project_id}/multi-check/{multi_check_id}", params={"manager_id": regular_id}
+))
+r = check("deleted multi-check no longer in history", client.get(
+    f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
+))
+assert all(h["id"] != multi_check_id for h in r.json()), r.json()
+check("deleted multi-check detail is gone", client.get(
+    f"/projects/{project_id}/multi-check/{multi_check_id}", params={"manager_id": regular_id}
+), expect=404)
+check("admin can't delete Мария's multi-check (not theirs)", client.delete(
+    f"/projects/{project_id}/multi-check/{dnt_data['multi_check_id']}", params={"manager_id": admin_id}
+), expect=404)
+
 # --- large multi-check actually goes through the Message Batches path when
 # a batch can be submitted — simulate that here (no real Anthropic key in
 # this sandbox) by faking the three network calls, to prove the
@@ -600,6 +643,20 @@ for normal in ["ru", "es-mx", "en", "de-DE", "fr"]:
     assert _model_for_lang(normal) == settings.CLAUDE_MODEL, normal
 print("[OK] _model_for_lang: confirmed hard-language list (kk/ky/tg/uz/sw/te/mr/az) "
       "routes to CLAUDE_MODEL_HARD by base subtag, everything else to CLAUDE_MODEL")
+
+# --- "my" is ISO-639's code for Burmese, but Александр's files use it for
+# Malay — left unclarified, the model assumes Burmese and reports correct
+# Malay text as being in the wrong language. The prompt must explicitly
+# override this one code's meaning instead of just stating the raw code. ---
+from app.claude_client import _target_lang_line
+
+my_line = _target_lang_line("my")
+assert "малайск" in my_line.lower(), my_line
+assert "бирманск" in my_line.lower(), my_line  # explicitly rules out the ISO-standard meaning
+normal_line = _target_lang_line("ru")
+assert "малайск" not in normal_line.lower() and "бирманск" not in normal_line.lower(), normal_line
+print("[OK] _target_lang_line: the «my» code is explicitly clarified as Malay (not the ISO-standard "
+      "Burmese) so the model doesn't misjudge correct Malay text as the wrong language")
 
 # --- numbers check: a correctly localized decimal comma or zero-padded
 # hour must NOT be flagged as a mismatch — Александр hit this live: an
