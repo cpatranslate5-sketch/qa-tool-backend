@@ -546,6 +546,10 @@ async def multi_check(
         "multi_check_id": record.id,
         "status": "processing",
         "source_lang": resolved_source,
+        # None of the batch's requests have run yet — this is just handed
+        # straight to Anthropic, so we already know the total (no API call
+        # needed to say "0 of N so far").
+        "progress": {"done": 0, "total": len(requests)},
     }
 
 
@@ -579,8 +583,9 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
     if record is None or record.project_id != project_id or record.manager_id != manager_id:
         raise HTTPException(404, "Проверка не найдена.")
 
+    progress = None
     if record.status == "processing" and record.batch_id:
-        finalized = await try_finalize_batch(record.batch_id, record.results["skeleton"])
+        finalized, progress = await try_finalize_batch(record.batch_id, record.results["skeleton"])
         if finalized is not None:
             record.results = finalized
             record.summary = finalized["summary"]
@@ -595,6 +600,9 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
             "status": "processing",
             "filename": record.filename,
             "source_lang": record.source_lang,
+            # Real counts from Anthropic (how many of the batch's requests
+            # are done), not a guessed time estimate — see excel_multi._batch_progress.
+            "progress": progress,
         }
 
     return {

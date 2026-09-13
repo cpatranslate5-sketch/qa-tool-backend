@@ -321,6 +321,10 @@ with open(sample_path, "rb") as f:
 batch_multi_data = r.json()
 assert batch_multi_data["status"] == "processing", batch_multi_data
 batch_multi_check_id = batch_multi_data["multi_check_id"]
+# Submission response already knows the total request count for free (no
+# Anthropic call needed to say "0 of N so far").
+assert batch_multi_data["progress"]["done"] == 0, batch_multi_data
+assert batch_multi_data["progress"]["total"] > 0, batch_multi_data
 
 r = check("history shows the batch entry as processing", client.get(
     f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
@@ -362,6 +366,50 @@ assert r.json()[0]["status"] == "completed"
 check("report download works once completed", client.get(
     f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx", params={"manager_id": regular_id}
 ))
+
+# --- while a batch is still "in_progress" (not yet "ended"), the detail
+# endpoint surfaces Anthropic's own request_counts as {"done", "total"}
+# instead of finalizing — this is what lets the UI show a real progress
+# readout ("2 of 5 done") rather than a guessed time estimate, which
+# Anthropic's API doesn't provide at all. ---
+_progress_poll_count = {"n": 0}
+
+
+async def _fake_get_batch_status_progress(batch_id):
+    _progress_poll_count["n"] += 1
+    if _progress_poll_count["n"] == 1:
+        # still running: one request finished, none failed yet
+        return {"processing_status": "in_progress", "request_counts": {
+            "processing": 0, "succeeded": 1, "errored": 0, "canceled": 0, "expired": 0,
+        }}
+    return {"processing_status": "ended", "results_url": "fake://results"}
+
+
+excel_multi_mod.get_batch_status = _fake_get_batch_status_progress
+
+with open(sample_path, "rb") as f:
+    r = check("second large multi-check submits as a batch (for progress test)", client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": ""},
+    ))
+progress_multi_data = r.json()
+assert progress_multi_data["status"] == "processing", progress_multi_data
+progress_multi_check_id = progress_multi_data["multi_check_id"]
+
+r = check("polling while still in-progress reports live counts instead of finalizing", client.get(
+    f"/projects/{project_id}/multi-check/{progress_multi_check_id}", params={"manager_id": regular_id}
+))
+mid_poll = r.json()
+assert mid_poll["status"] == "processing", mid_poll
+assert mid_poll["progress"] == {"done": 1, "total": 1}, mid_poll
+
+r = check("next poll finalizes once Anthropic marks the batch ended", client.get(
+    f"/projects/{project_id}/multi-check/{progress_multi_check_id}", params={"manager_id": regular_id}
+))
+assert r.json()["status"] == "completed", r.json()
+
+excel_multi_mod.get_batch_status = _fake_get_batch_status
 
 # --- "Срочно" (urgent) flag forces the live/synchronous path even for a
 # file whose volume would otherwise route it to the batch queue. The batch

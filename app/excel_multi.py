@@ -668,16 +668,31 @@ async def submit_multi_check_batch(requests: list[dict]) -> str | None:
     return await create_message_batch(requests)
 
 
-async def try_finalize_batch(batch_id: str, skeleton: dict) -> dict | None:
-    """Returns the finalized results dict once the Anthropic batch has
-    ended, otherwise None (still processing — caller should try again
-    later)."""
+def _batch_progress(status: dict) -> dict:
+    """Turns Anthropic's own request_counts ({"processing": n, "succeeded":
+    n, "errored": n, "canceled": n, "expired": n}) into a simple {"done",
+    "total"} the UI can show as a real progress readout. Anthropic doesn't
+    publish an ETA for a batch job, so a made-up time estimate would just be
+    a guess — this is the one number we actually know is true."""
+    counts = status.get("request_counts") or {}
+    total = sum(counts.values())
+    done = total - counts.get("processing", 0)
+    return {"done": done, "total": total}
+
+
+async def try_finalize_batch(batch_id: str, skeleton: dict) -> tuple[dict | None, dict]:
+    """Returns (finalized_results, progress). finalized_results is the
+    completed results dict once the Anthropic batch has ended, otherwise
+    None (still processing — caller should try again later). progress is
+    always {"done": int, "total": int} from Anthropic's request_counts, so
+    the caller can surface real progress even while still waiting."""
     status = await get_batch_status(batch_id)
+    progress = _batch_progress(status)
     if status.get("processing_status") != "ended":
-        return None
+        return None, progress
     results_url = status.get("results_url")
     ai_results_by_custom_id = await get_batch_results(results_url) if results_url else {}
-    return finalize_batch_results(skeleton, ai_results_by_custom_id)
+    return finalize_batch_results(skeleton, ai_results_by_custom_id), progress
 
 
 def build_report_workbook(filename: str, source_lang: str, results: dict) -> bytes:
