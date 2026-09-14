@@ -557,7 +557,7 @@ async def multi_check(
     "/projects/{project_id}/multi-check",
     response_model=list[schemas.MultiCheckHistoryOut],
 )
-def multi_check_history(project_id: int, manager_id: int, db: Session = Depends(get_db)):
+async def multi_check_history(project_id: int, manager_id: int, db: Session = Depends(get_db)):
     """Scoped to the requesting folder only — same per-folder history
     scoping as single_check_history, above."""
     _get_project(project_id, db)
@@ -565,15 +565,32 @@ def multi_check_history(project_id: int, manager_id: int, db: Session = Depends(
         models.MultiCheck.project_id == project_id,
         models.MultiCheck.manager_id == manager_id,
     ).order_by(models.MultiCheck.created_at.desc()).limit(50).all()
-    return [
-        schemas.MultiCheckHistoryOut(
+
+    out = []
+    for r in records:
+        progress = None
+        if r.status == "processing" and r.batch_id:
+            # One Anthropic call per still-processing upload — in practice
+            # there's rarely more than one at a time — so the history list
+            # can show a real "готово X из Y" without the manager having to
+            # reopen that specific check's page to trigger a poll.
+            finalized, progress = await try_finalize_batch(r.batch_id, r.results["skeleton"])
+            if finalized is not None:
+                r.results = finalized
+                r.summary = finalized["summary"]
+                r.status = "completed"
+                r.cost_usd = finalized["summary"].get("cost_usd", 0.0)
+                db.commit()
+                db.refresh(r)
+                progress = None
+        out.append(schemas.MultiCheckHistoryOut(
             id=r.id, filename=r.filename, source_lang=r.source_lang,
             summary=r.summary, status=r.status, performed_by_name=r.performed_by_name,
             created_at=r.created_at.isoformat(),
             cost_usd=r.cost_usd,
-        )
-        for r in records
-    ]
+            progress=progress,
+        ))
+    return out
 
 
 @app.get("/projects/{project_id}/multi-check/{multi_check_id}")

@@ -141,6 +141,11 @@ class MultiCheckHistoryOut(BaseModel):
     status: str
     performed_by_name: str
     created_at: str
+    # Only set while status is "processing" — Anthropic's own count of how
+    # many of the batch's requests are done vs. the total (see
+    # excel_multi._batch_progress), so the history list can show a real
+    # percentage instead of just "ещё обрабатывается…".
+    progress: dict | None = None
 
     class Config:
         from_attributes = True

@@ -330,8 +330,19 @@ async def _fake_create_message_batch(requests):
     return "msgbatch_test123"
 
 
+_batch_status_call_count = {"n": 0}
+
+
 async def _fake_get_batch_status(batch_id):
     assert batch_id == "msgbatch_test123"
+    _batch_status_call_count["n"] += 1
+    if _batch_status_call_count["n"] == 1:
+        # First check (triggered by the history list's own opportunistic
+        # poll, below) — still running, so it stays "processing" with real
+        # counts instead of finalizing right there.
+        return {"processing_status": "in_progress", "request_counts": {
+            "processing": 5, "succeeded": 3, "errored": 0, "canceled": 0, "expired": 0,
+        }}
     return {"processing_status": "ended", "results_url": "fake://results"}
 
 
@@ -372,7 +383,12 @@ assert batch_multi_data["progress"]["total"] > 0, batch_multi_data
 r = check("history shows the batch entry as processing", client.get(
     f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
 ))
-assert r.json()[0]["status"] == "processing", r.json()[0]
+hist_entry = r.json()[0]
+assert hist_entry["status"] == "processing", hist_entry
+# The history list opportunistically polls Anthropic itself (one call per
+# still-processing upload) so a manager sees real progress — "готово X из
+# Y" — without having to open that specific check first.
+assert hist_entry["progress"] == {"done": 3, "total": 8}, hist_entry
 
 check("report download blocked while processing", client.get(
     f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx", params={"manager_id": regular_id}
