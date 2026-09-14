@@ -12,6 +12,7 @@ from app.excel_multi import (
     BATCH_THRESHOLD_CHARS,
     build_batch_plan,
     build_report_workbook,
+    cancel_multi_check_batch,
     estimate_check_volume,
     finalize_batch_results,
     merge_lang_codes,
@@ -673,7 +674,7 @@ def multi_check_report(project_id: int, multi_check_id: int, manager_id: int, db
 
 
 @app.delete("/projects/{project_id}/multi-check/{multi_check_id}")
-def delete_multi_check(project_id: int, multi_check_id: int, manager_id: int, db: Session = Depends(get_db)):
+async def delete_multi_check(project_id: int, multi_check_id: int, manager_id: int, db: Session = Depends(get_db)):
     # Scoped exactly like every other multi-check lookup: a manager can only
     # ever see/act on their OWN uploads (not every folder's) — same rule as
     # multi_check_detail and multi_check_report above.
@@ -681,6 +682,13 @@ def delete_multi_check(project_id: int, multi_check_id: int, manager_id: int, db
     record = db.get(models.MultiCheck, multi_check_id)
     if record is None or record.project_id != project_id or record.manager_id != manager_id:
         raise HTTPException(404, "Проверка не найдена.")
+    # Deleting a still-processing upload doubles as "cancel" — Александр
+    # asked for this (a check turning out slower than expected, or just
+    # changing his mind). Tell Anthropic to stop before dropping our own
+    # record, so a cancelled check doesn't keep quietly racking up cost in
+    # the background after the manager thinks it's gone.
+    if record.status == "processing" and record.batch_id:
+        await cancel_multi_check_batch(record.batch_id)
     db.delete(record)
     db.commit()
     return {"ok": True}

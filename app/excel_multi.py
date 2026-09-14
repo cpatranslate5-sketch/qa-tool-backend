@@ -17,6 +17,7 @@ from app.claude_client import (
     _truncation_warning,
     _usage_cost,
     build_batch_prompt,
+    cancel_message_batch,
     create_message_batch,
     get_batch_results,
     get_batch_status,
@@ -708,6 +709,19 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
 
 async def submit_multi_check_batch(requests: list[dict]) -> str | None:
     return await create_message_batch(requests)
+
+
+async def cancel_multi_check_batch(batch_id: str) -> None:
+    """Best-effort cancel for a manager who no longer wants to wait for (or
+    pay for) a still-processing upload — e.g. they want to switch to
+    "Срочно" instead, or simply changed their mind. Anthropic may reject
+    this (most likely because the batch had already ended right as the
+    manager clicked cancel) — that's fine, the caller is deleting its own
+    record either way, so a failure here should never block that."""
+    try:
+        await cancel_message_batch(batch_id)
+    except Exception:
+        pass
 
 
 def _batch_progress(status: dict) -> dict:

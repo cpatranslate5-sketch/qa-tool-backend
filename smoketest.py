@@ -489,6 +489,41 @@ assert r.json()["status"] == "completed", r.json()
 
 excel_multi_mod.get_batch_status = _fake_get_batch_status
 
+# --- cancelling a still-processing upload (Александр asked whether a check
+# can be stopped mid-way — e.g. it's taking longer than expected and he'd
+# rather re-upload with "Срочно", or he simply changed his mind). Deleting a
+# still-processing entry now doubles as "cancel": Anthropic is told to stop
+# working on it (so it isn't billed for whatever hadn't started yet) before
+# our own record is dropped. ---
+_cancel_calls_seen = []
+
+
+async def _fake_cancel_message_batch(batch_id):
+    _cancel_calls_seen.append(batch_id)
+    return {"processing_status": "canceling"}
+
+
+excel_multi_mod.cancel_message_batch = _fake_cancel_message_batch
+
+with open(sample_path, "rb") as f:
+    r = check("third large multi-check submits as a batch (for cancel test)", client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": ""},
+    ))
+cancel_multi_data = r.json()
+assert cancel_multi_data["status"] == "processing", cancel_multi_data
+cancel_multi_check_id = cancel_multi_data["multi_check_id"]
+
+check("cancelling (deleting) a still-processing upload tells Anthropic to stop", client.delete(
+    f"/projects/{project_id}/multi-check/{cancel_multi_check_id}", params={"manager_id": regular_id}
+))
+assert _cancel_calls_seen == ["msgbatch_test123"], _cancel_calls_seen
+r = check("cancelled upload no longer in history", client.get(
+    f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
+))
+assert all(h["id"] != cancel_multi_check_id for h in r.json()), r.json()
+
 # --- "Срочно" (urgent) flag forces the live/synchronous path even for a
 # file whose volume would otherwise route it to the batch queue. The batch
 # network calls are still monkeypatched from above, but the urgent path

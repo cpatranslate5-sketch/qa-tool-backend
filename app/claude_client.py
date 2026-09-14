@@ -562,6 +562,20 @@ async def get_batch_status(batch_id: str) -> dict:
         return resp.json()
 
 
+async def cancel_message_batch(batch_id: str) -> dict:
+    """Asks Anthropic to stop processing whatever's left of this batch — a
+    manager cancelling a still-processing check. Anthropic moves the batch
+    to processing_status "canceling" and then "ended" once every in-flight
+    request has settled; anything that hadn't started yet comes back with
+    result type "canceled" and isn't billed for. Raises on failure (e.g. the
+    batch already ended on Anthropic's side) — the caller decides whether
+    that should block anything on our end."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(f"{BATCHES_URL}/{batch_id}/cancel", headers=_headers())
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def get_batch_results(results_url: str) -> dict[str, dict]:
     """Fetches and parses the batch's .jsonl results. Returns
     {custom_id: {"text": str | None, "usage": dict, "stop_reason": str |
