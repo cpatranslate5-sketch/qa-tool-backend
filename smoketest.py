@@ -393,6 +393,10 @@ batch_multi_check_id = batch_multi_data["multi_check_id"]
 # Anthropic call needed to say "0 of N so far").
 assert batch_multi_data["progress"]["done"] == 0, batch_multi_data
 assert batch_multi_data["progress"]["total"] > 0, batch_multi_data
+# The UI falls back to showing elapsed waiting time whenever Anthropic's own
+# counts haven't moved yet (Александр found the percentage looked frozen at
+# 0% for a long stretch) — needs a real timestamp to compute that from.
+assert batch_multi_data["created_at"], batch_multi_data
 
 r = check("history shows the batch entry as processing", client.get(
     f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
@@ -476,6 +480,7 @@ r = check("polling while still in-progress reports live counts instead of finali
 mid_poll = r.json()
 assert mid_poll["status"] == "processing", mid_poll
 assert mid_poll["progress"] == {"done": 1, "total": 1}, mid_poll
+assert mid_poll["created_at"], mid_poll
 
 r = check("next poll finalizes once Anthropic marks the batch ended", client.get(
     f"/projects/{project_id}/multi-check/{progress_multi_check_id}", params={"manager_id": regular_id}

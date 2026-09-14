@@ -563,6 +563,11 @@ async def multi_check(
         # straight to Anthropic, so we already know the total (no API call
         # needed to say "0 of N so far").
         "progress": {"done": 0, "total": len(requests)},
+        # When the request counts stay flat for a while (Anthropic doesn't
+        # always update them until well into the batch), the UI falls back
+        # to showing how long the job has actually been waiting — a real,
+        # measured number, not a guessed ETA.
+        "created_at": record.created_at.isoformat(),
     }
 
 
@@ -633,6 +638,9 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
             # Real counts from Anthropic (how many of the batch's requests
             # are done), not a guessed time estimate — see excel_multi._batch_progress.
             "progress": progress,
+            # Lets the UI show elapsed waiting time as a fallback while the
+            # counts above are still flat — see the submission response.
+            "created_at": record.created_at.isoformat(),
         }
 
     return {
