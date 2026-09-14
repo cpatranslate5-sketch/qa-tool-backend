@@ -235,6 +235,11 @@ print("   summary:", multi_data["summary"])
 # configured there's nothing to submit, so it finalizes immediately with
 # just the rule-based findings, same as the old fully-synchronous behavior.
 assert multi_data["status"] == "completed", multi_data
+# --- a completed check reports when it started/finished, so the report
+# (and history list) can show how long it actually took ---
+assert multi_data["created_at"], multi_data
+assert multi_data["completed_at"], multi_data
+print("[OK] completed multi-check response includes created_at/completed_at")
 
 # --- detect-languages: the target-language checkbox list must come from
 # the UPLOADED FILE's own columns, not only from the project's Tone
@@ -272,9 +277,18 @@ r = check("multi-check history shows attribution", client.get(
 assert r.json()[0]["performed_by_name"] == "Мария"
 assert r.json()[0]["status"] == "completed"
 
-check("multi-check report download", client.get(
+report_resp = check("multi-check report download", client.get(
     f"/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx", params={"manager_id": regular_id}
 ))
+# --- the report's first row should say how long the check took, now that
+# Александр asked for the time spent to show up in the downloadable report
+# too (not just the history list) ---
+report_wb = openpyxl.load_workbook(io.BytesIO(report_resp.content))
+report_ws = report_wb.active
+report_first_cell = report_ws.cell(row=1, column=1).value
+assert "заняла" in report_first_cell, report_first_cell
+assert report_ws.cell(row=3, column=1).value == "Лист", "header row should follow the duration line + spacer"
+print("[OK] downloaded report's first row states check duration:", report_first_cell)
 
 # --- multi-check history/detail/report are also scoped per folder ---
 r = check("admin's multi-check history is empty (Мария's uploads aren't his)", client.get(
@@ -429,6 +443,13 @@ print("   ru findings after batch merge:", ru_findings)
 # non-zero cost, computed with the batch discount, and persisted on the
 # record (not just present in the one-off response).
 assert finalized["cost_usd"] > 0, finalized
+# A batch-processed check finalizes asynchronously (unlike the synchronous
+# path checked earlier), so completed_at has to be set separately, right
+# here at finalization time — confirm that actually happened, not just for
+# the synchronous path.
+assert finalized["created_at"], finalized
+assert finalized["completed_at"], finalized
+print("[OK] finalized batch check also gets created_at/completed_at (not just the synchronous path)")
 r2 = check("multi-check detail re-fetch still shows the persisted cost", client.get(
     f"/projects/{project_id}/multi-check/{batch_multi_check_id}", params={"manager_id": regular_id}
 ))
@@ -439,6 +460,7 @@ r = check("history now shows completed", client.get(
     f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
 ))
 assert r.json()[0]["status"] == "completed"
+assert r.json()[0]["completed_at"], r.json()[0]
 
 check("report download works once completed", client.get(
     f"/projects/{project_id}/multi-check/{batch_multi_check_id}/report.xlsx", params={"manager_id": regular_id}

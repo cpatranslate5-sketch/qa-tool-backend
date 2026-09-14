@@ -500,6 +500,14 @@ async def multi_check(
     urgent: bool = Form(False),
     db: Session = Depends(get_db),
 ):
+    # Captured up front (rather than relying on created_at's own
+    # default-at-insert-time, which for the live path below would land AFTER
+    # all the AI checking already ran) so a completed record's created_at
+    # genuinely marks when the request came in — needed to show a real,
+    # accurate "проверка заняла N минут" for a live/synchronous check, not
+    # just for a batch one. See the duration_minutes plumbing below.
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+
     _get_project(project_id, db)
     _get_manager(manager_id, db)
     file_bytes = await file.read()
@@ -531,6 +539,7 @@ async def multi_check(
             sheets, resolved_source, selected_checks, extra_instructions,
             tone_lookup, target_filter,
         )
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
             project_id=project_id,
             filename=file.filename or "upload.xlsx",
@@ -542,6 +551,8 @@ async def multi_check(
             performed_by_name=manager_name.strip(),
             manager_id=manager_id,
             cost_usd=results["summary"].get("cost_usd", 0.0),
+            created_at=started_at,
+            completed_at=finished_at,
         )
         db.add(record)
         db.commit()
@@ -553,6 +564,12 @@ async def multi_check(
             "summary": results["summary"],
             "sheets": results["sheets"],
             "cost_usd": record.cost_usd,
+            # Александр asked for the check's report to show how long it
+            # took — the frontend computes this from the two timestamps,
+            # same as it already does for the "processing" elapsed-time
+            # fallback (see created_at there).
+            "created_at": record.created_at.isoformat(),
+            "completed_at": record.completed_at.isoformat(),
         }
 
     requests, skeleton = build_batch_plan(
@@ -565,6 +582,7 @@ async def multi_check(
         # Nothing to submit (no AI check types selected, or no API key
         # configured) — the rule-based skeleton is already the final answer.
         results = finalize_batch_results(skeleton, {})
+        finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
             project_id=project_id,
             filename=file.filename or "upload.xlsx",
@@ -576,6 +594,8 @@ async def multi_check(
             performed_by_name=manager_name.strip(),
             manager_id=manager_id,
             cost_usd=results["summary"].get("cost_usd", 0.0),
+            created_at=started_at,
+            completed_at=finished_at,
         )
         db.add(record)
         db.commit()
@@ -587,6 +607,8 @@ async def multi_check(
             "summary": results["summary"],
             "sheets": results["sheets"],
             "cost_usd": record.cost_usd,
+            "created_at": record.created_at.isoformat(),
+            "completed_at": record.completed_at.isoformat(),
         }
 
     record = models.MultiCheck(
@@ -604,6 +626,7 @@ async def multi_check(
         # multi_check_detail, which fills this in once it finalizes.
         cost_usd=0.0,
         batch_volume_chars=volume,
+        created_at=started_at,
     )
     db.add(record)
     db.commit()
@@ -669,6 +692,7 @@ async def multi_check_history(project_id: int, manager_id: int, db: Session = De
             cost_usd=r.cost_usd,
             progress=progress,
             estimated_minutes=_estimate_batch_minutes(db, r.batch_volume_chars) if r.status == "processing" else None,
+            completed_at=r.completed_at.isoformat() if r.completed_at else None,
         ))
     return out
 
@@ -720,6 +744,13 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
         "summary": record.summary,
         "sheets": record.results.get("sheets", []),
         "cost_usd": record.cost_usd,
+        # Александр asked for the check's report to show how long it took —
+        # the frontend computes the duration from these two timestamps, the
+        # same way it already computes elapsed time for a still-processing
+        # check. completed_at is absent (None) only for a record that
+        # finished before this was tracked.
+        "created_at": record.created_at.isoformat(),
+        "completed_at": record.completed_at.isoformat() if record.completed_at else None,
     }
 
 
@@ -732,7 +763,13 @@ def multi_check_report(project_id: int, multi_check_id: int, manager_id: int, db
     if record.status != "completed":
         raise HTTPException(409, "Проверка ещё обрабатывается — отчёт будет доступен после завершения.")
 
-    report_bytes = build_report_workbook(record.filename, record.source_lang, record.results)
+    duration_minutes = None
+    if record.completed_at is not None and record.created_at is not None:
+        duration_minutes = (record.completed_at - record.created_at).total_seconds() / 60
+
+    report_bytes = build_report_workbook(
+        record.filename, record.source_lang, record.results, duration_minutes=duration_minutes
+    )
     filename = f"qa-report-{record.id}.xlsx"
     return StreamingResponse(
         iter([report_bytes]),

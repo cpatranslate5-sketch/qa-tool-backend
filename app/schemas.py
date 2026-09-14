@@ -151,6 +151,11 @@ class MultiCheckHistoryOut(BaseModel):
     # actually took (see app.main._estimate_batch_minutes). None until
     # there's history to learn from, or for a check that never queued.
     estimated_minutes: int | None = None
+    # Only set once status is "completed" — lets the history list show how
+    # long the check actually took (created_at to completed_at), without a
+    # second request. None for a still-processing check, or for an older
+    # record from before this field existed.
+    completed_at: str | None = None
 
     class Config:
         from_attributes = True

@@ -751,11 +751,43 @@ async def try_finalize_batch(batch_id: str, skeleton: dict) -> tuple[dict | None
     return finalize_batch_results(skeleton, ai_results_by_custom_id), progress
 
 
-def build_report_workbook(filename: str, source_lang: str, results: dict) -> bytes:
-    """Builds a downloadable .xlsx with one row per finding."""
+def _plural_ru(n: int, one: str, few: str, many: str) -> str:
+    """Standard Russian count-noun pluralization — mirrors the frontend's
+    pluralRu (lang.ts), kept as a separate copy since this side is Python."""
+    mod10, mod100 = n % 10, n % 100
+    if 11 <= mod100 <= 14:
+        return many
+    if mod10 == 1:
+        return one
+    if 2 <= mod10 <= 4:
+        return few
+    return many
+
+
+def _format_minutes_ru(minutes: float) -> str:
+    """Mirrors the frontend's formatElapsedMinutesRu (lang.ts) — used in the
+    downloadable report's summary line, below."""
+    whole = round(minutes)
+    if whole < 1:
+        return "меньше минуты"
+    return f"{whole} {_plural_ru(whole, 'минута', 'минуты', 'минут')}"
+
+
+def build_report_workbook(
+    filename: str, source_lang: str, results: dict, duration_minutes: float | None = None
+) -> bytes:
+    """Builds a downloadable .xlsx with one row per finding. duration_minutes
+    (how long the check itself took, end to end) is optional — omitted
+    entirely for an older record that predates this being tracked, rather
+    than showing a misleading "0 минут"."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "QA Findings"
+    if duration_minutes is not None:
+        ws.append([f"Проверка «{filename}» ({source_lang}) — заняла {_format_minutes_ru(duration_minutes)}"])
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=9)
+        ws.cell(row=1, column=1).font = openpyxl.styles.Font(bold=True)
+        ws.append([])  # spacer row before the header
     ws.append(["Лист", "Строка в файле", "Контекст", "Язык", "Серьёзность", "Тип", "Проблема", "Источник", "Перевод"])
     for col_idx, width in enumerate([18, 14, 28, 8, 12, 14, 50, 40, 40], start=1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
