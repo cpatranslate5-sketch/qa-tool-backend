@@ -63,7 +63,20 @@ BATCH_THRESHOLD_CHARS = 10_000
 META_COL_NAMES = {
     "context", "key", "id", "string id", "identifier", "comment",
     "status", "screenshot", "reference", "notes", "note",
+    "контекст", "ключ", "тз", "комментарий", "примечание", "статус",
 }
+
+# A "label: number" shape — "NOTIF title: 20", "Лимиты: PUSH banner: 25" —
+# is unambiguously a character-limit/spec column, never a language: a real
+# language code never contains a colon. Matched at the end of the header so
+# a "Лимиты: ..." prefix in front doesn't matter. Also treat any header that
+# starts with the Russian word for "limits" (a merged section header like a
+# bare "Лимиты" spanning several columns, with no colon of its own) the
+# same way. Client files pack in columns like this alongside the real
+# language columns — Александр flagged them as noise in the "not
+# recognized as languages" notice, since it's obvious on sight (and by
+# comparing with the source column) that they were never meant to be one.
+_LIMIT_SPEC_RE = re.compile(r":\s*\d+\s*$")
 
 
 def _is_context_col(header: str) -> bool:
@@ -77,6 +90,11 @@ def _is_max_length_col(header: str) -> bool:
 
 def _is_meta_col(header: str) -> bool:
     return header.strip().lower() in META_COL_NAMES
+
+
+def _is_limit_spec_col(header: str) -> bool:
+    h = header.strip()
+    return bool(_LIMIT_SPEC_RE.search(h)) or h.lower().startswith("лимит")
 
 
 _PAREN_LANG_RE = re.compile(r"^([a-zA-Zа-яА-Я]{2,3})\s*\(([a-zA-Zа-яА-Я0-9]{1,5})\)$")
@@ -268,6 +286,11 @@ def parse_workbook(file_bytes: bytes) -> list[dict]:
             elif _is_max_length_col(label):
                 max_length_col = c
             elif _is_meta_col(label):
+                continue
+            elif _is_limit_spec_col(label):
+                # Obviously a limit/spec column, not a near-miss language
+                # code — drop it silently instead of flagging it to the
+                # manager as "not recognized as a language".
                 continue
             else:
                 normalized = _normalize_lang_label(label)

@@ -960,4 +960,31 @@ assert check_cost_data["cost_usd"] > 0, check_cost_data
 print(f"   /check cost_usd: {check_cost_data['cost_usd']}")
 settings.ANTHROPIC_API_KEY = ""
 
+# --- parse_workbook: obviously-not-a-language columns (per-channel
+# character-limit spec columns, "ТЗ", etc.) are dropped silently instead of
+# being dumped into the noisy "not recognized as languages" notice —
+# Александр flagged a real file whose limit columns ("NOTIF title: 20",
+# "Лимиты: PUSH banner: 25", ...) were cluttering that message even though
+# it's obvious on sight they're not languages.
+from app.excel_multi import parse_workbook
+import openpyxl as _openpyxl
+
+wb_limits = _openpyxl.Workbook()
+ws_limits = wb_limits.active
+ws_limits.title = "Sheet1"
+ws_limits.append([
+    "Context", "ТЗ", "Лимиты: NOTIF title: 20", "NOTIF banner: 25",
+    "NOTIF text: 200", "Лимиты", "en", "ru",
+])
+ws_limits.append(["greeting", "some brief", "", "", "", "", "Hello", "Привет"])
+buf_limits = io.BytesIO()
+wb_limits.save(buf_limits)
+parsed_limits = parse_workbook(buf_limits.getvalue())
+assert len(parsed_limits) == 1, parsed_limits
+sheet_limits = parsed_limits[0]
+assert sheet_limits["unrecognized_columns"] == [], sheet_limits["unrecognized_columns"]
+assert set(sheet_limits["languages"]) == {"en", "ru"}, sheet_limits["languages"]
+print("[OK] parse_workbook: per-channel character-limit columns (\"label: number\"), a bare "
+      "«Лимиты» header, and «ТЗ» are dropped silently rather than flagged as unrecognized languages")
+
 print("\nALL SMOKETEST CHECKS PASSED")
