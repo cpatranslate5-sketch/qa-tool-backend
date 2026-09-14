@@ -377,6 +377,19 @@ def single_check_history(project_id: int, manager_id: int, db: Session = Depends
     ]
 
 
+@app.delete("/projects/{project_id}/history/{single_check_id}")
+def delete_single_check(project_id: int, single_check_id: int, manager_id: int, db: Session = Depends(get_db)):
+    # Same per-folder ownership scoping as every other history endpoint —
+    # a manager can only ever delete their OWN point checks.
+    _get_project(project_id, db)
+    record = db.get(models.SingleCheck, single_check_id)
+    if record is None or record.project_id != project_id or record.manager_id != manager_id:
+        raise HTTPException(404, "Проверка не найдена.")
+    db.delete(record)
+    db.commit()
+    return {"ok": True}
+
+
 # ---------------------------------------------------------- multi check ---
 
 DEFAULT_MULTI_CHECKS = [

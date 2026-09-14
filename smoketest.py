@@ -205,6 +205,20 @@ r = check("admin's own history shows only admin's check", client.get(f"/projects
 assert len(r.json()) == 1, r.json()
 assert r.json()[0]["performed_by_name"] == "Александр"
 
+# --- deleting a single (point) check from history ---
+single_check_to_delete = history[0]["id"]
+check("admin can't delete Мария's single check (not theirs)", client.delete(
+    f"/projects/{project_id}/history/{single_check_to_delete}", params={"manager_id": admin_id}
+), expect=404)
+check("Мария can delete her own single check", client.delete(
+    f"/projects/{project_id}/history/{single_check_to_delete}", params={"manager_id": regular_id}
+))
+r = check("deleted single check no longer in history", client.get(
+    f"/projects/{project_id}/history", params={"manager_id": regular_id}
+))
+assert len(r.json()) == 2, r.json()
+assert all(h["id"] != single_check_to_delete for h in r.json()), r.json()
+
 # --- non-admin CAN run a multi-check upload ---
 sample_path = "/root/.claude/uploads/aee9e6e5-e96f-5b4b-aa4e-8aad6284c8c9/147efc1b-Promo_Rules_Localization.xlsx"
 with open(sample_path, "rb") as f:
