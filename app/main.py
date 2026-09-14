@@ -1,3 +1,5 @@
+import datetime
+
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -242,6 +244,55 @@ def _require_doc(project_id: int, checks: list[str], db: Session) -> None:
                 400,
                 f"Для проверки «{doc_name}» нужно сначала загрузить документ «{doc_name}» для этого проекта.",
             )
+
+
+def _estimate_batch_minutes(db: Session, volume_chars: int) -> int | None:
+    """A rough ETA for a still-processing batch job, learned from how long
+    past batch jobs of a similar size actually took (Александр asked for
+    some kind of estimate, even approximate, instead of only elapsed time).
+    This is explicitly NOT a promise — Anthropic's queue is shared with
+    every other customer and its own speed varies run to run, sometimes a
+    lot, even for the exact same document — just a starting expectation so
+    "processing" isn't a total blank.
+
+    Pools total characters and total minutes across the last 20 finished
+    batch jobs (rather than averaging each job's own rate) so a handful of
+    small, fast jobs can't dominate the estimate the way a naive average of
+    ratios would. Returns None until there's at least one finished batch
+    job to learn from, or if volume_chars is 0."""
+    if volume_chars <= 0:
+        return None
+    rows = (
+        db.query(models.MultiCheck.batch_volume_chars, models.MultiCheck.created_at, models.MultiCheck.completed_at)
+        .filter(
+            models.MultiCheck.status == "completed",
+            models.MultiCheck.batch_id != "",
+            models.MultiCheck.completed_at.isnot(None),
+            models.MultiCheck.batch_volume_chars > 0,
+        )
+        .order_by(models.MultiCheck.completed_at.desc())
+        .limit(20)
+        .all()
+    )
+    total_chars = 0.0
+    total_minutes = 0.0
+    for chars, created, completed in rows:
+        minutes = (completed - created).total_seconds() / 60.0
+        # A job clocked at under a minute is more likely measurement noise
+        # (fixed overhead, a request that happened to be answered almost
+        # immediately) than a real per-character rate — counting it would
+        # let one lucky fast job massively overstate how fast Anthropic's
+        # queue actually runs.
+        if minutes < 1:
+            continue
+        total_chars += chars
+        total_minutes += minutes
+    if total_chars <= 0 or total_minutes <= 0:
+        return None
+    chars_per_minute = total_chars / total_minutes
+    if chars_per_minute <= 0:
+        return None
+    return max(1, round(volume_chars / chars_per_minute))
 
 
 @app.post("/projects/{project_id}/tone/upload", response_model=schemas.ToneStatusOut)
@@ -552,6 +603,7 @@ async def multi_check(
         # Real cost isn't known until the Anthropic batch ends — see
         # multi_check_detail, which fills this in once it finalizes.
         cost_usd=0.0,
+        batch_volume_chars=volume,
     )
     db.add(record)
     db.commit()
@@ -569,6 +621,10 @@ async def multi_check(
         # to showing how long the job has actually been waiting — a real,
         # measured number, not a guessed ETA.
         "created_at": record.created_at.isoformat(),
+        # A rough, non-binding ETA based on how long similarly-sized past
+        # batch jobs actually took — None until there's history to learn
+        # from. See _estimate_batch_minutes.
+        "estimated_minutes": _estimate_batch_minutes(db, volume),
     }
 
 
@@ -599,6 +655,10 @@ async def multi_check_history(project_id: int, manager_id: int, db: Session = De
                 r.summary = finalized["summary"]
                 r.status = "completed"
                 r.cost_usd = finalized["summary"].get("cost_usd", 0.0)
+                # Records how long this batch job actually took (together
+                # with created_at and batch_volume_chars) — future estimates
+                # learn from this. See _estimate_batch_minutes.
+                r.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 db.commit()
                 db.refresh(r)
                 progress = None
@@ -608,6 +668,7 @@ async def multi_check_history(project_id: int, manager_id: int, db: Session = De
             created_at=r.created_at.isoformat(),
             cost_usd=r.cost_usd,
             progress=progress,
+            estimated_minutes=_estimate_batch_minutes(db, r.batch_volume_chars) if r.status == "processing" else None,
         ))
     return out
 
@@ -627,6 +688,9 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
             record.summary = finalized["summary"]
             record.status = "completed"
             record.cost_usd = finalized["summary"].get("cost_usd", 0.0)
+            # See multi_check_history's matching line — records how long
+            # this batch job actually took, for future estimates.
+            record.completed_at = datetime.datetime.now(datetime.timezone.utc)
             db.commit()
             db.refresh(record)
 
@@ -642,6 +706,10 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
             # Lets the UI show elapsed waiting time as a fallback while the
             # counts above are still flat — see the submission response.
             "created_at": record.created_at.isoformat(),
+            # Same rough, non-binding ETA as the submission response — kept
+            # live here too so it reflects the freshest historical data on
+            # every poll, not just what was known at submission time.
+            "estimated_minutes": _estimate_batch_minutes(db, record.batch_volume_chars),
         }
 
     return {

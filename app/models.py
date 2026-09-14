@@ -150,5 +150,17 @@ class MultiCheck(Base):
     # once the Message Batches job finalizes (for a "processing" one).
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # How many characters this upload's batch run covers (see
+    # excel_multi.estimate_check_volume) — only set for a batch-path
+    # submission (0 for a synchronous one, which never queued at all and so
+    # has no bearing on how long the queue takes). Kept so a future batch
+    # job's expected wait can be estimated from how long past jobs of a
+    # similar size actually took — see app.main._estimate_batch_minutes.
+    batch_volume_chars: Mapped[int] = mapped_column(Integer, default=0)
+    # When this record's batch actually finished (flipped to "completed") —
+    # together with created_at and batch_volume_chars, this is the
+    # historical data _estimate_batch_minutes learns from. NULL for a
+    # synchronous check or one still processing.
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="multi_checks")

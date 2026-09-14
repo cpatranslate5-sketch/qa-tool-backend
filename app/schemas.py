@@ -146,6 +146,11 @@ class MultiCheckHistoryOut(BaseModel):
     # excel_multi._batch_progress), so the history list can show a real
     # percentage instead of just "ещё обрабатывается…".
     progress: dict | None = None
+    # Only meaningful while status is "processing" — a rough, non-binding
+    # ETA in minutes, learned from how long similarly-sized past batch jobs
+    # actually took (see app.main._estimate_batch_minutes). None until
+    # there's history to learn from, or for a check that never queued.
+    estimated_minutes: int | None = None
 
     class Config:
         from_attributes = True

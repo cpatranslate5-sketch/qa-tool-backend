@@ -204,6 +204,25 @@ def _run_migrations():
             if "glossary_uploaded_at" in cols:
                 conn.execute(text("ALTER TABLE projects DROP COLUMN glossary_uploaded_at"))
 
+    # Rough ETA for a still-processing batch job, learned from how long past
+    # jobs of a similar size actually took (Александр asked for some kind of
+    # estimate, even an approximate one, instead of only elapsed time — see
+    # app.main._estimate_batch_minutes). batch_volume_chars records each
+    # batch job's own size; completed_at records when it actually finished,
+    # so the two together become the historical data future estimates learn
+    # from. Existing rows get 0/NULL, i.e. "no size on record, don't count
+    # this one" — harmless, since a synchronous (non-batch) check was never
+    # going to be useful queue-duration data anyway.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "multi_checks" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("multi_checks")}
+        with engine.begin() as conn:
+            if "batch_volume_chars" not in cols:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN batch_volume_chars INTEGER NOT NULL DEFAULT 0"))
+            if "completed_at" not in cols:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN completed_at TIMESTAMPTZ"))
+
 
 def _ensure_admin_exists():
     from app import models

@@ -524,6 +524,59 @@ r = check("cancelled upload no longer in history", client.get(
 ))
 assert all(h["id"] != cancel_multi_check_id for h in r.json()), r.json()
 
+# --- rough ETA for a still-processing batch job, learned from how long
+# past jobs of a similar size actually took (Александр asked for some kind
+# of estimate instead of only elapsed time). A real test run finishes in
+# milliseconds, far too fast to naturally produce any meaningful "minutes
+# elapsed" — so two fake historical completed batch jobs are inserted
+# directly via the DB with known size and duration, and the estimate for a
+# new job is checked against the rate they imply. ---
+from app.main import _estimate_batch_minutes
+from app import models
+import datetime as _dt
+
+_hist_db = dbmod.SessionLocal()
+try:
+    _now_utc = _dt.datetime.now(_dt.timezone.utc)
+    _hist_db.add(models.MultiCheck(
+        project_id=project_id, filename="hist1.xlsx", source_lang="en",
+        status="completed", batch_id="msgbatch_hist1", manager_id=regular_id,
+        batch_volume_chars=10_000,
+        created_at=_now_utc - _dt.timedelta(minutes=10), completed_at=_now_utc,
+    ))
+    _hist_db.add(models.MultiCheck(
+        project_id=project_id, filename="hist2.xlsx", source_lang="en",
+        status="completed", batch_id="msgbatch_hist2", manager_id=regular_id,
+        batch_volume_chars=20_000,
+        created_at=_now_utc - _dt.timedelta(minutes=20), completed_at=_now_utc,
+    ))
+    _hist_db.commit()
+    # Pooled rate: (10,000 + 20,000) chars over (10 + 20) minutes = 1,000
+    # chars/minute — NOT the average of the two jobs' own ratios (which
+    # would also happen to be 1,000/min here; the point of pooling is that a
+    # small, fast outlier can't dominate the average the way it would if
+    # every job's ratio counted equally regardless of size).
+    assert _estimate_batch_minutes(_hist_db, 5_000) == 5, _estimate_batch_minutes(_hist_db, 5_000)
+    assert _estimate_batch_minutes(_hist_db, 0) is None
+finally:
+    _hist_db.close()
+print("[OK] _estimate_batch_minutes: pools characters/minutes across recent finished batch jobs into "
+      "one rate to estimate a new job's duration, rather than averaging each job's own ratio")
+
+with open(sample_path, "rb") as f:
+    r = check("multi-check submission now includes a rough ETA once there's history to learn from", client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": ""},
+    ))
+eta_multi_data = r.json()
+assert eta_multi_data["status"] == "processing", eta_multi_data
+assert eta_multi_data["estimated_minutes"] is not None and eta_multi_data["estimated_minutes"] > 0, eta_multi_data
+print("   estimated_minutes:", eta_multi_data["estimated_minutes"])
+check("cancel that ETA-test upload so it doesn't linger in history for later tests", client.delete(
+    f"/projects/{project_id}/multi-check/{eta_multi_data['multi_check_id']}", params={"manager_id": regular_id}
+))
+
 # --- "Срочно" (urgent) flag forces the live/synchronous path even for a
 # file whose volume would otherwise route it to the batch queue. The batch
 # network calls are still monkeypatched from above, but the urgent path
