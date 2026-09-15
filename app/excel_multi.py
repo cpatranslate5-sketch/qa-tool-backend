@@ -555,7 +555,7 @@ def build_batch_plan(
             target_langs = [l for l in target_langs if l in target_langs_filter]
         languages_skeleton = {}
 
-        for lang in target_langs:
+        for lang_idx, lang in enumerate(target_langs):
             relevant_rows = []
             ai_items = []
             for row in sheet["rows"]:
@@ -583,7 +583,17 @@ def build_batch_plan(
                     "findings": findings,
                 })
 
-            custom_id = f"s{s_idx}-{lang}"
+            # Built from the sheet/position index only, never from `lang`
+            # itself — Anthropic's Batches API requires custom_id to match
+            # ^[a-zA-Z0-9_-]{1,64}$, but a language code comes straight from
+            # a column header in whatever file gets uploaded and can't be
+            # trusted to satisfy that (e.g. a Cyrillic character that looks
+            # identical to a Latin one, from a copy-pasted "fr-CI" header,
+            # is enough to make Anthropic reject the WHOLE batch — every
+            # language in it, not just the bad one — with a 400). Rebuilt
+            # this way, custom_id is always safe regardless of what's in
+            # the file.
+            custom_id = f"s{s_idx}-t{lang_idx}"
             model = _model_for_lang(lang)
             prompt, number_to_index = build_batch_prompt(
                 ai_items, checks, extra_instructions,
@@ -789,6 +799,12 @@ def build_report_workbook(
         ws.cell(row=1, column=1).font = openpyxl.styles.Font(bold=True)
         ws.append([])  # spacer row before the header
     ws.append(["Лист", "Строка в файле", "Контекст", "Язык", "Серьёзность", "Тип", "Проблема", "Источник", "Перевод"])
+    # Captured AFTER the append above (not computed from the pre-append
+    # max_row) — an appended blank spacer row still advances openpyxl's
+    # internal row cursor even though it holds no cells, so computing this
+    # beforehand pointed one row too early and left the header itself out
+    # of the filter/freeze range below.
+    header_row = ws.max_row
     for col_idx, width in enumerate([18, 14, 28, 8, 12, 14, 50, 40, 40], start=1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
@@ -807,6 +823,15 @@ def build_report_workbook(
                         item["source"],
                         item["translation"],
                     ])
+
+    # Turns on Excel's own column filter dropdowns on the header row — lets
+    # Александр filter to just one "Язык" (or any other column) using the
+    # filter control Excel already gives him, defaulting to showing
+    # everything exactly as it does today. Only makes sense once there's at
+    # least one data row below the header.
+    if ws.max_row > header_row:
+        ws.auto_filter.ref = f"A{header_row}:I{ws.max_row}"
+        ws.freeze_panes = f"A{header_row + 1}"
 
     buf = io.BytesIO()
     wb.save(buf)

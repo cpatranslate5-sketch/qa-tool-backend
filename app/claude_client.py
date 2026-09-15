@@ -596,7 +596,15 @@ async def get_batch_results(results_url: str) -> dict[str, dict]:
         line = line.strip()
         if not line:
             continue
-        entry = json.loads(line)
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            # One garbled line (a cut-off download, a proxy hiccup) shouldn't
+            # take down the whole batch's results — skip just that line and
+            # keep parsing the rest; the missing custom_id(s) end up absent
+            # from `out`, which finalize_batch_results already treats as
+            # "no result for this language" rather than crashing on it.
+            continue
         custom_id = entry.get("custom_id")
         if custom_id is None:
             continue

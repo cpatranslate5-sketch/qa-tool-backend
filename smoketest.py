@@ -330,6 +330,53 @@ assert dnt_ru_rows[0]["translation"] == "Цена: 400 долларов.", dnt_r
 assert any(f["type"] == "numbers" for f in dnt_ru_rows[0]["findings"]), dnt_ru_rows
 print("   DO NOT TRANSLATE rows correctly skipped, genuine mismatch still caught:", dnt_ru_rows)
 
+# --- Александр asked "стоимость 0$ с найденными проблемами — это
+# нормально?" — yes, when only the free algorithmic checks are selected
+# (no AI call ever happens, so nothing to bill), and checks_run in the
+# response is exactly what lets the UI show which criteria actually ran
+# instead of leaving him guessing. Covers both at once: run with only the
+# free "punctuation" check (which is one of the CHECK_OPTIONS-labeled keys,
+# unlike the plain "numbers"/"max_length" the frontend silently folds in),
+# confirm cost stays 0 and checks_run reflects exactly that selection. ---
+only_algo_wb = openpyxl.Workbook()
+only_algo_ws = only_algo_wb.active
+only_algo_ws.append(["EN", "RU"])
+only_algo_ws.append(["Hello world.", "Привет мир"])  # source ends with "." but translation has no terminal punctuation at all -> reliably flagged
+only_algo_buf = io.BytesIO()
+only_algo_wb.save(only_algo_buf)
+only_algo_buf.seek(0)
+r = check("multi-check with only a free algorithmic criterion selected", client.post(
+    f"/projects/{project_id}/multi-check",
+    files={"file": ("only-algo.xlsx", only_algo_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "punctuation"},
+))
+only_algo_data = r.json()
+assert only_algo_data["status"] == "completed", only_algo_data
+assert only_algo_data["cost_usd"] == 0, only_algo_data  # no AI check type was even selected
+assert only_algo_data["checks_run"] == ["punctuation"], only_algo_data
+print("[OK] $0 cost with real findings is expected when only free/algorithmic criteria are selected; checks_run confirms which criteria ran")
+
+# --- the downloadable report should let Александр filter by language using
+# Excel's own column-filter control ("фильтр по языкам") ---
+only_algo_report = check("report for the only-algo check downloads fine", client.get(
+    f"/projects/{project_id}/multi-check/{only_algo_data['multi_check_id']}/report.xlsx", params={"manager_id": regular_id}
+))
+only_algo_wb_read = openpyxl.load_workbook(io.BytesIO(only_algo_report.content))
+only_algo_ws_read = only_algo_wb_read.active
+# The filter range must start exactly ON the header row ("Лист", "Строка в
+# файле", ...), not one row early on the blank spacer above it — an
+# earlier version of this got that boundary wrong and silently excluded
+# the header (and included the empty spacer instead) from the filterable
+# range.
+header_row_idx = next(
+    r for r in range(1, only_algo_ws_read.max_row + 1)
+    if only_algo_ws_read.cell(row=r, column=1).value == "Лист"
+)
+assert only_algo_ws_read.auto_filter.ref == f"A{header_row_idx}:I{only_algo_ws_read.max_row}", (
+    only_algo_ws_read.auto_filter.ref, header_row_idx, only_algo_ws_read.max_row
+)
+print("[OK] downloaded report's Excel column filter starts exactly on the header row:", only_algo_ws_read.auto_filter.ref)
+
 # --- deleting a multi-check report/upload from history ---
 check("Мария can delete her own multi-check", client.delete(
     f"/projects/{project_id}/multi-check/{multi_check_id}", params={"manager_id": regular_id}
@@ -352,9 +399,20 @@ check("admin can't delete Мария's multi-check (not theirs)", client.delete(
 # actually produces a correct, complete result. ---
 import app.excel_multi as excel_multi_mod
 
+# custom_id is deliberately opaque (see build_batch_plan — it's built from
+# the sheet/position index only, never from the language code itself, so a
+# weird character in a file's own language column can never produce an
+# invalid custom_id and get the whole batch rejected by Anthropic). This
+# fake captures whatever custom_ids were actually submitted rather than
+# hardcoding the old "s{sheet}-{lang}" shape, so the test doesn't silently
+# stop verifying anything if that internal scheme ever changes again.
+_submitted_custom_ids: list[str] = []
+
 
 async def _fake_create_message_batch(requests):
     assert requests, "expected at least one per-language batch request to be built"
+    _submitted_custom_ids.clear()
+    _submitted_custom_ids.extend(r["custom_id"] for r in requests)
     return "msgbatch_test123"
 
 
@@ -376,17 +434,21 @@ async def _fake_get_batch_status(batch_id):
 
 async def _fake_get_batch_results(results_url):
     assert results_url == "fake://results"
-    # One fake AI finding for the "ru" target language of the (only) sheet —
-    # custom_id format is "s{sheet_index}-{lang}" (see build_batch_plan).
-    # Shape matches the real get_batch_results: {custom_id: {"text": ...,
-    # "usage": ..., "stop_reason": ..., "result_type": ...}}.
+    # Same fake AI finding for every custom_id that was actually submitted —
+    # shape matches the real get_batch_results: {custom_id: {"text": ...,
+    # "usage": ..., "stop_reason": ..., "result_type": ...}}. Every
+    # language's rows are identical in this sample file's languages, so
+    # this reliably shows up under "ru" (and every other language) without
+    # the test needing to know its exact custom_id.
+    assert _submitted_custom_ids, "expected _fake_create_message_batch to have run first"
     return {
-        "s0-ru": {
+        cid: {
             "text": '[{"row": 1, "type": "typo", "severity": "medium", "message": "тестовая ИИ-находка"}]',
             "usage": {"input_tokens": 1000, "output_tokens": 200},
             "stop_reason": "end_turn",
             "result_type": "succeeded",
         }
+        for cid in _submitted_custom_ids
     }
 
 
@@ -631,6 +693,188 @@ urgent_multi_data = r.json()
 assert urgent_multi_data["status"] == "completed", urgent_multi_data
 assert not _batch_calls_seen, "urgent=true must not go through the batch queue at all"
 excel_multi_mod.create_message_batch = _original_fake_create_batch
+
+# --- Александр hit a real production bug: a file with a language column
+# header like "fr-CI" but typed with a Cyrillic «с» (U+0441) instead of the
+# visually-identical Latin "c" — looks completely normal to a human, but
+# Anthropic's Batches API requires custom_id to match ^[a-zA-Z0-9_-]{1,64}$,
+# and the old code built custom_id straight from the language string
+# ("s{sheet}-{lang}"), so this one bad column got the ENTIRE batch (every
+# language in it) rejected by Anthropic with a 400 — which, because it was
+# an unhandled exception, came back to the browser as a raw 500 with no
+# CORS headers, which Chrome then reported as "blocked by CORS policy",
+# completely hiding the real cause. Fixed by building custom_id from the
+# sheet/position index only (see build_batch_plan) — never from the
+# language string. This proves that holds for ANY weird character, not
+# just this one. ---
+import re as _re
+from app.excel_multi import build_batch_plan as _build_batch_plan_direct
+from app.excel_multi import parse_workbook as _parse_workbook_direct
+
+_weird_lang_wb = openpyxl.Workbook()
+_weird_lang_ws = _weird_lang_wb.active
+_weird_lang_ws.append(["EN", "RU", "fr-сi", "Ünïçø∂€ 漢字"])  # 3rd header: Cyrillic с, not Latin c
+_weird_lang_ws.append(["Hello.", "Привет.", "Bonjour.", "Bonjour."])
+_weird_lang_buf = io.BytesIO()
+_weird_lang_wb.save(_weird_lang_buf)
+_weird_lang_buf.seek(0)
+_weird_sheets = _parse_workbook_direct(_weird_lang_buf.read())
+_weird_requests, _weird_skeleton = _build_batch_plan_direct(_weird_sheets, "en", ["typo"], "", {}, None)
+_custom_id_pattern = _re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_bad_ids = [r["custom_id"] for r in _weird_requests if not _custom_id_pattern.match(r["custom_id"])]
+assert not _bad_ids, f"custom_id must always be Anthropic-safe, regardless of the file's own language codes: {_bad_ids}"
+assert len(_weird_requests) >= 2, "expected a request for each non-source language, weird characters included"
+print(f"[OK] build_batch_plan: custom_id stays ASCII-safe even for language codes with lookalike/unicode characters (e.g. Cyrillic «с» instead of Latin \"c\"): {[r['custom_id'] for r in _weird_requests]}")
+
+# --- and the defensive side of the same fix: an app-wide handler for
+# httpx.HTTPError (registered in main.py, not the bare Exception class —
+# see its comment for why that distinction is what actually makes CORS
+# headers survive) means ANY Anthropic/network failure, anywhere AI checks
+# are called, surfaces as a clean, readable error — never a raw crash that
+# strips CORS headers and shows up in the browser as a confusing "blocked
+# by CORS policy" message with no indication anything is actually wrong
+# server-side. Covers all three places that call out to Anthropic:
+# batch submission (the exact path Александр's real report hit), the
+# live/synchronous multi-check path, and the standalone single-check
+# endpoint. ---
+import httpx as _httpx_for_fault_injection
+
+
+async def _fake_create_message_batch_failing(requests):
+    raise _httpx_for_fault_injection.ConnectError("simulated Anthropic outage")
+
+
+_previous_create_batch = excel_multi_mod.create_message_batch
+excel_multi_mod.create_message_batch = _fake_create_message_batch_failing
+with open(sample_path, "rb") as f:
+    r = check("a failed batch submission surfaces as a clean error, not a raw crash", client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "typo"},
+    ), expect=502)
+assert "Не удалось связаться" in r.json()["detail"], r.json()
+excel_multi_mod.create_message_batch = _previous_create_batch
+
+# same fault, but on the live/synchronous path (small file, stays under
+# BATCH_THRESHOLD_CHARS) — a different code path (run_ai_checks_batch ->
+# _call_claude) than the batch-submission one above, so it needs its own
+# coverage to actually prove the app-wide handler, not just this one
+# call site.
+import app.claude_client as claude_client_mod
+
+_previous_call_claude = claude_client_mod._call_claude
+
+
+async def _fake_call_claude_failing(prompt, model=None):
+    raise _httpx_for_fault_injection.ConnectError("simulated Anthropic outage")
+
+
+claude_client_mod._call_claude = _fake_call_claude_failing
+small_wb = openpyxl.Workbook()
+small_ws = small_wb.active
+small_ws.append(["EN", "RU"])
+small_ws.append(["Hello.", "Привет."])
+small_buf = io.BytesIO()
+small_wb.save(small_buf)
+small_buf.seek(0)
+r = check("an Anthropic failure on the LIVE multi-check path also surfaces cleanly", client.post(
+    f"/projects/{project_id}/multi-check",
+    files={"file": ("small.xlsx", small_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "typo"},
+), expect=502)
+assert "Не удалось связаться" in r.json()["detail"], r.json()
+
+# and on the standalone single-check endpoint
+r = check("an Anthropic failure on the standalone /check endpoint also surfaces cleanly", client.post(
+    "/check", json={"source": "Hello.", "translation": "Привет.", "checks": ["typo"]},
+), expect=502)
+assert "Не удалось связаться" in r.json()["detail"], r.json()
+claude_client_mod._call_claude = _previous_call_claude
+
+# --- and the flip side, deliberately: a genuinely unrelated bug (not an
+# Anthropic/network failure) must NOT be silently swallowed by the same
+# handler — it should still surface as the framework's normal bare 500, so
+# a real bug still gets noticed and fixed rather than hidden behind a
+# friendly "temporary outage" message forever. Locks in that the handler
+# above is registered for httpx.HTTPError specifically, not bare
+# Exception. ---
+async def _fake_call_claude_unrelated_bug(prompt, model=None):
+    raise RuntimeError("some unrelated real bug, not an Anthropic/network failure")
+
+
+claude_client_mod._call_claude = _fake_call_claude_unrelated_bug
+# TestClient's default client re-raises unhandled server exceptions into the
+# test process instead of returning them as a response (so a real crash is
+# loud in normal testing) — exactly the opposite of what we want to check
+# here, so this one call uses its own client with that behaviour turned off.
+_no_raise_client = TestClient(app, raise_server_exceptions=False)
+r_bug = check(
+    "an unrelated bug (not httpx.HTTPError) is NOT masked as a friendly outage message",
+    _no_raise_client.post("/check", json={"source": "Hello.", "translation": "Привет.", "checks": ["typo"]}),
+    expect=500,
+)
+assert "Не удалось связаться" not in r_bug.text, r_bug.text
+claude_client_mod._call_claude = _previous_call_claude
+
+# --- get_batch_results must not let one garbled .jsonl line (a cut-off
+# download, a proxy hiccup) take down parsing of the rest of the batch's
+# results — it should skip just that line and keep going. ---
+class _FakeBatchResultsResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeBatchResultsClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, headers=None):
+        good_line = (
+            '{"custom_id": "s0-t0", "result": {"type": "succeeded", '
+            '"message": {"content": [{"type": "text", "text": "[]"}], '
+            '"usage": {}, "stop_reason": "end_turn"}}}'
+        )
+        return _FakeBatchResultsResponse("\n".join([good_line, "{not valid json", good_line.replace("t0", "t1")]))
+
+
+_previous_async_client = claude_client_mod.httpx.AsyncClient
+claude_client_mod.httpx.AsyncClient = _FakeBatchResultsClient
+_results = asyncio.get_event_loop().run_until_complete(claude_client_mod.get_batch_results("fake://results"))
+claude_client_mod.httpx.AsyncClient = _previous_async_client
+assert set(_results.keys()) == {"s0-t0", "s0-t1"}, _results
+print("[OK] get_batch_results skips a malformed .jsonl line instead of crashing the whole batch")
+
+# --- a bad/expired API key (401/403 from Anthropic) is a config problem on
+# our side, not a transient outage — the handler should say so distinctly
+# rather than telling the user to just try again in a minute. ---
+class _FakeAuthErrorResponse:
+    status_code = 401
+
+
+async def _fake_call_claude_auth_error(prompt, model=None):
+    raise _httpx_for_fault_injection.HTTPStatusError(
+        "401 Unauthorized", request=None, response=_FakeAuthErrorResponse()
+    )
+
+
+claude_client_mod._call_claude = _fake_call_claude_auth_error
+r_auth = check(
+    "a 401 from Anthropic (bad/expired API key) gets a distinct 'not a transient outage' message",
+    client.post("/check", json={"source": "Hello.", "translation": "Привет.", "checks": ["typo"]}),
+    expect=502,
+)
+assert "ошибк" in r_auth.json()["detail"].lower() and "автор" in r_auth.json()["detail"].lower(), r_auth.json()
+assert "временный сбой" not in r_auth.json()["detail"], r_auth.json()
+claude_client_mod._call_claude = _previous_call_claude
 
 # --- re-uploading the tone doc replaces it, doesn't accumulate ---
 twb3 = openpyxl.Workbook()

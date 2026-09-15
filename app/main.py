@@ -1,8 +1,10 @@
 import datetime
+import logging
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app import models, schemas
@@ -28,6 +30,8 @@ from app.excel_multi import (
 from app.project_docs import parse_tone_workbook
 from app.rule_checks import run_rule_checks
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Translation QA Tool", version="0.4.0")
 
 app.add_middleware(
@@ -37,6 +41,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Every AI-backed check (single, multi live, multi batch submit, batch
+# status/results polling) calls out to Anthropic via httpx and can fail for
+# reasons outside our control — a transient outage, a rate limit, a bad
+# response. Without this handler, such a failure is an UNHANDLED exception,
+# and Starlette's default handling for those returns a bare 500 built by
+# the outermost ServerErrorMiddleware — which sits OUTSIDE CORSMiddleware,
+# so the response never gets an Access-Control-Allow-Origin header. The
+# browser then reports this as "blocked by CORS policy", hiding the real
+# cause entirely (confirmed by direct testing: this exact confusing error
+# is what a manager saw after uploading a file whose language column had a
+# Cyrillic character Anthropic's API rejected — a batch-submission crash,
+# not an actual CORS misconfiguration).
+#
+# The fix is this handler, registered for httpx.HTTPError specifically
+# (the base class of both bad-status responses and connection/timeout
+# failures) rather than the bare Exception class: FastAPI/Starlette special-
+# cases a handler registered for Exception (or code 500) by routing it to
+# that same outer ServerErrorMiddleware, so it would ALSO lose the CORS
+# header — verified experimentally. A handler for a specific exception type
+# like this one is instead run by ExceptionMiddleware, which sits INSIDE
+# CORSMiddleware, so its response correctly gets the header. Genuinely
+# unexpected bugs (not an Anthropic/network failure) still crash with the
+# framework's normal bare 500 — deliberately not swallowed here, since
+# those need fixing, not a friendly message papering over them.
+@app.exception_handler(httpx.HTTPError)
+async def anthropic_call_failed(request: Request, exc: httpx.HTTPError):
+    logger.error("Anthropic API call failed on %s %s: %r", request.method, request.url.path, exc)
+    # A bad/expired ANTHROPIC_API_KEY surfaces as httpx.HTTPStatusError with
+    # a 401/403 — that's a config problem on our side, not a transient
+    # Anthropic outage, so telling the user to just "try again in a minute"
+    # would be actively misleading (and would hide a real, fixable problem
+    # behind a retry loop). Give that case its own message; everything else
+    # (connection errors, timeouts, 5xx, rate limits) keeps the generic one.
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403):
+        detail = (
+            "Сервис ИИ-проверки отклонил запрос из-за ошибки авторизации — "
+            "похоже, дело не во временном сбое, а в настройках ключа доступа. "
+            "Сообщите нам, это на нашей стороне."
+        )
+    else:
+        detail = (
+            "Не удалось связаться с сервисом ИИ-проверки — похоже, временный сбой. "
+            "Попробуйте ещё раз через минуту; если не поможет — сообщите нам."
+        )
+    return JSONResponse(status_code=502, content={"detail": detail})
 
 
 @app.on_event("startup")
@@ -570,12 +621,22 @@ async def multi_check(
             # fallback (see created_at there).
             "created_at": record.created_at.isoformat(),
             "completed_at": record.completed_at.isoformat(),
+            # Which criteria were actually selected for this run — lets the
+            # UI show a "Критерии: ..." line so a $0 cost is self-explaining
+            # (e.g. only the free algorithmic checks were ticked) instead of
+            # a manager having to guess whether something went wrong.
+            "checks_run": record.checks_run,
         }
 
     requests, skeleton = build_batch_plan(
         sheets, resolved_source, selected_checks, extra_instructions,
         tone_lookup, target_filter,
     )
+    # Anthropic (or the network to it) failing here — a transient outage, a
+    # rate limit, a malformed request we didn't anticipate — is handled by
+    # the app-wide httpx.HTTPError handler below (see its comment for why
+    # this can't just be a local try/except): it turns into a clean,
+    # readable error instead of a raw crash that strips CORS headers.
     batch_id = await submit_multi_check_batch(requests) if requests else None
 
     if batch_id is None:
@@ -609,6 +670,7 @@ async def multi_check(
             "cost_usd": record.cost_usd,
             "created_at": record.created_at.isoformat(),
             "completed_at": record.completed_at.isoformat(),
+            "checks_run": record.checks_run,
         }
 
     record = models.MultiCheck(
@@ -751,6 +813,7 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
         # finished before this was tracked.
         "created_at": record.created_at.isoformat(),
         "completed_at": record.completed_at.isoformat() if record.completed_at else None,
+        "checks_run": record.checks_run,
     }
 
 
