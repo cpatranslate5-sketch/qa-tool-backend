@@ -161,6 +161,30 @@ assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
 r = check("known languages no longer include the deleted one", client.get(f"/projects/{project_id}/known-languages"))
 assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
 
+# --- regression: exactly what Александр hit live — he added a BARE
+# language ("es") to the catalog alongside an already-present
+# region-qualified variant of the same base ("es-mx") and it vanished
+# from known-languages entirely, looking like the add did nothing.
+# Root cause: _catalog_languages ran the stored list through
+# merge_lang_codes, a helper meant for collapsing ambiguous guesses
+# gathered automatically from a document (where a bare "ko" and a
+# region-qualified "ko-KR" really are the same physical column) — wrong
+# for the catalog, which is a manager's own deliberate, one-at-a-time
+# list where a bare "es" alongside "es-ar"/"es-mx" is a genuinely
+# separate, intentional third entry. Fixed: the catalog now shows
+# exactly what was added, nothing collapsed away. ---
+check("admin adds bare 'es' to the catalog alongside the existing 'es-mx'", client.post(
+    f"/projects/{project_id}/languages", json={"manager_id": admin_id, "lang_code": "es"}
+))
+r = check("bare 'es' is NOT silently merged away just because 'es-mx' also exists", client.get(f"/projects/{project_id}/known-languages"))
+assert set(r.json()["languages"]) == {"ru", "es-mx", "en", "es"}, r.json()
+check("clean up: remove 'es' from the catalog again", client.delete(
+    f"/projects/{project_id}/languages/es", params={"manager_id": admin_id}
+))
+r = check("catalog back to its prior state after cleanup", client.get(f"/projects/{project_id}/known-languages"))
+assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
+print("[OK] the catalog shows exactly what was manually added or removed, never auto-merged away")
+
 # --- GLOBAL language-alias dictionary (Александр's own idea): unlike the
 # per-project catalog above, this is shared across the whole platform and
 # deliberately open to every folder, not just the admin one — a wrong or

@@ -419,13 +419,24 @@ def tone_status(project_id: int, db: Session = Depends(get_db)):
 
 
 def _catalog_languages(project_id: int, db: Session) -> list[str]:
+    """Returns exactly what's stored for this project — deliberately NOT
+    passed through merge_lang_codes. That helper collapses same-language
+    entries gathered automatically from a document (where a bare "ko" and
+    a region-qualified "ko-KR" really are just two spellings of the same
+    physical column), which is the wrong behaviour here: the catalog is a
+    manually-curated list the admin builds one explicit add at a time (see
+    add_catalog_language below), so a bare "es" alongside "es-ar"/"es-mx"
+    is a third, deliberately separate entry, not an ambiguous duplicate to
+    silently drop. Merging it away made an admin's own explicit add
+    invisible — found from Александр adding "es"/"fr" and seeing nothing
+    change (they WERE saved, just never shown)."""
     langs = {
         row[0]
         for row in db.query(models.LanguageCatalogEntry.lang_code)
         .filter(models.LanguageCatalogEntry.project_id == project_id)
         .all()
     }
-    return merge_lang_codes(langs)
+    return sorted(langs)
 
 
 @app.get("/projects/{project_id}/known-languages")
