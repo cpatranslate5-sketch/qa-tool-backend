@@ -116,32 +116,69 @@ r = check("admin tone upload", client.post(
 ))
 assert r.json()["rule_count"] == 4, r.json()
 
-# --- known languages come from the tone-of-address document alone now
-# (the only reference document left) — just every language column it names ---
-r = check("known languages union", client.get(f"/projects/{project_id}/known-languages"))
+# --- known languages (the checkbox catalog) is now its OWN list,
+# completely decoupled from the tone-of-address document — Александр
+# asked for the checkbox catalog to change ONLY on an explicit
+# add/remove, never as a side effect of uploading anything. Right after
+# a tone upload, the catalog is still empty: uploading a tone doc alone
+# no longer populates it. ---
+r = check("known languages is NOT auto-populated by a tone upload", client.get(f"/projects/{project_id}/known-languages"))
+assert r.json()["languages"] == [], r.json()
+
+# --- admin builds the catalog explicitly, one language at a time ---
+check("non-admin can't add a catalog language", client.post(
+    f"/projects/{project_id}/languages", json={"manager_id": regular_id, "lang_code": "ru"}
+), expect=403)
+for code in ["ru", "es-mx", "kz", "en"]:
+    check(f"admin adds '{code}' to the catalog", client.post(
+        f"/projects/{project_id}/languages", json={"manager_id": admin_id, "lang_code": code}
+    ))
+# re-adding an already-present language is a harmless no-op, not an error
+check("re-adding an existing catalog language is a no-op", client.post(
+    f"/projects/{project_id}/languages", json={"manager_id": admin_id, "lang_code": "ru"}
+))
+r = check("known languages now reflects the manually-built catalog", client.get(f"/projects/{project_id}/known-languages"))
 assert set(r.json()["languages"]) == {"ru", "es-mx", "kz", "en"}, r.json()
 
-# --- admin can drop a single straggler language from the tone doc without
+# --- admin can drop a single straggler language from the catalog without
 # touching the rest — for exactly the situation this feature was built
 # for: a project created via "copy from an existing project" (tested
-# further below) inherits that other project's whole tone doc, including
-# a language nobody meant for THIS project, and re-uploading the entire
-# spreadsheet would be overkill just to drop one entry ---
-check("non-admin can't delete a tone-doc language", client.delete(
-    f"/projects/{project_id}/tone/languages/kz", params={"manager_id": regular_id}
+# further below) inherits that other project's whole catalog, including
+# a language nobody meant for THIS project ---
+check("non-admin can't delete a catalog language", client.delete(
+    f"/projects/{project_id}/languages/kz", params={"manager_id": regular_id}
 ), expect=403)
-check("deleting a language not in the doc 404s", client.delete(
-    f"/projects/{project_id}/tone/languages/zz", params={"manager_id": admin_id}
+check("deleting a language not in the catalog 404s", client.delete(
+    f"/projects/{project_id}/languages/zz", params={"manager_id": admin_id}
 ), expect=404)
 # uppercase on the way in, to prove the match is case-insensitive (the
 # frontend always displays codes upper-cased) even though it's stored
 # lower-cased
-r = check("admin deletes the stray 'kz' tone language", client.delete(
-    f"/projects/{project_id}/tone/languages/KZ", params={"manager_id": admin_id}
+r = check("admin deletes the stray 'kz' catalog language", client.delete(
+    f"/projects/{project_id}/languages/KZ", params={"manager_id": admin_id}
 ))
-assert r.json()["rule_count"] == 3, r.json()
+assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
 r = check("known languages no longer include the deleted one", client.get(f"/projects/{project_id}/known-languages"))
 assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
+
+# --- re-uploading the tone doc doesn't touch the catalog either (fully
+# decoupled in both directions) — rule_count changes, known-languages
+# doesn't ---
+tone_recheck_wb = openpyxl.Workbook()
+tone_recheck_ws = tone_recheck_wb.active
+tone_recheck_ws.append(["EN", "RU", "JA"])
+tone_recheck_ws.append(["Формальное", "Формальное", "Формальное"])
+tone_recheck_buf = io.BytesIO()
+tone_recheck_wb.save(tone_recheck_buf)
+tone_recheck_buf.seek(0)
+r = check("re-uploading the tone doc leaves the catalog untouched", client.post(
+    f"/projects/{project_id}/tone/upload",
+    files={"file": ("tone_reupload_check.xlsx", tone_recheck_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"manager_id": admin_id},
+))
+assert r.json()["rule_count"] == 3, r.json()  # the tone doc itself DID change...
+r = check("catalog unchanged after tone re-upload", client.get(f"/projects/{project_id}/known-languages"))
+assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()  # ...but the catalog didn't
 
 # --- now that the tone doc exists, the previously-blocked check runs fine ---
 check("tone check now runs", client.post("/check", json={
@@ -263,23 +300,79 @@ assert multi_data["created_at"], multi_data
 assert multi_data["completed_at"], multi_data
 print("[OK] completed multi-check response includes created_at/completed_at")
 
-# --- detect-languages: the target-language checkbox list must come from
-# the UPLOADED FILE's own columns, not only from the project's Tone
-# document — Александр hit a real gap where English simply had no row in
-# his Tone document (it rarely needs a ты/вы-style rule) and so never
-# appeared as a selectable target at all, no matter what the file
-# contained. This endpoint is what lets the frontend show the file's own
-# languages instead. ---
+# --- extend the catalog to a more realistic size before exercising
+# detect-languages against the real sample file (which spans ~30
+# languages) — mirrors an admin gradually building out their real
+# language list over time, on top of the small set used above to test
+# plain add/remove ---
+for code in ["ar", "kk", "pt-br"]:
+    check(f"admin adds '{code}' to the catalog", client.post(
+        f"/projects/{project_id}/languages", json={"manager_id": admin_id, "lang_code": code}
+    ))
+
+# --- detect-languages: reports which of the file's language-shaped
+# columns match the project's OWN catalog (checkable) vs. which merely
+# LOOK like a language code but aren't on the manager's list at all
+# (unknown_languages) — the fix for Александр's concrete bug report: a
+# column literally labelled "PR" (meant as an abbreviation for
+# Portuguese, but not a real code for it) used to get silently treated
+# as a real target language, with Peru's flag, purely because it parsed
+# as language-shaped. Now nothing enters the checkbox list just because
+# a file happens to contain it. ---
 with open(sample_path, "rb") as f:
-    r = check("detect-languages reports the file's own language columns", client.post(
+    r = check("detect-languages splits catalog-matched vs unknown languages", client.post(
         f"/projects/{project_id}/multi-check/detect-languages",
         files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     ))
 detected = r.json()["languages"]
-assert "ru" in detected, detected
-assert len(detected) > 2, detected  # this sample file spans many target languages
-assert r.json()["unrecognized_columns"] == [], r.json()  # this sample file has none
-print(f"   detected languages: {detected}")
+unknown_detected = r.json()["unknown_languages"]
+# every catalog language actually present in the file is reported as a
+# real, checkable target...
+assert {"ru", "es-mx", "en", "ar", "kk", "pt-br"} <= set(detected), detected
+# ...while a real language column the manager simply hasn't added to
+# their catalog yet (Bengali) is reported separately, not silently mixed
+# into the checkable list
+assert "bn" in unknown_detected, unknown_detected
+assert r.json()["unrecognized_columns"] == [], r.json()  # this sample file has none of those
+print(f"   detected (catalog-matched) languages: {detected}")
+print(f"   unknown (language-shaped but not on the catalog) languages: {unknown_detected}")
+
+# --- the exact scenario Александр reported: a column literally labelled
+# "PR" (a manager's mistaken abbreviation for Portuguese) must come back
+# as unknown — never silently added as a real target language ---
+mislabel_wb = openpyxl.Workbook()
+mislabel_ws = mislabel_wb.active
+mislabel_ws.append(["Context", "en", "ru", "PR"])
+mislabel_ws.append(["Greeting", "Hello", "Привет", "Olá"])
+mislabel_buf = io.BytesIO()
+mislabel_wb.save(mislabel_buf)
+mislabel_buf.seek(0)
+r = check("a mislabeled column ('PR' for Portuguese) is reported as unknown, not added silently", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("mislabeled_pr.xlsx", mislabel_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "pr" not in r.json()["languages"], r.json()
+assert "pr" in r.json()["unknown_languages"], r.json()
+assert "en" in r.json()["languages"] and "ru" in r.json()["languages"], r.json()
+
+# --- exactly the fix Александр asked for: once the manager explicitly
+# adds the (genuinely new) language to the catalog, the SAME file is
+# re-checked and that column now counts as a recognized target — never
+# automatically, only after the explicit add ---
+check("admin adds the genuinely-new 'pr' language to the catalog", client.post(
+    f"/projects/{project_id}/languages", json={"manager_id": admin_id, "lang_code": "pr"}
+))
+mislabel_buf.seek(0)
+r = check("after adding it to the catalog, the same column is now recognized", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("mislabeled_pr.xlsx", mislabel_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "pr" in r.json()["languages"], r.json()
+assert "pr" not in r.json()["unknown_languages"], r.json()
+# clean up so 'pr' doesn't leak into later known-languages assertions
+check("clean up: remove 'pr' from the catalog again", client.delete(
+    f"/projects/{project_id}/languages/pr", params={"manager_id": admin_id}
+))
 
 # --- a column that isn't recognized as a language must be reported back
 # BEFORE the manager presses "start", not only inside a finished report —
@@ -994,6 +1087,19 @@ assert r.json()["tone_filename"] == "tone2.xlsx", r.json()
 
 r = check("copied project's tone status matches source", client.get(f"/projects/{copy_project_id}/tone/status"))
 assert r.json()["rule_count"] == 2, r.json()
+
+# --- the copy must ALSO inherit the source project's language catalog —
+# without this, a project created "from" a template would start with a
+# usable tone doc but an empty, useless checkbox list ---
+r = check("copied project's language catalog also matches source", client.get(f"/projects/{copy_project_id}/known-languages"))
+assert set(r.json()["languages"]) == {"ru", "es-mx", "en", "ar", "kk", "pt-br"}, r.json()
+# and it's a genuinely independent copy — removing a language from the
+# COPY must not touch the original
+check("removing a language from the copy", client.delete(
+    f"/projects/{copy_project_id}/languages/kk", params={"manager_id": admin_id}
+))
+r = check("original project's catalog is untouched by the copy's edit", client.get(f"/projects/{project_id}/known-languages"))
+assert "kk" in r.json()["languages"], r.json()
 
 # re-uploading the ORIGINAL project's tone doc must not affect the copy
 twb4 = openpyxl.Workbook()

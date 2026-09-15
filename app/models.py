@@ -71,6 +71,9 @@ class Project(Base):
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     tone_rules: Mapped[list["ToneRule"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    language_catalog: Mapped[list["LanguageCatalogEntry"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
 
 
 class ToneRule(Base):
@@ -88,6 +91,35 @@ class ToneRule(Base):
     project: Mapped["Project"] = relationship(back_populates="tone_rules")
 
     __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_tone_rule_per_project_lang"),)
+
+
+class LanguageCatalogEntry(Base):
+    """One language in a project's manually-curated "which languages do I
+    check here" catalog — this is what the target-language checkboxes are
+    built from (see app.main's /projects/{id}/known-languages and
+    /projects/{id}/languages).
+
+    Deliberately its OWN table, separate from ToneRule: Александр asked
+    for this list to change ONLY when he explicitly adds or removes a
+    language — never as a side effect of uploading a Tone-of-address
+    document (which is about register content, not catalog membership)
+    or a file to check (which used to get unioned into this same list
+    automatically — that's exactly what let a mislabeled column like a
+    stray "PR" silently show up as a real target language with Peru's
+    flag). See app.database._run_migrations for the one-time backfill
+    that seeds this table from each project's existing tone_rules the
+    first time this table is created, so upgrading doesn't blank out
+    anyone's already-built checkbox list."""
+
+    __tablename__ = "language_catalog"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    lang_code: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    project: Mapped["Project"] = relationship(back_populates="language_catalog")
+
+    __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_catalog_lang_per_project"),)
 
 
 class SingleCheck(Base):

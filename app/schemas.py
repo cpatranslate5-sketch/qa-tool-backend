@@ -69,6 +69,11 @@ class ProjectOut(BaseModel):
         from_attributes = True
 
 
+class LanguageIn(BaseModel):
+    manager_id: int
+    lang_code: str
+
+
 class ToneStatusOut(BaseModel):
     """The project's Tone-of-address document is a structured file uploaded
     by the admin — this is what every folder sees to know what's loaded,

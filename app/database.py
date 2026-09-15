@@ -223,6 +223,49 @@ def _run_migrations():
             if "completed_at" not in cols:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN completed_at TIMESTAMPTZ"))
 
+    # The target-language checkbox catalog is now its own table, fully
+    # decoupled from tone_rules — Александр asked for the checkbox list to
+    # change ONLY when he explicitly adds or removes a language, never as
+    # a side effect of uploading a Tone-of-address document or a file to
+    # check (see models.LanguageCatalogEntry's docstring for the full
+    # story — a stray mislabeled column like "PR" used to silently become
+    # a real target language with Peru's flag). NOT the same table as the
+    # old dropped "project_languages" (language folders, removed long
+    # ago) — deliberately a different name, so the unconditional DROP
+    # TABLE migration for that old name (further up) never touches this
+    # one. Created and backfilled here, ONCE: the very first time this
+    # table doesn't exist yet, every project's EXISTING tone_rules
+    # languages are copied in, so upgrading never blanks out anyone's
+    # already-built checkbox list. On every later startup the table
+    # already exists and this whole block is skipped — a manager's own
+    # add/remove edits (and the fact that new tone_rules no longer
+    # auto-populate this table) are permanent from that point on.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "language_catalog" not in existing_tables:
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
+                conn.execute(text(
+                    "CREATE TABLE language_catalog ("
+                    "id SERIAL PRIMARY KEY, "
+                    "project_id INTEGER NOT NULL REFERENCES projects(id), "
+                    "lang_code VARCHAR(20) NOT NULL, "
+                    "CONSTRAINT uq_catalog_lang_per_project UNIQUE (project_id, lang_code))"
+                ))
+            else:
+                conn.execute(text(
+                    "CREATE TABLE language_catalog ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "project_id INTEGER NOT NULL REFERENCES projects(id), "
+                    "lang_code VARCHAR(20) NOT NULL, "
+                    "CONSTRAINT uq_catalog_lang_per_project UNIQUE (project_id, lang_code))"
+                ))
+            if "tone_rules" in existing_tables:
+                conn.execute(text(
+                    "INSERT INTO language_catalog (project_id, lang_code) "
+                    "SELECT DISTINCT project_id, lang_code FROM tone_rules"
+                ))
+
 
 def _ensure_admin_exists():
     from app import models

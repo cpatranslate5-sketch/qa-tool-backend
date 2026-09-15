@@ -14,6 +14,7 @@ from app.config import settings
 from app.database import get_db, init_db
 from app.excel_multi import (
     BATCH_THRESHOLD_CHARS,
+    _normalize_lang_label,
     build_batch_plan,
     build_report_workbook,
     cancel_multi_check_batch,
@@ -199,9 +200,13 @@ def list_projects(db: Session = Depends(get_db)):
 
 
 def _copy_project_documents(from_project_id: int, to_project_id: int, db: Session) -> None:
-    """Deep-copies tone-of-address rows from one project into another as an
-    independent starting point — editing the new project's copy afterward
-    never touches the original."""
+    """Deep-copies tone-of-address rows AND the language catalog from one
+    project into another as an independent starting point — editing the
+    new project's copy afterward (including adding/removing a catalog
+    language) never touches the original. Copying the catalog too is
+    deliberate: without it, a project created "from" a template would
+    start with an empty checkbox list despite inheriting that template's
+    tone rules, which would be a confusing, useless starting point."""
     from_project = db.get(models.Project, from_project_id)
     if from_project is None:
         raise HTTPException(404, "Проект-образец не найден.")
@@ -209,6 +214,8 @@ def _copy_project_documents(from_project_id: int, to_project_id: int, db: Sessio
 
     for r in db.query(models.ToneRule).filter(models.ToneRule.project_id == from_project_id).all():
         db.add(models.ToneRule(project_id=to_project_id, lang_code=r.lang_code, register=r.register))
+    for r in db.query(models.LanguageCatalogEntry).filter(models.LanguageCatalogEntry.project_id == from_project_id).all():
+        db.add(models.LanguageCatalogEntry(project_id=to_project_id, lang_code=r.lang_code))
 
     to_project.tone_filename = from_project.tone_filename
     to_project.tone_uploaded_at = from_project.tone_uploaded_at
@@ -356,7 +363,16 @@ async def upload_tone(
 ):
     """Admin-only. Replaces the project's whole Tone-of-address doc —
     language codes across the header row, "Формальное"/"Неформальное
-    обращение" in the row(s) below each one."""
+    обращение" in the row(s) below each one.
+
+    Deliberately does NOT touch the project's language catalog (see
+    known_languages/add_catalog_language) — the two used to be the same
+    table, but Александр asked for the checkbox list to change only on an
+    explicit add/remove, never as a side effect of uploading any
+    document. A newly-added language that also needs a tone-of-address
+    rule still needs BOTH: adding it to the catalog (so it's checkable at
+    all) and naming it in this document (so the register check has
+    something to check it against)."""
     _require_admin(manager_id, db)
     project = _get_project(project_id, db)
     file_bytes = await file.read()
@@ -389,11 +405,28 @@ def tone_status(project_id: int, db: Session = Depends(get_db)):
     )
 
 
+def _catalog_languages(project_id: int, db: Session) -> list[str]:
+    langs = {
+        row[0]
+        for row in db.query(models.LanguageCatalogEntry.lang_code)
+        .filter(models.LanguageCatalogEntry.project_id == project_id)
+        .all()
+    }
+    return merge_lang_codes(langs)
+
+
 @app.get("/projects/{project_id}/known-languages")
 def known_languages(project_id: int, db: Session = Depends(get_db)):
-    """Every language named in the project's tone-of-address document —
-    the frontend's source for the target-language checkbox list (see
-    point 8 of the redesign).
+    """The project's manually-curated "which languages do I check here"
+    catalog — the frontend's source for the target-language checkboxes.
+
+    Deliberately NOT derived from the Tone-of-address document, and NOT
+    touched by anything in an uploaded check file either — Александр
+    asked for this list to change ONLY when he explicitly adds or removes
+    a language (see /projects/{id}/languages below), after a mislabeled
+    column ("PR", meant as Portuguese but not a real code for it) used to
+    silently show up as a real target language with Peru's flag, purely
+    because it happened to look language-shaped in an uploaded file.
 
     merge_lang_codes collapses same-language entries at different
     granularities into one (keeping the more specific spelling) while
@@ -401,44 +434,53 @@ def known_languages(project_id: int, db: Session = Depends(get_db)):
     es-MX) separate, since those really do mean different rules and must
     be picked explicitly."""
     _get_project(project_id, db)
-    langs: set[str] = set()
-    for row in db.query(models.ToneRule.lang_code).filter(models.ToneRule.project_id == project_id).all():
-        langs.add(row[0])
-    langs.discard("")
-    return {"languages": merge_lang_codes(langs)}
+    return {"languages": _catalog_languages(project_id, db)}
 
 
-@app.delete("/projects/{project_id}/tone/languages/{lang_code}", response_model=schemas.ToneStatusOut)
-def delete_tone_language(project_id: int, lang_code: str, manager_id: int, db: Session = Depends(get_db)):
-    """Removes one straggler language from the project's Tone-of-address
-    catalog without touching the rest of the document.
+@app.post("/projects/{project_id}/languages")
+def add_catalog_language(project_id: int, payload: schemas.LanguageIn, db: Session = Depends(get_db)):
+    """Adds one language to the project's manually-curated catalog —
+    admin-only, and (together with the DELETE below) the ONLY way a
+    language ever enters or leaves this list. Accepts the same display
+    styles as everywhere else ("ES (MX)", "es-mx") via
+    _normalize_lang_label. Idempotent: adding an already-present language
+    just returns the current list, no error."""
+    _require_admin(payload.manager_id, db)
+    _get_project(project_id, db)
+    code = _normalize_lang_label(payload.lang_code.strip())
+    if not code or " " in code or len(code) > 12:
+        raise HTTPException(400, "Некорректный код языка.")
+    exists = (
+        db.query(models.LanguageCatalogEntry)
+        .filter(models.LanguageCatalogEntry.project_id == project_id, models.LanguageCatalogEntry.lang_code == code)
+        .first()
+    )
+    if not exists:
+        db.add(models.LanguageCatalogEntry(project_id=project_id, lang_code=code))
+        db.commit()
+    return {"languages": _catalog_languages(project_id, db)}
 
-    Built for exactly the situation Александр hit: a project created via
-    "copy from an existing project" (see _copy_project_documents) inherits
-    that other project's Tone-of-address rows wholesale — including a
-    language that was never in HIS own tone file for this project, and
-    that he'd have no way to find just by re-reading his own spreadsheet.
-    Re-uploading the whole document is the only other way to fix that
-    (upload always replaces every row — see upload_tone above), which is
-    overkill just to drop one leftover entry, so this gives admins a
-    scalpel instead of a replace-everything hammer.
 
-    lang_code is matched exactly against the stored value (lower-cased,
-    same casing parse_tone_workbook stores it in) — the frontend always
-    passes back the same code it displayed, just upper-cased for
-    display, so .lower() here undoes that."""
+@app.delete("/projects/{project_id}/languages/{lang_code}")
+def delete_catalog_language(project_id: int, lang_code: str, manager_id: int, db: Session = Depends(get_db)):
+    """Removes one language from the project's catalog — admin-only.
+    lang_code is matched case-insensitively (the frontend always displays
+    codes upper-cased, but stores them lower-cased, same as everywhere
+    else in this app)."""
     _require_admin(manager_id, db)
-    project = _get_project(project_id, db)
+    _get_project(project_id, db)
     deleted = (
-        db.query(models.ToneRule)
-        .filter(models.ToneRule.project_id == project_id, models.ToneRule.lang_code == lang_code.strip().lower())
+        db.query(models.LanguageCatalogEntry)
+        .filter(
+            models.LanguageCatalogEntry.project_id == project_id,
+            models.LanguageCatalogEntry.lang_code == lang_code.strip().lower(),
+        )
         .delete()
     )
     if not deleted:
-        raise HTTPException(404, f"Язык «{lang_code}» не найден в документе «Тон обращения» этого проекта.")
+        raise HTTPException(404, f"Язык «{lang_code}» не найден в списке языков этого проекта.")
     db.commit()
-    rule_count = db.query(models.ToneRule).filter(models.ToneRule.project_id == project_id).count()
-    return schemas.ToneStatusOut(filename=project.tone_filename, uploaded_at=project.tone_uploaded_at, rule_count=rule_count)
+    return {"languages": _catalog_languages(project_id, db)}
 
 
 # --------------------------------------------------------- single check ---
@@ -537,26 +579,33 @@ DEFAULT_MULTI_CHECKS = [
 
 @app.post("/projects/{project_id}/multi-check/detect-languages")
 async def detect_file_languages(project_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """Language codes found as column headers in an uploaded file — lets the
-    UI populate the target-language checkboxes from the file the manager is
-    ABOUT to check, rather than only from the project's Tone-of-address
-    document (see known_languages above). Александр hit a real gap here: a
-    language can be legitimately present in a file without ever needing a
-    tone-of-address rule (English chiefly, which rarely needs a ты/вы-style
-    distinction) — so it simply never had a row in the Tone document, never
-    appeared in known_languages, and was therefore never even offered as a
-    selectable target at all, no matter what the uploaded file actually
-    contained. Read-only: just parses the file and reports what's in it,
-    doesn't run any check or store anything.
+    """Language codes found as column headers in an uploaded file, checked
+    against the project's own language catalog (see known_languages
+    above) — read-only: just parses the file and reports what's in it,
+    doesn't run any check, store anything, or touch the catalog itself.
 
-    Also reports any columns parse_workbook couldn't recognize as a
-    language at all — previously computed but silently dropped here, only
-    ever surfacing inside a completed check's report. Given back before
-    the manager presses "start" instead, so a genuine language column
-    that got missed (a typo'd code, an unusual spelling) can be spotted
-    and fixed up front, rather than only noticed afterward — by which
-    point an AI-backed check may already have been paid for without ever
-    having covered it."""
+    Three buckets, not two:
+    - languages: column headers that look like a language code AND match
+      something already in the project's catalog (via the same safe
+      resolve_lang_code bridging used everywhere else) — these become
+      selectable/checkable target languages.
+    - unknown_languages: headers that look like a language code but match
+      NOTHING in the catalog — Александр hit this concretely: a column
+      literally labelled "PR" (meant as an abbreviation for Portuguese,
+      but not a real code for it) used to get silently treated as a real
+      target language, with Peru's flag. Now it's surfaced here instead,
+      so the manager can either rename the column (if it was a mistake)
+      or explicitly add the language to the catalog first (if it's
+      genuinely new) — never have it added FOR them.
+    - unrecognized_columns: headers that don't even look like a language
+      code at all (e.g. "Task name") — unrelated to the catalog, exactly
+      as before.
+
+    Given back before the manager presses "start" instead of only
+    surfacing inside a finished report, so any of the three situations
+    above can be caught and fixed up front — rather than only noticed
+    afterward, by which point an AI-backed check may already have been
+    paid for without ever having covered the language that needed it."""
     _get_project(project_id, db)
     file_bytes = await file.read()
     try:
@@ -568,7 +617,24 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     for s in sheets:
         langs.update(s["languages"])
         unrecognized.update(s.get("unrecognized_columns", []))
-    return {"languages": merge_lang_codes(langs), "unrecognized_columns": sorted(unrecognized)}
+
+    catalog = {
+        row[0]
+        for row in db.query(models.LanguageCatalogEntry.lang_code)
+        .filter(models.LanguageCatalogEntry.project_id == project_id)
+        .all()
+    }
+    known: set[str] = set()
+    unknown: set[str] = set()
+    for code in langs:
+        target = known if (catalog and resolve_lang_code(code, catalog)) else unknown
+        target.add(code)
+
+    return {
+        "languages": merge_lang_codes(known),
+        "unknown_languages": sorted(unknown),
+        "unrecognized_columns": sorted(unrecognized),
+    }
 
 
 @app.post("/projects/{project_id}/multi-check/verify-languages")
