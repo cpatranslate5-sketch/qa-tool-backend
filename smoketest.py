@@ -374,6 +374,25 @@ check("clean up: remove 'pr' from the catalog again", client.delete(
     f"/projects/{project_id}/languages/pr", params={"manager_id": admin_id}
 ))
 
+# --- the Portuguese default: a column literally labelled bare "PT" (no
+# region at all) must resolve straight to "pt-br", matching the "pt-br"
+# already on this project's catalog (added above) — not show up as
+# "unknown", and not stay bare "pt" either ---
+pt_wb = openpyxl.Workbook()
+pt_ws = pt_wb.active
+pt_ws.append(["Context", "en", "ru", "PT"])
+pt_ws.append(["Greeting", "Hello", "Привет", "Olá"])
+pt_buf = io.BytesIO()
+pt_wb.save(pt_buf)
+pt_buf.seek(0)
+r = check("a bare 'PT' column resolves to Brazilian Portuguese ('pt-br'), matching the catalog", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("bare_pt.xlsx", pt_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "pt-br" in r.json()["languages"], r.json()
+assert "pt" not in r.json()["languages"], r.json()
+assert "pt" not in r.json()["unknown_languages"] and "pt-br" not in r.json()["unknown_languages"], r.json()
+
 # --- a column that isn't recognized as a language must be reported back
 # BEFORE the manager presses "start", not only inside a finished report —
 # by which point an AI-backed check may already have run without ever
@@ -1223,6 +1242,23 @@ print("[OK] merge_lang_codes/resolve_lang_code: a real independent language "
       "or resolved against an unrelated language's region — while the "
       "legitimate country-code-shorthand bridging (KZ/BD/KG-style) and "
       "genuine same-language bridging (ar/ar-eg) both still work")
+
+# --- Александр's Portuguese is always Brazilian, never Portugal's — a bare
+# "PT" column (or a manually-typed catalog addition of just "pt") must
+# default to "pt-br", the same way "ES (AR)" already tells the AI check it's
+# Argentine Spanish rather than leaving a bare "es" to be guessed at. An
+# EXPLICIT region must never be overridden by that default, whichever style
+# it's written in. ---
+from app.excel_multi import _normalize_lang_label
+
+assert _normalize_lang_label("PT") == "pt-br"
+assert _normalize_lang_label("pt") == "pt-br"
+assert _normalize_lang_label("PT (PT)") == "pt-pt"  # explicit region always wins over the default
+assert _normalize_lang_label("PT-BR") == "pt-br"  # already-explicit form passes through unchanged
+assert _normalize_lang_label("PT (BR)") == "pt-br"
+assert _normalize_lang_label("ES") == "es"  # the default is Portuguese-specific, not applied to other languages
+print("[OK] _normalize_lang_label: a bare \"pt\"/\"PT\" defaults to Brazilian Portuguese "
+      "(\"pt-br\"), while any explicitly-written region is always left alone")
 
 # --- pick_source_lang must bridge the same granularity mismatches as
 # everything else in this file (via resolve_lang_code), not do a literal

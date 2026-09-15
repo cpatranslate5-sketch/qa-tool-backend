@@ -116,13 +116,37 @@ _PAREN_LANG_RE = re.compile(r"^([a-zA-Zа-яА-Я]{2,3})\s*\(([a-zA-Zа-яА-Я0
 _SPACE_LANG_RE = re.compile(r"^([A-Z]{2,3})\s+([A-Z0-9]{1,5})$")
 
 
+# Unlike Spanish (which the agency always spells out by region — es-ar,
+# es-mx, es-es — because it genuinely handles several), Portuguese has only
+# ever meant one thing in Александр's work: Brazilian Portuguese. But
+# Portugal's and Brazil's Portuguese differ enough (vocabulary, formality
+# conventions) that the AI check should be told explicitly which one it's
+# dealing with, exactly the way an explicit "es-ar" already tells it
+# Argentine Spanish rather than leaving that to be guessed from a bare "es"
+# (see _target_lang_line in app.claude_client — whatever code reaches it as
+# target_lang is what the AI is told the language IS). So a bare,
+# unqualified "pt" — no region attached at all — defaults to Brazilian
+# Portuguese ("pt-br") wherever a language code is first minted: a file
+# column header, or a manually-typed catalog addition. An EXPLICIT region
+# ("PT (PT)", "pt-pt") is left alone — if Portugal's own Portuguese is ever
+# actually needed, spelling it out that way is how to ask for it instead of
+# getting the Brazilian default.
+_DEFAULT_REGION_FOR_BARE_LANG = {
+    "pt": "pt-br",
+}
+
+
 def _normalize_lang_label(label: str) -> str:
     """Turns a display-style language header like "ES (MX)", "PT (BR)", or
     the same without parentheses ("ES MX", "PT BR" — must be ALL CAPS, see
     _SPACE_LANG_RE) into the hyphenated form used everywhere else
     ("es-mx", "pt-br"), while leaving an already-plain code like "es-mx" or
     "fr-сi" untouched. Some client files use one style, some another, so
-    all of them need to resolve to the same lang_code."""
+    all of them need to resolve to the same lang_code. A handful of bare
+    codes also get defaulted to a specific region here — see
+    _DEFAULT_REGION_FOR_BARE_LANG — since an explicit region ("PT (BR)",
+    "pt-pt") above already means something specific and must never be
+    overridden by that default."""
     label = label.strip()
     m = _PAREN_LANG_RE.match(label)
     if m:
@@ -130,7 +154,8 @@ def _normalize_lang_label(label: str) -> str:
     m = _SPACE_LANG_RE.match(label)
     if m:
         return f"{m.group(1).lower()}-{m.group(2).lower()}"
-    return label.lower()
+    code = label.lower()
+    return _DEFAULT_REGION_FOR_BARE_LANG.get(code, code)
 
 
 def _base_lang(code: str) -> str:
