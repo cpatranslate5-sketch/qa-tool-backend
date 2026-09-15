@@ -538,6 +538,51 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     return {"languages": merge_lang_codes(langs), "unrecognized_columns": sorted(unrecognized)}
 
 
+@app.post("/projects/{project_id}/multi-check/verify-languages")
+async def verify_file_languages(
+    project_id: int,
+    file: UploadFile = File(...),
+    codes: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Александр's redesign: rather than trusting an auto-generated "here's
+    what we found" list and hoping a missing language gets NOTICED (people
+    are bad at spotting an absence from a list — that's exactly how a real
+    language went missing before this existed), the manager states up
+    front which languages they expect to check, and this endpoint is the
+    explicit yes/no per language, with the exact fix when it's no.
+
+    codes: comma-separated canonical language codes the manager ticked
+    (from the project's own catalog — known_languages / detect-languages —
+    so these are already in the project's own canonical spelling, e.g.
+    "es-mx" not "ES (MX)"). For each one, resolve_lang_code is tried
+    against every language column actually found in THIS file — the same
+    safe bridging (parenthesized/space-separated display styles, ko vs
+    ko-KR granularity, country-code-style shorthand) already used
+    everywhere else, so a code that's merely spelled differently in the
+    file still counts as found; only a code with no safe match at all (not
+    present, or genuinely ambiguous between several columns) is reported
+    missing. Read-only, like detect-languages: doesn't run any check or
+    store anything."""
+    _get_project(project_id, db)
+    requested = [c.strip() for c in codes.split(",") if c.strip()]
+    if not requested:
+        raise HTTPException(400, "Не выбрано ни одного языка для подтверждения.")
+    file_bytes = await file.read()
+    try:
+        sheets = parse_workbook(file_bytes)
+    except Exception:
+        raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
+    file_langs: set[str] = set()
+    for s in sheets:
+        file_langs.update(s["languages"])
+    results = [
+        {"code": code, "found": resolve_lang_code(code, file_langs) is not None}
+        for code in requested
+    ]
+    return {"results": results}
+
+
 @app.post("/projects/{project_id}/multi-check")
 async def multi_check(
     project_id: int,

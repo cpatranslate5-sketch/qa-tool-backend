@@ -300,6 +300,35 @@ assert "es-mx" in r.json()["languages"] and "pt-br" in r.json()["languages"], r.
 assert "Task name" in r.json()["unrecognized_columns"], r.json()
 assert "ES MX" not in r.json()["unrecognized_columns"], r.json()
 
+# --- Александр's redesign: instead of the manager reviewing an
+# auto-generated "here's what we found" list (easy to miss an absence
+# from), the manager states which languages they expect up front, and
+# verify-languages is the explicit per-language yes/no this drives —
+# found via the same safe bridging as everywhere else (a code spelled
+# differently still counts), missing only when nothing safely matches. ---
+with open(sample_path, "rb") as f:
+    r = check("verify-languages reports found/not-found per requested language", client.post(
+        f"/projects/{project_id}/multi-check/verify-languages",
+        files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={"codes": "ru, es-mx, nl"},  # nl (Dutch) genuinely isn't in this sample file
+    ))
+verify_results = {row["code"]: row["found"] for row in r.json()["results"]}
+assert verify_results == {"ru": True, "es-mx": True, "nl": False}, verify_results
+# and the space-style header fix above is itself confirmed found through
+# this same endpoint, not just through detect-languages.
+verify_space_buf = io.BytesIO()
+space_wb.save(verify_space_buf)
+verify_space_buf.seek(0)
+r = check("verify-languages also recognizes the ALL-CAPS space-style headers", client.post(
+    f"/projects/{project_id}/multi-check/verify-languages",
+    files={"file": ("space_style_codes.xlsx", verify_space_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"codes": "es-mx, pt-br, de"},  # de genuinely isn't in this file
+))
+verify_results2 = {row["code"]: row["found"] for row in r.json()["results"]}
+assert verify_results2 == {"es-mx": True, "pt-br": True, "de": False}, verify_results2
+print("[OK] verify-languages: explicit per-language found/not-found confirmation, driving "
+      "the new \"tick what you expect, confirm, get told exactly what's missing\" flow")
+
 # --- target_langs filter: checking just 2 of the file's many languages
 # should only touch those 2 in the summary ---
 with open(sample_path, "rb") as f:
