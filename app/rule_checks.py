@@ -27,6 +27,19 @@ _DECIMAL_COMMA_RE = re.compile(r"^(\d+),(\d{1,2})$")
 # and "1400" are the same value and must compare equal.
 _THOUSANDS_GROUPED_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$")
 
+# A period used the same way, e.g. "50.000", "1.500.000" — the mirror image
+# of the comma pattern above: German, Spanish and several other of
+# Александр's target languages group thousands with a period instead of a
+# comma, so source "50000" and translation "50.000" are the same value, not
+# a mismatch (this is exactly the false positive he hit: "50000"/"50.000"
+# flagged as different numbers). Same exactly-3-digit-group shape as the
+# comma version, so it carries the same accepted ambiguity — a genuine
+# 3-decimal-place fraction like "0.125" would also match this shape and get
+# treated as grouped — but that's already the tradeoff the comma rule above
+# makes, and 3-decimal fractions don't come up in promo prize
+# amounts/counts/percentages.
+_DOT_THOUSANDS_GROUPED_RE = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
+
 # A plain space (regular, non-breaking, or thin) is ALSO a standard
 # thousands separator — it's how Russian formats a big number ("1 500 000"),
 # while the same value shows up comma-grouped in English/Spanish
@@ -51,12 +64,14 @@ def _normalize_number(tok: str) -> str:
     """Normalizes cosmetic-only formatting differences that are *expected*
     to differ between source and a correctly localized translation, so
     they aren't flagged as a real numbers mismatch:
-      - a thousands-grouping comma ("1,400", "1,500,000") is removed
-        entirely, since keeping or dropping it doesn't change the value —
-        Александр hit a translation that correctly kept some of a promo's
-        numbers grouped ("1,500,000") but wrote smaller ones ungrouped
-        ("1400" for the source's "1,400"), and it was flagged as a mismatch
-        even though the value never changed.
+      - a thousands-grouping comma OR period ("1,400"/"1.400",
+        "1,500,000"/"1.500.000") is removed entirely, since keeping,
+        dropping, or switching which punctuation mark groups the number
+        doesn't change the value — Александр hit both directions of this:
+        a translation that correctly kept some of a promo's numbers
+        grouped ("1,500,000") but wrote smaller ones ungrouped ("1400" for
+        the source's "1,400"), and a target language that grouped with a
+        period instead of a comma ("50.000" for the source's "50000").
       - a decimal comma ("0,40") is unified with a decimal point ("0.40") —
         the source is usually English (period), while many of the agency's
         target languages correctly use a comma for the same value.
@@ -67,6 +82,8 @@ def _normalize_number(tok: str) -> str:
     untouched and still compare as different."""
     if _THOUSANDS_GROUPED_RE.match(tok):
         return tok.replace(",", "")
+    if _DOT_THOUSANDS_GROUPED_RE.match(tok):
+        return tok.replace(".", "")
     m = _DECIMAL_COMMA_RE.match(tok)
     normalized = f"{m.group(1)}.{m.group(2)}" if m else tok
     if "." not in normalized and len(normalized) > 1:
@@ -75,12 +92,16 @@ def _normalize_number(tok: str) -> str:
 
 
 def _decompose_grouped(tok: str) -> list[str]:
-    """A token that's unambiguously a comma-grouped THOUSANDS number
-    ("1,400", "1,500,000") is one single value — _normalize_number above
-    already merges its commas away, so it stays one atom. What's left with
-    2+ separators is a DATE written as one glued-together run —
-    "22.09.2026" — since an ordinary decimal or a recognized thousands
-    grouping never reaches this branch. Dates are exactly the case where
+    """A token that's unambiguously a comma- or period-grouped THOUSANDS
+    number ("1,400", "1.400", "1,500,000", "1.500.000") is one single value
+    — _normalize_number above already merges its separators away, so it
+    stays one atom. What's left with 2+ separators is a DATE written as one
+    glued-together run — "22.09.2026" — since an ordinary decimal or a
+    recognized thousands grouping never reaches this branch (a dotted
+    thousands number like "50.000" is already resolved to one atom by
+    _normalize_number before this function's date-vs-grouping decision
+    even runs, precisely so it's never mistaken for a 2-part date
+    fragment). Dates are exactly the case where
     the grouping itself is expected to change between languages:
     day/month/year can come in a different order, and the separator can be
     "." or "/" (a slash-separated date like "09/22/2026" never even

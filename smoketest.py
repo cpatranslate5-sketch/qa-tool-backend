@@ -1106,6 +1106,29 @@ print("[OK] check_numbers: a space used to group thousands (standard Russian for
       "while an actually different number is still caught, and the message names the "
       "specific number(s) that differ rather than dumping the whole list")
 
+# --- a PERIOD is just as legitimate a thousands separator as a comma or a
+# space — German, Spanish and several other target languages group
+# thousands that way ("50.000", "1.500.000"). Александр hit this live: the
+# report showed source "50000" and translation "50.000" as two different
+# numbers even though the value never changed, purely because the comma
+# rule above only covered the comma. Also covers a currency symbol whose
+# position and spacing changes between source and translation ("$100000"
+# vs "100.000$") — the symbol itself was never part of the extracted
+# number to begin with, so its placement was already a non-issue; this
+# just confirms it stays that way once the number itself is also
+# period-grouped. ---
+assert check_numbers("Win up to 50000 today", "Выиграйте до 50.000 сегодня") == []
+assert check_numbers("Prize: $1500000", "Приз: 1.500.000$") == []
+assert check_numbers("Min. bet: $100000", "Мин. ставка: 100.000 $") == []
+# But an actually different period-grouped number must still be caught.
+mismatch_dot = check_numbers("Win up to 50000 today", "Выиграйте до 55.000 сегодня")
+assert mismatch_dot, mismatch_dot
+assert "50000" in mismatch_dot[0]["message"] and "55000" in mismatch_dot[0]["message"], mismatch_dot
+print("[OK] check_numbers: a period used to group thousands (standard German/Spanish "
+      "formatting) is treated the same as a comma or a space — freely interchangeable "
+      "without being flagged, including when a currency symbol moves position/spacing "
+      "along with it — while an actually different number is still caught")
+
 # --- a DATE must not be flagged just because the target language writes
 # the day/month/year in a different order and/or with a different
 # separator — Александр hit this live: a source date "09/22/2026"
