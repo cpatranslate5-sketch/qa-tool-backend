@@ -266,8 +266,9 @@ def _tone_lookup(project_id: int, db: Session):
 
     The document can name the same language at two granularities within
     itself (a plain "ko" row alongside a region-qualified "ko-KR" one) —
-    resolve_lang_code bridges that by matching on any shared subtag, but
-    only when it's unambiguous (see its docstring)."""
+    resolve_lang_code bridges that by matching a compatible subtag (never
+    just any coincidentally-shared one — see its docstring), but only
+    when it's unambiguous."""
     rows = db.query(models.ToneRule).filter(models.ToneRule.project_id == project_id).all()
     by_lang = {r.lang_code: r.register for r in rows}
 
@@ -513,7 +514,16 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     appeared in known_languages, and was therefore never even offered as a
     selectable target at all, no matter what the uploaded file actually
     contained. Read-only: just parses the file and reports what's in it,
-    doesn't run any check or store anything."""
+    doesn't run any check or store anything.
+
+    Also reports any columns parse_workbook couldn't recognize as a
+    language at all — previously computed but silently dropped here, only
+    ever surfacing inside a completed check's report. Given back before
+    the manager presses "start" instead, so a genuine language column
+    that got missed (a typo'd code, an unusual spelling) can be spotted
+    and fixed up front, rather than only noticed afterward — by which
+    point an AI-backed check may already have been paid for without ever
+    having covered it."""
     _get_project(project_id, db)
     file_bytes = await file.read()
     try:
@@ -521,9 +531,11 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     except Exception:
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
     langs: set[str] = set()
+    unrecognized: set[str] = set()
     for s in sheets:
         langs.update(s["languages"])
-    return {"languages": merge_lang_codes(langs)}
+        unrecognized.update(s.get("unrecognized_columns", []))
+    return {"languages": merge_lang_codes(langs), "unrecognized_columns": sorted(unrecognized)}
 
 
 @app.post("/projects/{project_id}/multi-check")

@@ -256,7 +256,26 @@ with open(sample_path, "rb") as f:
 detected = r.json()["languages"]
 assert "ru" in detected, detected
 assert len(detected) > 2, detected  # this sample file spans many target languages
+assert r.json()["unrecognized_columns"] == [], r.json()  # this sample file has none
 print(f"   detected languages: {detected}")
+
+# --- a column that isn't recognized as a language must be reported back
+# BEFORE the manager presses "start", not only inside a finished report —
+# by which point an AI-backed check may already have run without ever
+# covering a genuine language column that got missed. ---
+unrec_wb = openpyxl.Workbook()
+unrec_ws = unrec_wb.active
+unrec_ws.append(["Context", "en", "ru", "Notes for reviewer"])
+unrec_ws.append(["Greeting", "Hello", "Привет", "double-check tone"])
+unrec_buf = io.BytesIO()
+unrec_wb.save(unrec_buf)
+unrec_buf.seek(0)
+r = check("detect-languages also reports unrecognized columns up front", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("with_notes_column.xlsx", unrec_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "Notes for reviewer" in r.json()["unrecognized_columns"], r.json()
+assert "en" in r.json()["languages"] and "ru" in r.json()["languages"], r.json()
 
 # --- target_langs filter: checking just 2 of the file's many languages
 # should only touch those 2 in the summary ---
@@ -981,6 +1000,49 @@ assert merge_lang_codes(["kz", "kk-KZ"]) == ["kk-KZ"]
 print("[OK] merge_lang_codes: collapses same-granularity duplicates, "
       "keeps genuinely distinct regional variants, bridges country-code-style "
       "labels to their region subtag, leaves unrelated codes alone")
+
+# --- Александр hit this live: Tone.xlsx has both a bare "AR" (Arabic)
+# column and an "ES (AR)" (Spanish, Argentina) column. Arabic's own bare
+# code purely coincidentally spells the same two letters as Argentina's
+# ISO-3166 country code, which sits inside "es-ar" as its region half —
+# the OLD any-subtag matching treated that coincidence as "same language",
+# silently merged bare "ar" into the Spanish group, and Arabic vanished
+# from the known-languages list entirely. Same landmine, still latent,
+# for five more real languages whose code coincidentally spells another
+# country's real ISO-3166 code: Bengali/Brunei, Kyrgyz/Cayman Islands,
+# Marathi/Mauritania, Tajik/Togo, Tagalog/Timor-Leste. ---
+assert "ar" in merge_lang_codes(["ar", "es-ar", "es-mx"])
+assert "es-ar" in merge_lang_codes(["ar", "es-ar", "es-mx"])
+assert resolve_lang_code("ar", ["es-ar", "es-mx"]) is None  # Arabic must not resolve to a Spanish-Argentina row
+for lang, other_country_code in [("bn", "bn"), ("ky", "ky"), ("mr", "mr"), ("tg", "tg"), ("tl", "tl")]:
+    merged = merge_lang_codes([lang, f"fr-{other_country_code}", "fr-fr"])
+    assert lang in merged, (lang, merged)
+    assert f"fr-{other_country_code}" in merged, (lang, merged)
+# but a bare code that ISN'T itself a real language (the agency's own
+# country-code-style shorthand, same as the KZ/BD tests above) still
+# bridges via region exactly as before — this fix must not have broken
+# the legitimate case it was carved out of.
+assert merge_lang_codes(["kg", "ky-KG"]) == ["ky-KG"]
+assert resolve_lang_code("kg", ["ky-KG", "en-US"]) == "ky-KG"
+# and a bare code that genuinely IS the same language as a region-qualified
+# one (not a coincidence) still merges normally.
+assert merge_lang_codes(["ar", "ar-eg"]) == ["ar-eg"]
+# same coincidence, a sixth real case: Александр's files use bare "my" for
+# Malay specifically (not ISO-639's own Burmese meaning — see
+# claude_client.LANG_CODE_MEANING_OVERRIDES), which is itself also
+# Malaysia's real ISO-3166 country code — bare "my" must bridge to a
+# genuine "my-*" variant of Malay, but never get pulled into an unrelated
+# language's Malaysia-region entry (e.g. "zh-MY") just because they
+# happen to share those two letters.
+assert merge_lang_codes(["my", "zh-MY", "zh-CN"]) == ["my", "zh-CN", "zh-MY"]
+assert resolve_lang_code("my", ["zh-MY", "zh-CN"]) is None
+print("[OK] merge_lang_codes/resolve_lang_code: a real independent language "
+      "whose code coincidentally spells another country's ISO-3166 code "
+      "(Arabic \"ar\" vs Argentina inside \"es-ar\", and the same latent risk "
+      "for Bengali, Kyrgyz, Marathi, Tajik, Tagalog) is never absorbed into "
+      "or resolved against an unrelated language's region — while the "
+      "legitimate country-code-shorthand bridging (KZ/BD/KG-style) and "
+      "genuine same-language bridging (ar/ar-eg) both still work")
 
 # --- pick_source_lang must bridge the same granularity mismatches as
 # everything else in this file (via resolve_lang_code), not do a literal

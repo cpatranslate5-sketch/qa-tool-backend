@@ -133,6 +133,61 @@ def _subtags(code: str) -> set[str]:
     return set(code.strip().lower().split("-"))
 
 
+# Bare codes that are real, independent ISO-639 languages in this project's
+# own right — every one of them actually appears as its own language column
+# somewhere in Александр's real files. Used by _language_subtags_compatible
+# below to tell apart two very different reasons a short code might share
+# letters with a region subtag: the agency's own country-code-style
+# shorthand for a language (Tone doc's "KZ" for Kazakh, "TJ" for Tajik,
+# "BD" for Bengali — none of which are themselves real ISO-639 codes, so
+# matching them against a region subtag is exactly the intended trick), vs
+# a genuine ISO-639 language code that PURELY BY COINCIDENCE also spells a
+# real but unrelated country's ISO-3166 code (Arabic "ar" vs Argentina's
+# country code "AR"; also latent landmines for the same reason even though
+# no real file has hit them yet: Bengali "bn"/Brunei "BN", Kyrgyz "ky"/
+# Cayman Islands "KY", Marathi "mr"/Mauritania "MR", Tajik "tg"/Togo "TG",
+# Tagalog "tl"/Timor-Leste "TL"). A code in this set must never be treated
+# as merely someone else's region fragment.
+INDEPENDENT_LANGUAGE_CODES = {
+    "ar", "az", "bn", "de", "el", "en", "es", "fr", "hi", "id", "it", "ja",
+    "kk", "ko", "ky", "mr", "ms", "my", "pl", "pt", "ro", "ru", "sw", "te",
+    "tg", "th", "tl", "tr", "uk", "ur", "uz", "vi", "zh",
+}
+
+
+def _language_subtags_compatible(a: str, b: str) -> bool:
+    """True when two language codes plausibly name the same language once
+    bridged across granularity — the shared logic behind both
+    resolve_lang_code's and merge_lang_codes's "same language, differently
+    spelled" bridging — while refusing a match that only "works" because
+    an ISO-639 language code happens to spell the same two letters as an
+    unrelated ISO-3166 country code (see INDEPENDENT_LANGUAGE_CODES above:
+    Arabic "ar" must never match "es-ar" — Spanish, Argentina — just
+    because Argentina's country code is also "AR").
+
+    Always safe: the two codes share the same LANGUAGE subtag — "ko" and
+    "ko-KR", or "es-ar" and "es-mx" by their common "es".
+
+    Also safe, but only for a bare code that ISN'T itself a real,
+    independent language (the agency's own country-code-style shorthand —
+    "KZ" for Kazakh, "TJ" for Tajik, "BD" for Bengali, which aren't
+    themselves recognized language codes) matching the REGION half of a
+    fuller code ("KZ" against "kk-KZ"). A bare code that IS a real
+    language in its own right is excluded from this side of the match
+    entirely — it may only match by sharing an actual LANGUAGE subtag,
+    never by coincidentally matching someone else's region."""
+    a, b = a.strip().lower(), b.strip().lower()
+    if _base_lang(a) == _base_lang(b):
+        return True
+    a_is_shorthand = "-" not in a and a not in INDEPENDENT_LANGUAGE_CODES
+    b_is_shorthand = "-" not in b and b not in INDEPENDENT_LANGUAGE_CODES
+    if a_is_shorthand and a in _subtags(b):
+        return True
+    if b_is_shorthand and b in _subtags(a):
+        return True
+    return False
+
+
 def _freeze(value):
     """Makes a value hashable/comparable for the equality check in
     resolve_lang_code below — a document's row might be a plain string
@@ -149,14 +204,17 @@ def resolve_lang_code(requested: str, available, values: dict | None = None):
     still finds a region-qualified "ko-KR" row, and vice versa.
 
     Tries an exact (case-insensitive) match first. Failing that, falls
-    back to matching the requested code against any subtag (language part
-    OR region part — see _subtags) of an available code — but ONLY when
-    exactly one available code contains it; if several do (e.g. a document
-    has both "es-ES" and "es-AR" with genuinely different rules for each),
-    guessing would silently apply the wrong regional rule, so this returns
-    None instead — the caller then treats the language as if it had no
-    entry at all, exactly like today's "document uploaded but this
-    language is missing" case, rather than picking one region at random.
+    back to matching the requested code against a compatible subtag of an
+    available code (see _language_subtags_compatible — language part
+    always, region part only for a genuine country-code-style shorthand,
+    never for a bare code that's a real language in its own right) — but
+    ONLY when exactly one available code is compatible; if several are
+    (e.g. a document has both "es-ES" and "es-AR" with genuinely different
+    rules for each), guessing would silently apply the wrong regional
+    rule, so this returns None instead — the caller then treats the
+    language as if it had no entry at all, exactly like today's "document
+    uploaded but this language is missing" case, rather than picking one
+    region at random.
 
     Some languages genuinely split into a handful of regional variants
     where every OTHER variant besides one or two special cases shares the
@@ -184,8 +242,7 @@ def resolve_lang_code(requested: str, available, values: dict | None = None):
     if requested in by_lower:
         return by_lower[requested]
 
-    requested_subtags = _subtags(requested)
-    matches = [a for a in avail_list if requested_subtags & _subtags(a)]
+    matches = [a for a in avail_list if _language_subtags_compatible(requested, a)]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1 and values is not None:
@@ -205,13 +262,19 @@ def merge_lang_codes(codes) -> list[str]:
     different formatting rules and must be picked explicitly.
 
     Region-qualified codes are grouped by their first (language) subtag
-    only — deliberately narrower than resolve_lang_code's any-subtag
-    match, since two region-qualified codes should never merge just for
-    sharing a region (hi-IN and mr-IN are different languages that happen
-    to both be spoken in India). A BARE code with no region of its own
-    (like Tone's country-style "KZ" for Kazakh) is looser by nature — it's
-    merged into whichever region-qualified group it matches on ANY subtag,
-    but only when that's unambiguous (exactly one group matches)."""
+    only — deliberately narrower than a full compatibility check, since
+    two region-qualified codes should never merge just for sharing a
+    region (hi-IN and mr-IN are different languages that happen to both be
+    spoken in India). A BARE code with no region of its own is looser by
+    nature — it's merged into whichever region-qualified group it's
+    compatible with (see _language_subtags_compatible: a genuine
+    country-code-style shorthand like Tone's "KZ" for Kazakh matches on
+    ANY subtag, but a bare code that's a real independent language, like
+    Arabic "ar", only matches by sharing an actual language subtag — it
+    must never be absorbed into another language's group just because it
+    happens to spell the same two letters as one of that group's REGIONS,
+    e.g. Arabic "ar" vs Argentina's country code inside "es-ar"), and only
+    when that's unambiguous (exactly one group matches)."""
     codes = [(c or "").strip() for c in codes if c and c.strip()]
     hyphenated = [c for c in codes if "-" in c]
     bare = [c for c in codes if "-" not in c]
@@ -224,7 +287,7 @@ def merge_lang_codes(codes) -> list[str]:
         low = code.lower()
         matching_bases = {
             base for base, variants in groups.items()
-            if any(low in _subtags(v) for v in variants)
+            if any(_language_subtags_compatible(low, v) for v in variants)
         }
         if len(matching_bases) == 1:
             groups[next(iter(matching_bases))].append(code)
