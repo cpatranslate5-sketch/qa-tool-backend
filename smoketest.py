@@ -161,6 +161,88 @@ assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
 r = check("known languages no longer include the deleted one", client.get(f"/projects/{project_id}/known-languages"))
 assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
 
+# --- GLOBAL language-alias dictionary (Александр's own idea): unlike the
+# per-project catalog above, this is shared across the whole platform and
+# deliberately open to every folder, not just the admin one — a wrong or
+# redundant alias is low-stakes and self-correcting (everyone sees who
+# added what), unlike the catalog which decides what actually gets
+# checked/billed ---
+r = check("language-aliases starts empty", client.get("/language-aliases"))
+assert r.json()["aliases"] == [], r.json()
+check("a non-admin folder CAN add an alias (deliberately not admin-gated)", client.post(
+    "/language-aliases", json={"manager_id": regular_id, "alias": "GEO", "canonical_code": "ka"}
+))
+r = check("the new alias shows up, stored lower-cased, with who added it", client.get("/language-aliases"))
+aliases = r.json()["aliases"]
+assert len(aliases) == 1, aliases
+assert aliases[0]["alias"] == "geo", aliases
+assert aliases[0]["canonical_code"] == "ka", aliases
+assert aliases[0]["added_by_name"] == "Мария", aliases  # regular_id's folder name
+geo_alias_id = aliases[0]["id"]
+check("adding the same alias again is refused, not silently overwritten", client.post(
+    "/language-aliases", json={"manager_id": admin_id, "alias": "geo", "canonical_code": "ru"}
+), expect=409)
+check("a non-admin folder CAN delete an alias too (same open-access rule)", client.delete(
+    f"/language-aliases/{geo_alias_id}", params={"manager_id": regular_id}
+))
+r = check("deleted alias no longer listed", client.get("/language-aliases"))
+assert r.json()["aliases"] == [], r.json()
+check("deleting an alias that's already gone 404s", client.delete(
+    f"/language-aliases/{geo_alias_id}", params={"manager_id": regular_id}
+), expect=404)
+
+# --- the actual point of the feature: a taught alias rescues a column that
+# would otherwise land in unrecognized_columns (a raw label with a space
+# in it, which no amount of regex tuning could ever guess at on its own) ---
+check("teach the platform 'PORTUGUESE BRAZIL' means Brazilian Portuguese", client.post(
+    "/language-aliases", json={"manager_id": admin_id, "alias": "Portuguese Brazil", "canonical_code": "pt-br"}
+))
+alias_wb = openpyxl.Workbook()
+alias_ws = alias_wb.active
+alias_ws.append(["Context", "en", "ru", "Portuguese Brazil"])
+alias_ws.append(["Greeting", "Hello", "Привет", "Olá"])
+alias_buf = io.BytesIO()
+alias_wb.save(alias_buf)
+alias_buf.seek(0)
+r = check("a taught alias with a space in it is now recognized as a language, not dropped as unrecognized", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("alias_test.xlsx", alias_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "Portuguese Brazil" not in r.json()["unrecognized_columns"], r.json()
+assert "pt-br" in r.json()["unknown_languages"] or "pt-br" in r.json()["languages"], r.json()
+
+# Regression: a taught alias must win even when its raw text happens to
+# collide with an unrelated column-shape rule (a META_COL_NAMES entry like
+# "статус", or the "label: number" limit-spec pattern) — parse_workbook used
+# to check those shortcuts BEFORE consulting the alias map, so a taught
+# alias whose text matched one would be silently dropped, never even
+# reaching unrecognized_columns for the manager to notice. Now checked first.
+check("teach the platform 'статус' (normally a meta/status column) means Georgian", client.post(
+    "/language-aliases", json={"manager_id": admin_id, "alias": "статус", "canonical_code": "ka"}
+))
+meta_alias_wb = openpyxl.Workbook()
+meta_alias_ws = meta_alias_wb.active
+meta_alias_ws.append(["Context", "en", "статус"])
+meta_alias_ws.append(["Greeting", "Hello", "გამარჯობა"])
+meta_alias_buf = io.BytesIO()
+meta_alias_wb.save(meta_alias_buf)
+meta_alias_buf.seek(0)
+r = check("a taught alias whose text collides with a meta-column name is still recognized as a language", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("meta_alias_test.xlsx", meta_alias_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "статус" not in r.json()["unrecognized_columns"], r.json()
+assert "ka" in r.json()["unknown_languages"] or "ka" in r.json()["languages"], r.json()
+# clean up so this alias doesn't affect any later test in this file
+aliases_now = client.get("/language-aliases").json()["aliases"]
+for a in aliases_now:
+    check(f"clean up: remove '{a['alias']}' alias again", client.delete(
+        f"/language-aliases/{a['id']}", params={"manager_id": admin_id}
+    ))
+print("[OK] global /language-aliases: open to every folder (add + delete), rejects a duplicate "
+      "alias instead of silently overwriting what it used to mean, and a taught spelling rescues "
+      "a column that regex rules alone could never recognize (even one containing a space)")
+
 # --- re-uploading the tone doc doesn't touch the catalog either (fully
 # decoupled in both directions) — rule_count changes, known-languages
 # doesn't ---
@@ -1322,6 +1404,25 @@ assert _normalize_lang_label("PT (BR)") == "pt-br"
 assert _normalize_lang_label("ES") == "es"  # the default is Portuguese-specific, not applied to other languages
 print("[OK] _normalize_lang_label: a bare \"pt\"/\"PT\" defaults to Brazilian Portuguese "
       "(\"pt-br\"), while any explicitly-written region is always left alone")
+
+# --- _label_to_code: the single choke point behind the manager-built global
+# alias dictionary (see /language-aliases below) — a taught spelling always
+# wins over whatever _normalize_lang_label's regex rules would have guessed,
+# including for something that wouldn't even look language-shaped at all
+# (contains a space, isn't short) — that's the whole point of teaching it.
+# Falls back to the regular rules when nothing is taught. ---
+from app.excel_multi import _label_to_code
+
+geo_alias_map = {"geo": "ka", "portuguese brazil": "pt-br", "prbr": "pt-br"}
+assert _label_to_code("GEO", geo_alias_map) == "ka"  # case-insensitive match on the taught alias
+assert _label_to_code(" Geo ", geo_alias_map) == "ka"  # surrounding whitespace ignored
+assert _label_to_code("Portuguese Brazil", geo_alias_map) == "pt-br"  # rescues something with a space, no regex could ever match this
+assert _label_to_code("PRBR", geo_alias_map) == "pt-br"
+assert _label_to_code("ES (MX)", geo_alias_map) == "es-mx"  # nothing taught for this -> falls back to the regular rules
+assert _label_to_code("ES (MX)", None) == "es-mx"  # no alias map at all -> same fallback, no crash
+print("[OK] _label_to_code: a taught alias (case-insensitive, whitespace-trimmed) always wins, "
+      "including rescuing a spelling that wouldn't otherwise look language-shaped at all, and "
+      "falls back to the regular _normalize_lang_label rules for anything not taught")
 
 # --- pick_source_lang must bridge the same granularity mismatches as
 # everything else in this file (via resolve_lang_code), not do a literal

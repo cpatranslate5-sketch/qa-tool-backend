@@ -266,6 +266,36 @@ def _run_migrations():
                     "SELECT DISTINCT project_id, lang_code FROM tone_rules"
                 ))
 
+    # A GLOBAL (not per-project) dictionary of "this raw spelling means
+    # this language" — Александр's own idea, so a manager can teach the
+    # platform a new nonstandard abbreviation (GEO, a mistaken "PR" for
+    # Portuguese, etc.) themselves, without needing a code change every
+    # time. See models.LanguageAlias for the full story. Nothing to
+    # backfill — this is a brand-new concept, not a replacement for
+    # anything that already existed, so it always starts empty.
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "language_aliases" not in existing_tables:
+        with engine.begin() as conn:
+            if engine.dialect.name == "postgresql":
+                conn.execute(text(
+                    "CREATE TABLE language_aliases ("
+                    "id SERIAL PRIMARY KEY, "
+                    "alias VARCHAR(60) NOT NULL UNIQUE, "
+                    "canonical_code VARCHAR(20) NOT NULL, "
+                    "added_by_name VARCHAR(120) NOT NULL DEFAULT '', "
+                    "created_at TIMESTAMPTZ)"
+                ))
+            else:
+                conn.execute(text(
+                    "CREATE TABLE language_aliases ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "alias VARCHAR(60) NOT NULL UNIQUE, "
+                    "canonical_code VARCHAR(20) NOT NULL, "
+                    "added_by_name VARCHAR(120) NOT NULL DEFAULT '', "
+                    "created_at TIMESTAMP)"
+                ))
+
 
 def _ensure_admin_exists():
     from app import models

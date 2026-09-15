@@ -22,7 +22,7 @@ import re
 
 import openpyxl
 
-from app.excel_multi import _normalize_lang_label
+from app.excel_multi import _label_to_code
 
 LANG_COL_NAMES = {"language", "lang", "язык", "код", "code"}
 
@@ -41,7 +41,7 @@ def _classify_tone(raw: str) -> str:
     return ""
 
 
-def parse_tone_workbook(file_bytes: bytes) -> list[dict]:
+def parse_tone_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -> list[dict]:
     """Returns [{"lang_code": "es-mx", "register": "formal"|"informal"}, ...].
 
     Not a simple row-per-language list: language codes run across the
@@ -51,6 +51,11 @@ def parse_tone_workbook(file_bytes: bytes) -> list[dict]:
     normally just one data row, but every row under a language column is
     scanned and the first non-empty one wins, so a stray blank formatting
     row in the export doesn't break anything.
+
+    alias_map: same manager-built global spelling dictionary used by
+    app.excel_multi.parse_workbook (see _label_to_code) — applied here
+    too so a code taught once means the same thing in every document,
+    not just in files sent for checking.
     """
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     by_lang: dict[str, str] = {}
@@ -69,7 +74,7 @@ def parse_tone_workbook(file_bytes: bytes) -> list[dict]:
                 continue
             codes = []
             for one_label in _LANG_SPLIT_RE.split(label):
-                code = _normalize_lang_label(one_label)
+                code = _label_to_code(one_label, alias_map)
                 if code and " " not in code and len(code) <= 12:
                     codes.append(code)
             if codes:

@@ -158,6 +158,33 @@ def _normalize_lang_label(label: str) -> str:
     return _DEFAULT_REGION_FOR_BARE_LANG.get(code, code)
 
 
+def _label_to_code(label: str, alias_map: dict[str, str] | None = None) -> str:
+    """The single choke point for "what language does this raw text mean" —
+    Александр's own idea: rather than every new nonstandard abbreviation
+    (GEO, a mistaken "PR" for Portuguese, "HING" for Hinglish, whatever
+    comes next) needing a code change from a developer, any manager can
+    teach the platform a spelling once, through the global /language-
+    aliases dictionary (see models.LanguageAlias), and it's recognized
+    everywhere from then on — a file's own column header, the
+    Tone-of-address document, or a manually-typed catalog addition.
+
+    alias_map (built fresh from that table by the caller — this function
+    stays a pure string transform, no DB access of its own, so it can
+    still be unit-tested with a plain dict) is checked FIRST, against the
+    raw label exactly as typed (trimmed, case-insensitive) — deliberately
+    BEFORE _normalize_lang_label's own regex-based rules, and deliberately
+    able to rescue a label that wouldn't otherwise even look language-
+    shaped at all (contains a space, isn't 2-3 letters, whatever) since
+    the whole point is to keep shrinking how often anything ends up
+    unrecognized. A label taught this way always wins over a coincidental
+    regex match. Falls back to the existing _normalize_lang_label rules
+    when nothing in the dictionary matches."""
+    hit = (alias_map or {}).get(label.strip().lower())
+    if hit:
+        return hit
+    return _normalize_lang_label(label)
+
+
 def _base_lang(code: str) -> str:
     """The base language subtag of a code — "ko" from "ko-KR", "es" from
     "es-mx", or the whole thing if it has no region part."""
@@ -423,8 +450,16 @@ def _find_header_row(ws, max_scan: int = 5) -> int:
     return best_row
 
 
-def parse_workbook(file_bytes: bytes) -> list[dict]:
-    """Returns a list of parsed sheets: each with lang codes found and rows."""
+def parse_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -> list[dict]:
+    """Returns a list of parsed sheets: each with lang codes found and rows.
+
+    alias_map: the manager-built global "this raw spelling means this
+    language" dictionary (see _label_to_code and models.LanguageAlias),
+    fetched fresh from the DB by the caller. Checked before a column is
+    ever judged "not language-shaped" — a taught alias can rescue a
+    header that the regex-only rules would otherwise drop into
+    `unrecognized_columns`, which is the whole point of the dictionary
+    existing at all."""
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     sheets = []
 
@@ -443,6 +478,20 @@ def parse_workbook(file_bytes: bytes) -> list[dict]:
             if not isinstance(v, str) or not v.strip():
                 continue
             label = v.strip()
+            alias_hit = (alias_map or {}).get(label.lower())
+            if alias_hit:
+                # An explicitly taught spelling always wins, whatever it
+                # looks like — checked before ANY other classification
+                # (context/max-length/meta/limit-spec, and the "looks like
+                # prose" guess below), so a taught alias can never be
+                # silently swallowed by one of those shortcuts. This is
+                # what "checked before a column is ever judged 'not
+                # language-shaped'" (see the docstring) actually means —
+                # it used to only run after the meta/limit-spec `continue`s,
+                # which could drop a taught alias whose raw text happened
+                # to also match one of those unrelated shapes.
+                lang_cols[c] = alias_hit
+                continue
             if _is_context_col(label):
                 context_col = c
             elif _is_max_length_col(label):

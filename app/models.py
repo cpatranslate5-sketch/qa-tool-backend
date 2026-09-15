@@ -122,6 +122,38 @@ class LanguageCatalogEntry(Base):
     __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_catalog_lang_per_project"),)
 
 
+class LanguageAlias(Base):
+    """A GLOBAL (not per-project) dictionary of "this raw spelling means
+    this language" — Александр's own idea, born from the GEO/PR-for-
+    Portuguese/HING kind of mislabeling this app has been chasing case by
+    case: instead of every new nonstandard abbreviation needing a code
+    change from a developer, any manager teaches the platform a spelling
+    once, here, and every project benefits immediately, from then on.
+
+    Deliberately separate from LanguageCatalogEntry, which stays
+    per-project and controls WHICH languages actually get checked. This
+    table only affects RECOGNITION — turning a raw column header (in an
+    uploaded check file, the Tone-of-address document, or even a
+    manually-typed catalog addition) into the canonical code the rest of
+    the app already understands, before any per-project list is even
+    consulted. See app.excel_multi._label_to_code, the single choke point
+    that applies this.
+
+    `alias` is stored lower-cased and trimmed, and is globally unique —
+    one spelling means exactly one language; to repoint it, delete and
+    re-add rather than having two conflicting rows. `canonical_code` is
+    stored already normalized (via _normalize_lang_label), so it's
+    immediately usable wherever a canonical code is expected."""
+
+    __tablename__ = "language_aliases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    alias: Mapped[str] = mapped_column(String(60), unique=True, nullable=False)
+    canonical_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    added_by_name: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class SingleCheck(Base):
     """One source/translation pair, checked directly against a project (no
     more per-language sub-folder — source_lang/target_lang are recorded on

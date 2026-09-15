@@ -14,6 +14,7 @@ from app.config import settings
 from app.database import get_db, init_db
 from app.excel_multi import (
     BATCH_THRESHOLD_CHARS,
+    _label_to_code,
     _normalize_lang_label,
     build_batch_plan,
     build_report_workbook,
@@ -186,6 +187,18 @@ def _require_admin(manager_id: int, db: Session) -> models.Manager:
     if not manager.is_admin:
         raise HTTPException(403, "Это действие доступно только админской папке.")
     return manager
+
+
+def _load_alias_map(db: Session) -> dict[str, str]:
+    """The GLOBAL "this raw spelling means this language" dictionary (see
+    models.LanguageAlias and app.excel_multi._label_to_code), fetched
+    fresh from the DB on every request that parses a file or a manually-
+    typed language code — it's a small table, and always reflecting the
+    latest additions/removals matters more here than caching it."""
+    return {
+        row[0]: row[1]
+        for row in db.query(models.LanguageAlias.alias, models.LanguageAlias.canonical_code).all()
+    }
 
 
 # -------------------------------------------------------------- projects ----
@@ -378,7 +391,7 @@ async def upload_tone(
     file_bytes = await file.read()
 
     try:
-        rows = parse_tone_workbook(file_bytes)
+        rows = parse_tone_workbook(file_bytes, _load_alias_map(db))
     except Exception:
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx со списком языков.")
     if not rows:
@@ -442,12 +455,13 @@ def add_catalog_language(project_id: int, payload: schemas.LanguageIn, db: Sessi
     """Adds one language to the project's manually-curated catalog —
     admin-only, and (together with the DELETE below) the ONLY way a
     language ever enters or leaves this list. Accepts the same display
-    styles as everywhere else ("ES (MX)", "es-mx") via
-    _normalize_lang_label. Idempotent: adding an already-present language
-    just returns the current list, no error."""
+    styles as everywhere else ("ES (MX)", "es-mx") via _label_to_code —
+    including anything already taught in the global /language-aliases
+    dictionary. Idempotent: adding an already-present language just
+    returns the current list, no error."""
     _require_admin(payload.manager_id, db)
     _get_project(project_id, db)
-    code = _normalize_lang_label(payload.lang_code.strip())
+    code = _label_to_code(payload.lang_code.strip(), _load_alias_map(db))
     if not code or " " in code or len(code) > 12:
         raise HTTPException(400, "Некорректный код языка.")
     exists = (
@@ -481,6 +495,80 @@ def delete_catalog_language(project_id: int, lang_code: str, manager_id: int, db
         raise HTTPException(404, f"Язык «{lang_code}» не найден в списке языков этого проекта.")
     db.commit()
     return {"languages": _catalog_languages(project_id, db)}
+
+
+# ------------------------------------------------------- language aliases ---
+# GLOBAL (not per-project, unlike the catalog above) — Александр's own idea:
+# any manager teaches the platform "this raw spelling means this language"
+# once, here, and it's recognized everywhere from then on (a file's own
+# column header, the Tone-of-address document, a manually-typed catalog
+# addition) — see models.LanguageAlias and app.excel_multi._label_to_code.
+# Deliberately open to every folder, not just the admin one: unlike the
+# catalog (which decides what actually gets billed/checked), a wrong or
+# redundant alias is low-stakes and self-correcting — everyone can see who
+# added what and fix a mistake themselves, which is the point of not
+# gatekeeping it.
+
+def _alias_out(row: models.LanguageAlias) -> dict:
+    return {
+        "id": row.id,
+        "alias": row.alias,
+        "canonical_code": row.canonical_code,
+        "added_by_name": row.added_by_name,
+        "created_at": row.created_at,
+    }
+
+
+@app.get("/language-aliases")
+def list_language_aliases(db: Session = Depends(get_db)):
+    rows = db.query(models.LanguageAlias).order_by(models.LanguageAlias.alias).all()
+    return {"aliases": [_alias_out(r) for r in rows]}
+
+
+@app.post("/language-aliases")
+def add_language_alias(payload: schemas.LanguageAliasIn, db: Session = Depends(get_db)):
+    """Any folder may add — this is a shared dictionary, not a per-project
+    setting, and mistakes here are cheap (see the section comment above).
+    `alias` is stored trimmed and lower-cased; `canonical_code` goes
+    through the same _label_to_code normalization as everywhere else (so
+    e.g. "ES (MX)" typed as a canonical code still becomes "es-mx") —
+    it's resolved WITHOUT consulting the alias table itself, so one alias
+    can never silently chain into another. One alias means exactly one
+    language: adding an already-present alias 409s rather than silently
+    overwriting what it used to mean — delete it first if it should now
+    point somewhere else."""
+    manager = _get_manager(payload.manager_id, db)
+    alias = payload.alias.strip().lower()
+    if not alias or len(alias) > 60:
+        raise HTTPException(400, "Введите вариант написания языка (до 60 символов).")
+    code = _normalize_lang_label(payload.canonical_code.strip())
+    if not code or " " in code or len(code) > 12:
+        raise HTTPException(400, "Некорректный код языка.")
+    exists = db.query(models.LanguageAlias).filter(models.LanguageAlias.alias == alias).first()
+    if exists:
+        raise HTTPException(
+            409,
+            f"«{payload.alias.strip()}» уже есть в словаре (означает «{exists.canonical_code}»). "
+            "Сначала удалите его, если хотите привязать к другому языку.",
+        )
+    db.add(models.LanguageAlias(alias=alias, canonical_code=code, added_by_name=manager.name))
+    db.commit()
+    rows = db.query(models.LanguageAlias).order_by(models.LanguageAlias.alias).all()
+    return {"aliases": [_alias_out(r) for r in rows]}
+
+
+@app.delete("/language-aliases/{alias_id}")
+def delete_language_alias(alias_id: int, manager_id: int, db: Session = Depends(get_db)):
+    """Any folder may delete — see the section comment above for why this
+    isn't admin-gated the way the per-project catalog is."""
+    _get_manager(manager_id, db)
+    row = db.get(models.LanguageAlias, alias_id)
+    if row is None:
+        raise HTTPException(404, "Этот вариант уже удалён или не существует.")
+    db.delete(row)
+    db.commit()
+    rows = db.query(models.LanguageAlias).order_by(models.LanguageAlias.alias).all()
+    return {"aliases": [_alias_out(r) for r in rows]}
 
 
 # --------------------------------------------------------- single check ---
@@ -609,7 +697,7 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     _get_project(project_id, db)
     file_bytes = await file.read()
     try:
-        sheets = parse_workbook(file_bytes)
+        sheets = parse_workbook(file_bytes, _load_alias_map(db))
     except Exception:
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
     langs: set[str] = set()
@@ -669,7 +757,7 @@ async def verify_file_languages(
         raise HTTPException(400, "Не выбрано ни одного языка для подтверждения.")
     file_bytes = await file.read()
     try:
-        sheets = parse_workbook(file_bytes)
+        sheets = parse_workbook(file_bytes, _load_alias_map(db))
     except Exception:
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
     file_langs: set[str] = set()
@@ -720,7 +808,7 @@ async def multi_check(
     file_bytes = await file.read()
 
     try:
-        sheets = parse_workbook(file_bytes)
+        sheets = parse_workbook(file_bytes, _load_alias_map(db))
     except Exception:
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
 
