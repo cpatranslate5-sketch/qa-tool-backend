@@ -277,6 +277,29 @@ r = check("detect-languages also reports unrecognized columns up front", client.
 assert "Notes for reviewer" in r.json()["unrecognized_columns"], r.json()
 assert "en" in r.json()["languages"] and "ru" in r.json()["languages"], r.json()
 
+# --- Александр hit this live right after the above shipped: his real file
+# spells some region-qualified languages as "ES MX"/"PT BR" — the display
+# style ("ES (MX)") without the parentheses — which fell through to the
+# generic "looks like prose" rejection (any header with a space in it) and
+# was reported as an unrecognized column even though it very much is a
+# language. Deliberately ALL CAPS only, so an ordinary two-word column like
+# "Task name" (mixed case in every real file) still correctly stays
+# unrecognized rather than being guessed as a language. ---
+space_wb = openpyxl.Workbook()
+space_ws = space_wb.active
+space_ws.append(["Context", "en", "ES MX", "PT BR", "Task name"])
+space_ws.append(["Greeting", "Hello", "Hola", "Ola", "internal note"])
+space_buf = io.BytesIO()
+space_wb.save(space_buf)
+space_buf.seek(0)
+r = check("detect-languages recognizes ALL-CAPS \"ES MX\"/\"PT BR\"-style headers as languages", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("space_style_codes.xlsx", space_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "es-mx" in r.json()["languages"] and "pt-br" in r.json()["languages"], r.json()
+assert "Task name" in r.json()["unrecognized_columns"], r.json()
+assert "ES MX" not in r.json()["unrecognized_columns"], r.json()
+
 # --- target_langs filter: checking just 2 of the file's many languages
 # should only touch those 2 in the summary ---
 with open(sample_path, "rb") as f:

@@ -100,15 +100,34 @@ def _is_limit_spec_col(header: str) -> bool:
 
 _PAREN_LANG_RE = re.compile(r"^([a-zA-Zа-яА-Я]{2,3})\s*\(([a-zA-Zа-яА-Я0-9]{1,5})\)$")
 
+# The same "ES (MX)"/"PT (BR)" display style, but without the parentheses —
+# "ES MX", "PT BR" — a header written this way isn't currently reachable at
+# all: with no hyphen and no parens for _PAREN_LANG_RE to key off, it falls
+# straight through to a plain .lower() with the space still in it, which
+# parse_workbook's own space check then rejects as "looks like prose, not a
+# language code". Deliberately requires BOTH words to be fully uppercase in
+# the source file (unlike the parenthesized form above, which is
+# case-insensitive) — that's what tells a genuine "ES MX"/"PT BR"-style code
+# apart from an ordinary two-word column header like "Task name" or a
+# capitalized "No data", which are never written in ALL CAPS in Александр's
+# real files. Deliberately does NOT try to be clever about the second
+# word's length ("PT BR" and "ES MX" happen to be 2+2, but keep the same
+# 1-5 character allowance as the parenthesized form for other real cases).
+_SPACE_LANG_RE = re.compile(r"^([A-Z]{2,3})\s+([A-Z0-9]{1,5})$")
+
 
 def _normalize_lang_label(label: str) -> str:
-    """Turns a display-style language header like "ES (MX)" or "PT (BR)"
-    into the hyphenated form used everywhere else ("es-mx", "pt-br"), while
-    leaving an already-plain code like "es-mx" or "fr-сi" untouched. Some
-    client files use one style, some the other, so both need to resolve to
-    the same lang_code."""
+    """Turns a display-style language header like "ES (MX)", "PT (BR)", or
+    the same without parentheses ("ES MX", "PT BR" — must be ALL CAPS, see
+    _SPACE_LANG_RE) into the hyphenated form used everywhere else
+    ("es-mx", "pt-br"), while leaving an already-plain code like "es-mx" or
+    "fr-сi" untouched. Some client files use one style, some another, so
+    all of them need to resolve to the same lang_code."""
     label = label.strip()
     m = _PAREN_LANG_RE.match(label)
+    if m:
+        return f"{m.group(1).lower()}-{m.group(2).lower()}"
+    m = _SPACE_LANG_RE.match(label)
     if m:
         return f"{m.group(1).lower()}-{m.group(2).lower()}"
     return label.lower()
