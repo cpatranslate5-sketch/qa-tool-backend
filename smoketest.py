@@ -121,6 +121,28 @@ assert r.json()["rule_count"] == 4, r.json()
 r = check("known languages union", client.get(f"/projects/{project_id}/known-languages"))
 assert set(r.json()["languages"]) == {"ru", "es-mx", "kz", "en"}, r.json()
 
+# --- admin can drop a single straggler language from the tone doc without
+# touching the rest — for exactly the situation this feature was built
+# for: a project created via "copy from an existing project" (tested
+# further below) inherits that other project's whole tone doc, including
+# a language nobody meant for THIS project, and re-uploading the entire
+# spreadsheet would be overkill just to drop one entry ---
+check("non-admin can't delete a tone-doc language", client.delete(
+    f"/projects/{project_id}/tone/languages/kz", params={"manager_id": regular_id}
+), expect=403)
+check("deleting a language not in the doc 404s", client.delete(
+    f"/projects/{project_id}/tone/languages/zz", params={"manager_id": admin_id}
+), expect=404)
+# uppercase on the way in, to prove the match is case-insensitive (the
+# frontend always displays codes upper-cased) even though it's stored
+# lower-cased
+r = check("admin deletes the stray 'kz' tone language", client.delete(
+    f"/projects/{project_id}/tone/languages/KZ", params={"manager_id": admin_id}
+))
+assert r.json()["rule_count"] == 3, r.json()
+r = check("known languages no longer include the deleted one", client.get(f"/projects/{project_id}/known-languages"))
+assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()
+
 # --- now that the tone doc exists, the previously-blocked check runs fine ---
 check("tone check now runs", client.post("/check", json={
     "source": "Play now.",

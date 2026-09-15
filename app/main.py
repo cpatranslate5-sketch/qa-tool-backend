@@ -408,6 +408,39 @@ def known_languages(project_id: int, db: Session = Depends(get_db)):
     return {"languages": merge_lang_codes(langs)}
 
 
+@app.delete("/projects/{project_id}/tone/languages/{lang_code}", response_model=schemas.ToneStatusOut)
+def delete_tone_language(project_id: int, lang_code: str, manager_id: int, db: Session = Depends(get_db)):
+    """Removes one straggler language from the project's Tone-of-address
+    catalog without touching the rest of the document.
+
+    Built for exactly the situation Александр hit: a project created via
+    "copy from an existing project" (see _copy_project_documents) inherits
+    that other project's Tone-of-address rows wholesale — including a
+    language that was never in HIS own tone file for this project, and
+    that he'd have no way to find just by re-reading his own spreadsheet.
+    Re-uploading the whole document is the only other way to fix that
+    (upload always replaces every row — see upload_tone above), which is
+    overkill just to drop one leftover entry, so this gives admins a
+    scalpel instead of a replace-everything hammer.
+
+    lang_code is matched exactly against the stored value (lower-cased,
+    same casing parse_tone_workbook stores it in) — the frontend always
+    passes back the same code it displayed, just upper-cased for
+    display, so .lower() here undoes that."""
+    _require_admin(manager_id, db)
+    project = _get_project(project_id, db)
+    deleted = (
+        db.query(models.ToneRule)
+        .filter(models.ToneRule.project_id == project_id, models.ToneRule.lang_code == lang_code.strip().lower())
+        .delete()
+    )
+    if not deleted:
+        raise HTTPException(404, f"Язык «{lang_code}» не найден в документе «Тон обращения» этого проекта.")
+    db.commit()
+    rule_count = db.query(models.ToneRule).filter(models.ToneRule.project_id == project_id).count()
+    return schemas.ToneStatusOut(filename=project.tone_filename, uploaded_at=project.tone_uploaded_at, rule_count=rule_count)
+
+
 # --------------------------------------------------------- single check ---
 # Any folder may run checks — only structural changes above are admin-only.
 
