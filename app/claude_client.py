@@ -283,15 +283,18 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
             json={
                 "model": resolved_model,
                 "max_tokens": AI_MAX_TOKENS,
-                # 0, not the API's default of 1 — this is a QA check against
-                # explicit written criteria, not creative writing, so the
-                # goal is the same, most-likely judgment call every time a
-                # given text is checked, not variety between runs. Without
-                # this, the SAME file could genuinely flag different things
-                # (or nothing) from one run to the next purely from random
-                # sampling — reported live by Александр as "то находит
-                # ошибки, то нет, то находит разные".
-                "temperature": 0,
+                # Deliberately NOT setting temperature. It was briefly set to
+                # 0 here (to make a fixed-criteria classification task give
+                # the same answer for the same input every time, instead of
+                # varying run to run) but Anthropic rejects it outright with
+                # a 400 ("temperature is deprecated for this model") on
+                # newer models — confirmed live against Sonnet, which broke
+                # every real-time check the moment Sonnet became the default
+                # model. Anthropic's own guidance for these newer models:
+                # "Remove them from requests, and use prompting to guide the
+                # model's behavior instead" — there's no replacement
+                # determinism knob, so consistency now has to come from
+                # clear prompt wording, not a request parameter.
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
@@ -551,14 +554,11 @@ async def create_message_batch(requests: list[dict]) -> str | None:
             "params": {
                 "model": r.get("model") or settings.CLAUDE_MODEL,
                 "max_tokens": AI_MAX_TOKENS,
-                # Same reasoning as _call_claude's real-time path above —
-                # deterministic judgment for a fixed set of criteria, not
-                # varied output. Must be set here too: a large/multi-language
-                # upload is exactly what gets routed through this batch path
-                # (see excel_multi.BATCH_THRESHOLD_CHARS), so leaving it out
-                # here would mean the inconsistency Александр saw keeps
-                # happening for precisely the uploads most likely to hit it.
-                "temperature": 0,
+                # Deliberately NOT setting temperature — see _call_claude's
+                # real-time path above for why: Anthropic rejects it with a
+                # 400 on newer models (confirmed live against Sonnet), and
+                # recommends prompting instead of a temperature parameter
+                # for consistent output on these models.
                 "messages": [{"role": "user", "content": r["prompt"]}],
             },
         }
