@@ -283,6 +283,15 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
             json={
                 "model": resolved_model,
                 "max_tokens": AI_MAX_TOKENS,
+                # 0, not the API's default of 1 — this is a QA check against
+                # explicit written criteria, not creative writing, so the
+                # goal is the same, most-likely judgment call every time a
+                # given text is checked, not variety between runs. Without
+                # this, the SAME file could genuinely flag different things
+                # (or nothing) from one run to the next purely from random
+                # sampling — reported live by Александр as "то находит
+                # ошибки, то нет, то находит разные".
+                "temperature": 0,
                 "messages": [{"role": "user", "content": prompt}],
             },
         )
@@ -542,6 +551,14 @@ async def create_message_batch(requests: list[dict]) -> str | None:
             "params": {
                 "model": r.get("model") or settings.CLAUDE_MODEL,
                 "max_tokens": AI_MAX_TOKENS,
+                # Same reasoning as _call_claude's real-time path above —
+                # deterministic judgment for a fixed set of criteria, not
+                # varied output. Must be set here too: a large/multi-language
+                # upload is exactly what gets routed through this batch path
+                # (see excel_multi.BATCH_THRESHOLD_CHARS), so leaving it out
+                # here would mean the inconsistency Александр saw keeps
+                # happening for precisely the uploads most likely to hit it.
+                "temperature": 0,
                 "messages": [{"role": "user", "content": r["prompt"]}],
             },
         }
