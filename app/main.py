@@ -71,7 +71,19 @@ app.add_middleware(
 # those need fixing, not a friendly message papering over them.
 @app.exception_handler(httpx.HTTPError)
 async def anthropic_call_failed(request: Request, exc: httpx.HTTPError):
-    logger.error("Anthropic API call failed on %s %s: %r", request.method, request.url.path, exc)
+    # %r on exc alone never showed the actual reason Anthropic rejected the
+    # request (httpx.HTTPStatusError's own string form is just the status
+    # code and URL) — logging the response body too, when there is one,
+    # surfaces Anthropic's own {"error": {"type": ..., "message": ...}}
+    # detail, which is the only way to tell a real invalid-request bug on
+    # our side apart from an account/key/billing problem on Anthropic's.
+    body = ""
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            body = f" | response body: {exc.response.text}"
+        except Exception:
+            pass
+    logger.error("Anthropic API call failed on %s %s: %r%s", request.method, request.url.path, exc, body)
     # A bad/expired ANTHROPIC_API_KEY surfaces as httpx.HTTPStatusError with
     # a 401/403 — that's a config problem on our side, not a transient
     # Anthropic outage, so telling the user to just "try again in a minute"
