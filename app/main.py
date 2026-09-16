@@ -29,7 +29,6 @@ from app.excel_multi import (
     submit_multi_check_batch,
     try_finalize_batch,
 )
-from app.project_docs import parse_tone_workbook
 from app.rule_checks import run_rule_checks
 
 logger = logging.getLogger(__name__)
@@ -215,9 +214,9 @@ def _load_alias_map(db: Session) -> dict[str, str]:
 
 # -------------------------------------------------------------- projects ----
 # Shared/global: every folder sees the same projects. Only the admin folder
-# may create, delete, or restructure one (reference documents). No more
-# per-language sub-folders — a project instead carries one optional
-# reference document (tone-of-address).
+# may create, delete, or restructure one. No more per-language
+# sub-folders, and (as of 2026-09-16) no more reference documents either —
+# see models.Project's docstring for what used to live here.
 
 @app.get("/projects", response_model=list[schemas.ProjectOut])
 def list_projects(db: Session = Depends(get_db)):
@@ -225,25 +224,18 @@ def list_projects(db: Session = Depends(get_db)):
 
 
 def _copy_project_documents(from_project_id: int, to_project_id: int, db: Session) -> None:
-    """Deep-copies tone-of-address rows AND the language catalog from one
-    project into another as an independent starting point — editing the
-    new project's copy afterward (including adding/removing a catalog
-    language) never touches the original. Copying the catalog too is
-    deliberate: without it, a project created "from" a template would
-    start with an empty checkbox list despite inheriting that template's
-    tone rules, which would be a confusing, useless starting point."""
+    """Deep-copies the language catalog from one project into another as an
+    independent starting point — editing the new project's copy afterward
+    (adding/removing a catalog language) never touches the original.
+
+    Used to also copy tone-of-address rows, back when that document
+    existed (removed 2026-09-16 — see models.Project's docstring)."""
     from_project = db.get(models.Project, from_project_id)
     if from_project is None:
         raise HTTPException(404, "Проект-образец не найден.")
-    to_project = db.get(models.Project, to_project_id)
 
-    for r in db.query(models.ToneRule).filter(models.ToneRule.project_id == from_project_id).all():
-        db.add(models.ToneRule(project_id=to_project_id, lang_code=r.lang_code, register=r.register))
     for r in db.query(models.LanguageCatalogEntry).filter(models.LanguageCatalogEntry.project_id == from_project_id).all():
         db.add(models.LanguageCatalogEntry(project_id=to_project_id, lang_code=r.lang_code))
-
-    to_project.tone_filename = from_project.tone_filename
-    to_project.tone_uploaded_at = from_project.tone_uploaded_at
 
 
 @app.post("/projects", response_model=schemas.ProjectOut)
@@ -283,51 +275,6 @@ def _get_project(project_id: int, db: Session) -> models.Project:
     if project is None:
         raise HTTPException(404, "Проект не найден.")
     return project
-
-
-# ------------------------------------------------- reference documents ----
-# One optional per-project document (tone-of-address), gating its matching
-# AI check (see _require_doc): a check can't run at all for a project with
-# zero rows in the document, but a document missing just one particular
-# language only skips that language's check, rather than blocking the run.
-
-def _tone_lookup(project_id: int, db: Session):
-    """Returns callable(lang_code) -> "formal"/"informal"/"" for the closest
-    matching language actually present in the project's Tone-of-address
-    document.
-
-    The document can name the same language at two granularities within
-    itself (a plain "ko" row alongside a region-qualified "ko-KR" one) —
-    resolve_lang_code bridges that by matching a compatible subtag (never
-    just any coincidentally-shared one — see its docstring), but only
-    when it's unambiguous."""
-    rows = db.query(models.ToneRule).filter(models.ToneRule.project_id == project_id).all()
-    by_lang = {r.lang_code: r.register for r in rows}
-
-    def lookup(lang_code: str) -> str:
-        resolved = resolve_lang_code(lang_code, by_lang.keys(), values=by_lang)
-        return by_lang.get(resolved, "") if resolved else ""
-
-    return lookup
-
-
-# check key -> (doc name shown to the user, row-count query) — used by
-# _require_doc to block a check that has nothing to check against at all.
-_DOC_REQUIREMENTS = {
-    "register": ("Тон обращения", models.ToneRule),
-}
-
-
-def _require_doc(project_id: int, checks: list[str], db: Session) -> None:
-    for check_key, (doc_name, model_cls) in _DOC_REQUIREMENTS.items():
-        if check_key not in checks:
-            continue
-        has_rows = db.query(model_cls).filter(model_cls.project_id == project_id).first() is not None
-        if not has_rows:
-            raise HTTPException(
-                400,
-                f"Для проверки «{doc_name}» нужно сначала загрузить документ «{doc_name}» для этого проекта.",
-            )
 
 
 def _estimate_batch_minutes(db: Session, volume_chars: int) -> int | None:
@@ -377,57 +324,6 @@ def _estimate_batch_minutes(db: Session, volume_chars: int) -> int | None:
     if chars_per_minute <= 0:
         return None
     return max(1, round(volume_chars / chars_per_minute))
-
-
-@app.post("/projects/{project_id}/tone/upload", response_model=schemas.ToneStatusOut)
-async def upload_tone(
-    project_id: int,
-    file: UploadFile = File(...),
-    manager_id: int = Form(...),
-    db: Session = Depends(get_db),
-):
-    """Admin-only. Replaces the project's whole Tone-of-address doc —
-    language codes across the header row, "Формальное"/"Неформальное
-    обращение" in the row(s) below each one.
-
-    Deliberately does NOT touch the project's language catalog (see
-    known_languages/add_catalog_language) — the two used to be the same
-    table, but Александр asked for the checkbox list to change only on an
-    explicit add/remove, never as a side effect of uploading any
-    document. A newly-added language that also needs a tone-of-address
-    rule still needs BOTH: adding it to the catalog (so it's checkable at
-    all) and naming it in this document (so the register check has
-    something to check it against)."""
-    _require_admin(manager_id, db)
-    project = _get_project(project_id, db)
-    file_bytes = await file.read()
-
-    try:
-        rows = parse_tone_workbook(file_bytes, _load_alias_map(db))
-    except Exception:
-        raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx со списком языков.")
-    if not rows:
-        raise HTTPException(400, "В файле не найдено ни одной строки с языком и указанием тона.")
-
-    db.query(models.ToneRule).filter(models.ToneRule.project_id == project_id).delete()
-    for r in rows:
-        db.add(models.ToneRule(project_id=project_id, lang_code=r["lang_code"], register=r["register"]))
-    project.tone_filename = file.filename or "tone.xlsx"
-    project.tone_uploaded_at = models._now()
-    db.commit()
-
-    return schemas.ToneStatusOut(
-        filename=project.tone_filename, uploaded_at=project.tone_uploaded_at, rule_count=len(rows)
-    )
-
-
-@app.get("/projects/{project_id}/tone/status", response_model=schemas.ToneStatusOut)
-def tone_status(project_id: int, db: Session = Depends(get_db)):
-    project = _get_project(project_id, db)
-    rule_count = db.query(models.ToneRule).filter(models.ToneRule.project_id == project_id).count()
-    return schemas.ToneStatusOut(
-        filename=project.tone_filename, uploaded_at=project.tone_uploaded_at, rule_count=rule_count
-    )
 
 
 def _catalog_languages(project_id: int, db: Session) -> list[str]:
@@ -602,13 +498,9 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     if not payload.source.strip() or not payload.translation.strip():
         return schemas.CheckOut(findings=[])
 
-    tone_register = ""
     project = None
     if payload.project_id:
         project = _get_project(payload.project_id, db)
-        _require_doc(payload.project_id, payload.checks, db)
-        target_lang = payload.target_lang.strip().lower()
-        tone_register = _tone_lookup(project.id, db)(target_lang)
 
     findings = run_rule_checks(
         payload.source, payload.translation, payload.checks,
@@ -616,7 +508,7 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     )
     ai_findings, cost_usd = await run_ai_checks(
         payload.source, payload.translation, payload.checks, payload.extra_instructions,
-        tone_register, payload.target_lang, payload.source_lang,
+        payload.target_lang, payload.source_lang,
     )
     findings += ai_findings
 
@@ -839,11 +731,9 @@ async def multi_check(
         raise HTTPException(400, "В файле не найдено ни одной колонки с кодом языка.")
 
     selected_checks = [c.strip() for c in checks.split(",") if c.strip()] or DEFAULT_MULTI_CHECKS
-    _require_doc(project_id, selected_checks, db)
 
     target_filter = {c.strip().lower() for c in target_langs.split(",") if c.strip()} or None
     resolved_source = pick_source_lang(sheets, source_lang.strip().lower() or None)
-    tone_lookup = _tone_lookup(project_id, db)
 
     # Small/medium jobs run live, as before. Large ones go through
     # Anthropic's Message Batches API instead — cheaper per token, but the
@@ -855,7 +745,7 @@ async def multi_check(
     if urgent or volume <= BATCH_THRESHOLD_CHARS:
         results = await run_multi_check(
             sheets, resolved_source, selected_checks, extra_instructions,
-            tone_lookup, target_filter,
+            target_filter,
         )
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
@@ -897,7 +787,7 @@ async def multi_check(
 
     requests, skeleton = build_batch_plan(
         sheets, resolved_source, selected_checks, extra_instructions,
-        tone_lookup, target_filter,
+        target_filter,
     )
     # Anthropic (or the network to it) failing here — a transient outage, a
     # rate limit, a malformed request we didn't anticipate — is handled by

@@ -1,11 +1,10 @@
-import datetime
-
 from pydantic import BaseModel
 
 # Every check type a single-check or multi-check can run. "missing" isn't
 # here — it always runs automatically whenever a translation is empty.
-# "register" (tone of address) requires its matching project document to
-# be uploaded at all — see app.main._require_doc.
+# "register" (tone of address) no longer needs any project document — it
+# reports the register actually used instead of judging it against one
+# (see app.claude_client.summarize_register_values).
 DEFAULT_CHECKS = [
     "numbers", "placeholders", "register", "typo",
     "untranslatable", "completeness", "punctuation",
@@ -48,8 +47,8 @@ class ManagerAdminEnterIn(BaseModel):
 class ProjectIn(BaseModel):
     name: str
     manager_id: int
-    # Optional — deep-copies another project's tone-of-address rows into
-    # the new one as a starting point (fully independent afterward).
+    # Optional — deep-copies another project's language catalog into the
+    # new one as a starting point (fully independent afterward).
     copy_from_project_id: int | None = None
 
 
@@ -61,8 +60,6 @@ class ProjectDeleteIn(BaseModel):
 class ProjectOut(BaseModel):
     id: int
     name: str
-    tone_filename: str
-    tone_uploaded_at: datetime.datetime | None
     created_by_name: str
 
     class Config:
@@ -78,16 +75,6 @@ class LanguageAliasIn(BaseModel):
     manager_id: int
     alias: str
     canonical_code: str
-
-
-class ToneStatusOut(BaseModel):
-    """The project's Tone-of-address document is a structured file uploaded
-    by the admin — this is what every folder sees to know what's loaded,
-    without exposing the full table."""
-
-    filename: str
-    uploaded_at: datetime.datetime | None
-    rule_count: int
 
 
 class CheckIn(BaseModel):

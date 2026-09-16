@@ -1,5 +1,6 @@
-"""Quick local smoke test for the shared-folders / admin model, the
-structured tone-of-address document, and the new check types. Uses
+"""Quick local smoke test for the shared-folders / admin model and the
+check types (register is now a plain report, not a document-gated
+pass/fail — see app.claude_client's register_value machinery). Uses
 a throwaway SQLite DB (no DATABASE_URL set) and no AI key, so only
 rule-based findings are expected, not AI ones."""
 import asyncio
@@ -78,15 +79,17 @@ check("non-admin create project blocked", client.post("/projects", json={"name":
 r = check("admin create project", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}))
 project_id = r.json()["id"]
 assert r.json()["created_by_name"] == "Александр"
-assert r.json()["tone_filename"] == ""
 
 check("duplicate project name", client.post("/projects", json={"name": "Pragmatic Play Promo", "manager_id": admin_id}), expect=409)
 
 # --- no more language folders: everything runs directly against the project ---
 import openpyxl
 
-# --- doc-gating: tone (register) check refuses to run until its doc exists ---
-check("tone (register) check blocked with no doc uploaded", client.post("/check", json={
+# --- register no longer needs any document at all (removed 2026-09-16 —
+# see models.Project's docstring): it used to 400 here with no Тон
+# обращения doc uploaded, now it just runs and reports the register it
+# finds, like any other check ---
+check("register check runs fine with no document at all (nothing to gate it any more)", client.post("/check", json={
     "source": "Play now.",
     "translation": "Играйте сейчас.",
     "checks": ["register"],
@@ -95,34 +98,11 @@ check("tone (register) check blocked with no doc uploaded", client.post("/check"
     "target_lang": "ru",
     "manager_name": "Мария",
     "manager_id": regular_id,
-}), expect=400)
+}))
 
-# --- Tone-of-address doc: real layout, matching the agency's actual
-# export — language codes as header-row columns, not one row per language
-# as originally assumed, with the register in the data row below each
-# column. "KZ" is the same country-code-style label the real file uses
-# for Kazakh.
-twb = openpyxl.Workbook()
-tws = twb.active
-tws.append(["EN", "RU", "KZ", "ES (MX)"])
-tws.append(["Формальное", "Формальное", "Формальное", "Неформальное"])
-tbuf = io.BytesIO()
-twb.save(tbuf)
-tbuf.seek(0)
-r = check("admin tone upload", client.post(
-    f"/projects/{project_id}/tone/upload",
-    files={"file": ("tone.xlsx", tbuf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": admin_id},
-))
-assert r.json()["rule_count"] == 4, r.json()
-
-# --- known languages (the checkbox catalog) is now its OWN list,
-# completely decoupled from the tone-of-address document — Александр
-# asked for the checkbox catalog to change ONLY on an explicit
-# add/remove, never as a side effect of uploading anything. Right after
-# a tone upload, the catalog is still empty: uploading a tone doc alone
-# no longer populates it. ---
-r = check("known languages is NOT auto-populated by a tone upload", client.get(f"/projects/{project_id}/known-languages"))
+# --- known languages (the checkbox catalog) starts empty and is built up
+# manually, one explicit add at a time ---
+r = check("known languages starts empty", client.get(f"/projects/{project_id}/known-languages"))
 assert r.json()["languages"] == [], r.json()
 
 # --- admin builds the catalog explicitly, one language at a time ---
@@ -267,37 +247,6 @@ print("[OK] global /language-aliases: open to every folder (add + delete), rejec
       "alias instead of silently overwriting what it used to mean, and a taught spelling rescues "
       "a column that regex rules alone could never recognize (even one containing a space)")
 
-# --- re-uploading the tone doc doesn't touch the catalog either (fully
-# decoupled in both directions) — rule_count changes, known-languages
-# doesn't ---
-tone_recheck_wb = openpyxl.Workbook()
-tone_recheck_ws = tone_recheck_wb.active
-tone_recheck_ws.append(["EN", "RU", "JA"])
-tone_recheck_ws.append(["Формальное", "Формальное", "Формальное"])
-tone_recheck_buf = io.BytesIO()
-tone_recheck_wb.save(tone_recheck_buf)
-tone_recheck_buf.seek(0)
-r = check("re-uploading the tone doc leaves the catalog untouched", client.post(
-    f"/projects/{project_id}/tone/upload",
-    files={"file": ("tone_reupload_check.xlsx", tone_recheck_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": admin_id},
-))
-assert r.json()["rule_count"] == 3, r.json()  # the tone doc itself DID change...
-r = check("catalog unchanged after tone re-upload", client.get(f"/projects/{project_id}/known-languages"))
-assert set(r.json()["languages"]) == {"ru", "es-mx", "en"}, r.json()  # ...but the catalog didn't
-
-# --- now that the tone doc exists, the previously-blocked check runs fine ---
-check("tone check now runs", client.post("/check", json={
-    "source": "Play now.",
-    "translation": "Играйте сейчас.",
-    "checks": ["register"],
-    "project_id": project_id,
-    "source_lang": "en",
-    "target_lang": "ru",
-    "manager_name": "Мария",
-    "manager_id": regular_id,
-}))
-
 # --- BOTH folders see the same shared project (no manager scoping) ---
 r = check("list projects (shared)", client.get("/projects"))
 assert len(r.json()) == 1
@@ -347,7 +296,7 @@ check("check with extra_instructions", client.post("/check", json={
 # manager only sees their own runs — point 1 of Александр's spec) ---
 r = check("history shows attribution", client.get(f"/projects/{project_id}/history", params={"manager_id": regular_id}))
 history = r.json()
-assert len(history) == 3  # tone + full-checks + extra_instructions check (double-space was standalone)
+assert len(history) == 3  # register-no-doc + full-checks + extra_instructions check (double-space was standalone)
 assert history[0]["performed_by_name"] == "Мария"
 assert history[0]["source_lang"] == "en" and history[0]["target_lang"] == "ru"
 print("   performed_by_name:", history[0]["performed_by_name"])
@@ -1057,7 +1006,7 @@ _weird_lang_buf = io.BytesIO()
 _weird_lang_wb.save(_weird_lang_buf)
 _weird_lang_buf.seek(0)
 _weird_sheets = _parse_workbook_direct(_weird_lang_buf.read())
-_weird_requests, _weird_skeleton = _build_batch_plan_direct(_weird_sheets, "en", ["typo"], "", {}, None)
+_weird_requests, _weird_skeleton = _build_batch_plan_direct(_weird_sheets, "en", ["typo"], "", None)
 _custom_id_pattern = _re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _bad_ids = [r["custom_id"] for r in _weird_requests if not _custom_id_pattern.match(r["custom_id"])]
 assert not _bad_ids, f"custom_id must always be Anthropic-safe, regardless of the file's own language codes: {_bad_ids}"
@@ -1214,35 +1163,18 @@ assert "ошибк" in r_auth.json()["detail"].lower() and "автор" in r_aut
 assert "временный сбой" not in r_auth.json()["detail"], r_auth.json()
 claude_client_mod._call_claude = _previous_call_claude
 
-# --- re-uploading the tone doc replaces it, doesn't accumulate ---
-twb3 = openpyxl.Workbook()
-tws3 = twb3.active
-tws3.append(["EN", "RU"])
-tws3.append(["Формальное", "Формальное"])
-tbuf3 = io.BytesIO()
-twb3.save(tbuf3)
-tbuf3.seek(0)
-r = check("admin re-uploads tone doc (replaces)", client.post(
-    f"/projects/{project_id}/tone/upload",
-    files={"file": ("tone2.xlsx", tbuf3, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": admin_id},
-))
-assert r.json()["rule_count"] == 2, r.json()
-
-# --- project template copy: new project starts with the same docs, fully
-# independent afterward (editing one never touches the other) ---
+# --- project template copy: new project starts with the same language
+# catalog, fully independent afterward (editing one never touches the
+# other) — used to also copy the tone-of-address doc, back when that
+# existed (removed 2026-09-16, see models.Project's docstring) ---
 r = check("create project copying requirements from the first", client.post(
     "/projects", json={"name": "LS Promo", "manager_id": admin_id, "copy_from_project_id": project_id}
 ))
 copy_project_id = r.json()["id"]
-assert r.json()["tone_filename"] == "tone2.xlsx", r.json()
 
-r = check("copied project's tone status matches source", client.get(f"/projects/{copy_project_id}/tone/status"))
-assert r.json()["rule_count"] == 2, r.json()
-
-# --- the copy must ALSO inherit the source project's language catalog —
-# without this, a project created "from" a template would start with a
-# usable tone doc but an empty, useless checkbox list ---
+# --- the copy must inherit the source project's language catalog —
+# without this, a project created "from" a template would start with an
+# empty, useless checkbox list ---
 r = check("copied project's language catalog also matches source", client.get(f"/projects/{copy_project_id}/known-languages"))
 assert set(r.json()["languages"]) == {"ru", "es-mx", "en", "ar", "kk", "pt-br"}, r.json()
 # and it's a genuinely independent copy — removing a language from the
@@ -1252,22 +1184,6 @@ check("removing a language from the copy", client.delete(
 ))
 r = check("original project's catalog is untouched by the copy's edit", client.get(f"/projects/{project_id}/known-languages"))
 assert "kk" in r.json()["languages"], r.json()
-
-# re-uploading the ORIGINAL project's tone doc must not affect the copy
-twb4 = openpyxl.Workbook()
-tws4 = twb4.active
-tws4.append(["EN", "RU", "ES (MX)"])
-tws4.append(["Формальное", "Формальное", "Неформальное"])
-tbuf4 = io.BytesIO()
-twb4.save(tbuf4)
-tbuf4.seek(0)
-check("re-upload original project's tone doc again", client.post(
-    f"/projects/{project_id}/tone/upload",
-    files={"file": ("tone3.xlsx", tbuf4, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"manager_id": admin_id},
-))
-r = check("copy's tone doc is untouched by the original's re-upload", client.get(f"/projects/{copy_project_id}/tone/status"))
-assert r.json()["rule_count"] == 2, r.json()
 
 # --- project deletion requires the admin's password ---
 check("delete project wrong password rejected", client.request(
@@ -1288,13 +1204,10 @@ r = check("managers survive re-migration", client.get("/managers"))
 assert len(r.json()) == 2
 r = check("projects survive re-migration", client.get("/projects"))
 assert len(r.json()) == 1
-r = check("tone doc survives re-migration", client.get(f"/projects/{project_id}/tone/status"))
-assert r.json()["rule_count"] == 3
 
 # --- unit tests: language-code granularity bridging (resolve_lang_code /
 # merge_lang_codes) ---
 from app.excel_multi import resolve_lang_code, merge_lang_codes
-from app.project_docs import parse_tone_workbook
 
 # exact match wins even when a base-subtag match would also be possible
 assert resolve_lang_code("ko-kr", ["ko-kr", "ko"]) == "ko-kr"
@@ -1468,24 +1381,6 @@ assert pick_source_lang([{"languages": ["kz", "en-001"]}], None) == "en-001"
 print("[OK] pick_source_lang: resolves the manager's chosen source language against "
       "a differently-granular spelling of the same language in the file, instead of "
       "silently falling back to English")
-
-# parse_tone_workbook: real layout is column-per-language, not
-# row-per-language as originally assumed — including a country-code
-# label ("KZ") and a combined "/"-separated header applying to two codes
-twb2 = openpyxl.Workbook()
-tws2 = twb2.active
-tws2.append(["EN", "RU", "KZ", "FR-CI / FR-FR", "ES (MX)"])
-tws2.append(["Формальное", "Формальное", "Формальное", "Неформальное", "Неформальное"])
-tbuf2 = io.BytesIO()
-twb2.save(tbuf2)
-tbuf2.seek(0)
-tone_rows = {r["lang_code"]: r["register"] for r in parse_tone_workbook(tbuf2.read())}
-assert tone_rows == {
-    "en": "formal", "ru": "formal", "kz": "formal",
-    "fr-ci": "informal", "fr-fr": "informal", "es-mx": "informal",
-}, tone_rows
-print("[OK] parse_tone_workbook: column-per-language layout (not row-per-language), "
-      "combined header split across both codes")
 
 # --- model tiering: confirmed "hard" languages get the stronger model,
 # matched by base subtag so any region variant of them qualifies too ---
@@ -1835,51 +1730,207 @@ assert set(sheet_limits["languages"]) == {"en", "ru"}, sheet_limits["languages"]
 print("[OK] parse_workbook: per-channel character-limit columns (\"label: number\"), a bare "
       "«Лимиты» header, and «ТЗ» are dropped silently rather than flagged as unrecognized languages")
 
-# --- register check fallback (no Тон обращения rule for this target
-# language) must not use the old "должен быть единым по всему тексту"
-# (must stay consistent) wording — Александр reported that exact failure
-# mode on 2026-09-16: five languages where EVERY row used the same wrong
-# register. That text IS internally consistent (just consistently wrong),
-# so a check that only looks for disagreement between rows can never catch
-# it. The fallback now has to ask for BOTH internal mixing and an
-# implausible-for-the-genre register, so a uniformly-wrong document has a
-# real chance of being flagged even with no project rule for that
-# language. ---
-from app.claude_client import _checks_description
+# --- register (tone of address) is no longer a document-gated pass/fail
+# check at all (removed 2026-09-16, at Александр's explicit request — see
+# models.Project's docstring): the old formal/informal-rule design could
+# be structurally blind to a translator using the SAME wrong register in
+# every single row (internally consistent, just consistently wrong — a
+# check that only looks for disagreement between rows can never catch
+# that). Replaced with a plain factual report of what's actually there,
+# which the manager reads and judges for themselves. ---
+from app.claude_client import (
+    REGISTER_VALUE_TYPE,
+    _checks_description,
+    _register_array_note,
+    _register_instructions,
+    summarize_register_values,
+)
 
-desc_no_rule = _checks_description(["register"], tone_register="", batch=True)
-assert "должен быть единым" not in desc_no_rule, desc_no_rule
-assert "не подходит характеру" in desc_no_rule, desc_no_rule
-assert "смешение форм" in desc_no_rule, desc_no_rule
-print("[OK] register check (batch/file mode) with no Тон обращения rule for this language asks the AI "
-      "to flag both internal ты/вы mixing AND a register implausible for the text's genre, instead of "
-      "the old \"must stay consistent\" wording that a uniformly-wrong document could never trigger")
+# _checks_description itself is now completely unaware of "register" —
+# it never appears in the "Что проверять" problem list.
+assert _checks_description(["register"]) is None, _checks_description(["register"])
+assert "регистр" not in (_checks_description(["register", "typo"]) or "").lower()
+print("[OK] _checks_description no longer mentions register at all — it's not an error-finding "
+      "check any more, so it never appears in the \"Что проверять\" problem list")
 
-# --- the single-pair path (standalone /check, SINGLE_PROMPT) must NOT get
-# the "смешение форм... даже если по остальным критериям ты оцениваешь
-# каждую пару отдельно" wording — that only makes sense with several pairs
-# of the same language visible together, which SINGLE_PROMPT never has (a
-# review pass caught this: the batch-only wording would otherwise leak into
-# a prompt that has no concept of "pairs" at all). ---
-desc_no_rule_single = _checks_description(["register"], tone_register="", batch=False)
-assert "должен быть единым" not in desc_no_rule_single, desc_no_rule_single
-assert "не подходит характеру" in desc_no_rule_single, desc_no_rule_single
-assert "смешение форм" not in desc_no_rule_single, desc_no_rule_single
-assert "пары" not in desc_no_rule_single, desc_no_rule_single
-print("[OK] register check (single-pair /check mode) with no Тон обращения rule only asks about "
-      "genre-implausibility, never the batch-only \"mixing across pairs\" wording that wouldn't make "
-      "sense with just one source/translation pair in view")
+# _register_instructions is the ENTIRE register-related prompt content now
+# — empty when register isn't selected, and never framed as a problem to
+# avoid or a mistake to flag when it is.
+assert _register_instructions(["typo"], batch=True) == ""
+batch_instr = _register_instructions(["register"], batch=True)
+assert REGISTER_VALUE_TYPE in batch_instr, batch_instr
+assert "НЕ находка об ошибке" in batch_instr, batch_instr
+assert '"row"' in batch_instr, batch_instr  # batch mode tags entries by row number
+single_instr = _register_instructions(["register"], batch=False)
+assert REGISTER_VALUE_TYPE in single_instr, single_instr
+assert '"row"' not in single_instr, single_instr  # single mode has exactly one pair, no row numbers
+assert _register_array_note(["typo"]) == ""
+assert _register_array_note(["register"]) != ""
+print("[OK] _register_instructions carries the entire register task now (empty when not selected, "
+      "explicitly framed as information-gathering rather than error-detection), and only the batch "
+      "(multi-row) prompt tags entries by row number")
 
-desc_formal = _checks_description(["register"], tone_register="formal")
-desc_informal = _checks_description(["register"], tone_register="informal")
-assert "формальный (вы/аналог)" in desc_formal, desc_formal
-assert "неформальный (ты/аналог)" in desc_informal, desc_informal
-assert "не подходит характеру" not in desc_formal, desc_formal
-print("[OK] register check with a resolved Тон обращения rule still uses the absolute per-row "
-      "formal/informal wording, unaffected by the no-rule fallback change above")
+# summarize_register_values: the actual Russian summary line the manager
+# reads. This is the function Александр's use case hinges on — his report
+# was five languages where EVERY row used the same wrong register, which
+# is exactly the "everywhere, no exceptions" case below.
+assert summarize_register_values({}) is None
+assert summarize_register_values({5: "formal", 12: "formal"}) == "везде на «вы»"
+assert summarize_register_values({1: "informal", 2: "informal", 3: "informal"}) == "везде на «ты»"
+# a genuine minority gets called out by row number
+mixed = summarize_register_values({1: "formal", 2: "formal", 3: "formal", 5: "informal", 12: "informal"})
+assert mixed == "везде на «вы», кроме: строки 5, 12", mixed
+# a SINGLE exception uses the singular "строка", not "строки" ("кроме:
+# строки 3" reads as a grammar mistake to a Russian speaker)
+single_exc = summarize_register_values({1: "formal", 2: "formal", 3: "informal"})
+assert single_exc == "везде на «вы», кроме: строка 3", single_exc
+# "neutral" rows (no direct address at all — a title, a number) are excluded
+# from the count entirely, not treated as a third camp
+assert summarize_register_values({1: "formal", 2: "neutral", 3: "formal"}) == "везде на «вы»"
+# nothing classifiable at all -> an honest "couldn't tell", not a guess
+assert summarize_register_values({1: "neutral", 2: "neutral"}) == (
+    "не удалось определить — в переведённых строках нет прямых обращений к пользователю"
+)
+# single-pair mode drops the "везде"/"кроме" framing (nothing to compare
+# a lone pair against)
+assert summarize_register_values({0: "formal"}, single=True) == "на «вы»"
+assert summarize_register_values({0: "informal"}, single=True) == "на «ты»"
+print("[OK] summarize_register_values: everywhere-the-same reports plainly, a genuine minority is "
+      "called out by row number, rows with no direct address are excluded from the count rather than "
+      "treated as a third camp, and single-pair mode drops the \"везде\"/\"кроме\" framing")
 
-assert "прямо просит сравнить пары между собой" in BATCH_PROMPT, BATCH_PROMPT
-print("[OK] BATCH_PROMPT's default \"check each pair separately\" instruction now explicitly allows "
-      "a specific criterion's own description to ask for cross-pair comparison instead")
+# --- end-to-end: the standalone /check endpoint actually produces a
+# "register_summary" finding from a mocked AI response, and — critically —
+# the raw register_value entry itself never leaks into the visible
+# findings (it's not a real problem, so it must never look like one) ---
+async def _fake_call_claude_register_single(prompt, model=None):
+    assert REGISTER_VALUE_TYPE in prompt
+    return (
+        f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal", "message": ""}}]',
+        {"input_tokens": 10, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_register_single
+r = check("register-only /check produces a register_summary, not a raw register_value", client.post(
+    "/check", json={"source": "Play now.", "translation": "Играйте сейчас.", "checks": ["register"]},
+))
+reg_findings = r.json()["findings"]
+assert len(reg_findings) == 1, reg_findings
+assert reg_findings[0]["type"] == "register_summary", reg_findings
+assert reg_findings[0]["message"] == "Тон обращения: на «вы».", reg_findings
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+print("[OK] standalone /check with only \"register\" selected turns a mocked AI response into a "
+      "single register_summary finding — the raw register_value entry never reaches the visible "
+      "findings list")
+
+# --- same wiring, but for a multi-check FILE upload's live (synchronous)
+# path — _check_language_for_sheet, the one place that actually knows the
+# excel_row for each checked row, is what turns the model's per-"row"
+# register_value entries into the "кроме: строки ..." exception list. Three
+# rows, one deliberately different from the other two, so the summary must
+# name exactly that row and no others. ---
+from app.excel_multi import _check_language_for_sheet
+
+_reg_sheet = {
+    "sheet_name": "Sheet1",
+    "languages": ["en", "ru"],
+    "rows": [
+        {"excel_row": 2, "context": "greeting", "max_length": None, "values": {"en": "Hello", "ru": "Привет"}},
+        {"excel_row": 3, "context": "farewell", "max_length": None, "values": {"en": "Bye", "ru": "Здарова, пока"}},
+        {"excel_row": 5, "context": "welcome", "max_length": None, "values": {"en": "Welcome", "ru": "Добро пожаловать"}},
+    ],
+}
+
+
+async def _fake_call_claude_register_batch(prompt, model=None):
+    assert REGISTER_VALUE_TYPE in prompt
+    return (
+        '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
+        '{"row": 2, "type": "register_value", "severity": "low", "value": "informal", "message": ""},'
+        '{"row": 3, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]',
+        {"input_tokens": 30, "output_tokens": 30},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_register_batch
+_reg_out, _reg_cost = asyncio.get_event_loop().run_until_complete(
+    _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert len(_reg_out) == 1, _reg_out  # nothing else had a real finding — just the one summary row
+assert _reg_out[0]["findings"][0]["type"] == "register_summary", _reg_out
+assert _reg_out[0]["findings"][0]["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_out
+assert not any(
+    f.get("type") == REGISTER_VALUE_TYPE for row in _reg_out for f in row["findings"]
+), "raw register_value must never reach the live multi-check path's visible findings"
+print("[OK] multi-check live path (_check_language_for_sheet): a mocked per-row register_value "
+      "response becomes one register_summary row naming the excel_row of the actual exception "
+      "(3 — the row deliberately given a different register than the other two), with no raw "
+      "register_value finding ever reaching the visible list")
+
+# --- and the Message-Batches (large-file) path — finalize_batch_results,
+# which merges a polled batch result back into the skeleton. Same
+# register_value entries, reached via the async-batch machinery instead of
+# an awaited call, must produce the identical summary. ---
+from app.excel_multi import build_batch_plan, finalize_batch_results
+
+_reg_requests, _reg_skeleton = build_batch_plan([_reg_sheet], "en", ["register"], "", None)
+assert len(_reg_requests) == 1, _reg_requests
+_reg_custom_id = _reg_requests[0]["custom_id"]
+_reg_batch_results = {
+    _reg_custom_id: {
+        "text": (
+            '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
+            '{"row": 2, "type": "register_value", "severity": "low", "value": "informal", "message": ""},'
+            '{"row": 3, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]'
+        ),
+        "usage": {"input_tokens": 30, "output_tokens": 30},
+        "result_type": "succeeded",
+        "stop_reason": "end_turn",
+    }
+}
+_reg_finalized = finalize_batch_results(_reg_skeleton, _reg_batch_results)
+_reg_lang_findings = _reg_finalized["sheets"][0]["languages"]["ru"]
+assert len(_reg_lang_findings) == 1, _reg_lang_findings
+assert _reg_lang_findings[0]["findings"][0]["type"] == "register_summary", _reg_lang_findings
+assert _reg_lang_findings[0]["findings"][0]["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_lang_findings
+assert not any(
+    f.get("type") == REGISTER_VALUE_TYPE for row in _reg_lang_findings for f in row["findings"]
+), "raw register_value must never reach the Message-Batches path's visible findings either"
+print("[OK] multi-check Message-Batches path (finalize_batch_results): the same polled register_value "
+      "response produces the identical register_summary, with the same excel_row exception and no raw "
+      "register_value finding reaching the visible list")
+
+# _count_real_findings: the "N проблем"/"N найдено" number shown across the
+# UI must never count the register_summary report as a problem — a check
+# that only ran "register" on an otherwise-clean document should say 0
+# problems, not 1 per language, or the whole point of dropping the old
+# pass/fail tone judgment is undone by the aggregate count alone.
+from app.excel_multi import _count_real_findings
+
+assert _count_real_findings([]) == 0
+assert _count_real_findings([{"findings": [{"type": "register_summary", "message": "..."}]}]) == 0
+assert _count_real_findings([
+    {"findings": [{"type": "typo", "message": "..."}]},
+    {"findings": [{"type": "register_summary", "message": "..."}]},
+]) == 1
+# a real finding riding alongside a register_summary row in the very same
+# row (shouldn't normally happen — they're separate synthetic rows — but
+# the count must still only drop the register_summary entry, not the row)
+assert _count_real_findings([
+    {"findings": [{"type": "typo", "message": "..."}, {"type": "register_summary", "message": "..."}]},
+]) == 1
+# truncation/AI-failure warnings ("system") are deliberately still counted
+# — those genuinely are something to notice, unlike the register report
+assert _count_real_findings([{"findings": [{"type": "system", "message": "..."}]}]) == 1
+print("[OK] _count_real_findings excludes the synthetic register_summary report from the \"N problems\" "
+      "count everywhere it's used, while still counting real findings and system warnings")
 
 print("\nALL SMOKETEST CHECKS PASSED")

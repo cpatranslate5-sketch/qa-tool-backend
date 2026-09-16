@@ -40,11 +40,9 @@ class Project(Base):
     """Shared/global — every folder sees the same set of projects. Only the
     admin folder can create one (see _require_admin in main.py). No more
     per-language sub-folders (removed — see the dropped ProjectLanguage
-    model): a project carries one optional reference document
-    (tone-of-address), gating its matching AI check until uploaded — see
-    app.main's _require_doc.
+    model) and, as of 2026-09-16, no more reference documents at all.
 
-    Two other documents existed here too but were removed:
+    Three documents used to live here, all removed in the end:
 
     - Numerals (number/currency/date format per language) — the AI check
       built on it kept misreading the document (currency identity vs.
@@ -55,42 +53,33 @@ class Project(Base):
       glossary or it doesn't, a plain text comparison), so letting a
       probabilistic model decide it was never the right tool to begin
       with, and it kept missing/mislabeling things as a result.
+    - Тон обращения (formal/informal register per language) — the register
+      check used to require this doc and flag a violation against it. But
+      a document that never covered every language, and a fallback for
+      the languages it didn't, meant the check could be structurally
+      blind to a translator using the SAME wrong register in every single
+      row (see app.claude_client's register_value machinery for the full
+      story) — Александр asked to drop the whole document and replace the
+      check with a plain factual report instead ("Тон обращения: везде на
+      «вы»", "...кроме: строки 5, 12"): no more pass/fail judgment call
+      for the AI to get wrong, just what register was actually used,
+      which the manager reads and judges for themselves.
 
-    Both were dropped rather than patched further — see git history for
-    the removal commits."""
+    All three were dropped rather than patched further — see git history
+    for the removal commits."""
 
     __tablename__ = "projects"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     created_by_name: Mapped[str] = mapped_column(String(120), default="")
-    tone_filename: Mapped[str] = mapped_column(String(300), default="")
-    tone_uploaded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
-    tone_rules: Mapped[list["ToneRule"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     language_catalog: Mapped[list["LanguageCatalogEntry"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
-
-
-class ToneRule(Base):
-    """One row of the project's "Тон обращения" doc: for a given language,
-    whether the required register is formal or informal."""
-
-    __tablename__ = "tone_rules"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), nullable=False)
-    lang_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    # "formal" or "informal" — parsed from the doc's Russian wording.
-    register: Mapped[str] = mapped_column(String(20), default="")
-
-    project: Mapped["Project"] = relationship(back_populates="tone_rules")
-
-    __table_args__ = (UniqueConstraint("project_id", "lang_code", name="uq_tone_rule_per_project_lang"),)
 
 
 class LanguageCatalogEntry(Base):
@@ -99,16 +88,16 @@ class LanguageCatalogEntry(Base):
     built from (see app.main's /projects/{id}/known-languages and
     /projects/{id}/languages).
 
-    Deliberately its OWN table, separate from ToneRule: Александр asked
-    for this list to change ONLY when he explicitly adds or removes a
-    language — never as a side effect of uploading a Tone-of-address
-    document (which is about register content, not catalog membership)
-    or a file to check (which used to get unioned into this same list
-    automatically — that's exactly what let a mislabeled column like a
-    stray "PR" silently show up as a real target language with Peru's
-    flag). See app.database._run_migrations for the one-time backfill
-    that seeds this table from each project's existing tone_rules the
-    first time this table is created, so upgrading doesn't blank out
+    Deliberately its OWN table, separate from the now-removed ToneRule:
+    Александр asked for this list to change ONLY when he explicitly adds
+    or removes a language — never as a side effect of uploading a
+    Tone-of-address document (back when that existed — see Project's
+    docstring) or a file to check (which used to get unioned into this
+    same list automatically — that's exactly what let a mislabeled
+    column like a stray "PR" silently show up as a real target language
+    with Peru's flag). See app.database._run_migrations for the one-time
+    backfill that seeded this table from each project's tone_rules the
+    first time this table was created, so upgrading never blanked out
     anyone's already-built checkbox list."""
 
     __tablename__ = "language_catalog"

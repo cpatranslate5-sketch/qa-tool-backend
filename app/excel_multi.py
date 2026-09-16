@@ -11,6 +11,7 @@ import re
 import openpyxl
 
 from app.claude_client import (
+    REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
     _model_for_lang,
@@ -24,6 +25,7 @@ from app.claude_client import (
     group_batch_findings,
     parse_json_array,
     run_ai_checks_batch,
+    summarize_register_values,
 )
 from app.rule_checks import run_rule_checks
 
@@ -578,6 +580,71 @@ def pick_source_lang(sheets: list[dict], preferred: str | None) -> str:
     return sorted(all_langs)[0] if all_langs else "en"
 
 
+def _extract_register_values(grouped: dict[int, list[dict]]) -> tuple[dict[int, list[dict]], dict[int, str]]:
+    """Pulls REGISTER_VALUE_TYPE entries (see app.claude_client) out of a
+    {item index: [finding, ...]} dict, returning (the same dict with those
+    entries removed, {index: value}). Used by both the live path
+    (_check_language_for_sheet below) and the Message-Batches finalize
+    path (finalize_batch_results further down) — both end up with the
+    model's raw response in exactly this shape, just reached differently
+    (an already-awaited call here vs. a polled batch result there).
+
+    Must run BEFORE either caller's "if findings: show this row" check —
+    a register_value entry exists for every checked row regardless of
+    whether there's a real problem, so leaving it in would make every
+    single row look like it has a finding."""
+    cleaned: dict[int, list[dict]] = {}
+    values: dict[int, str] = {}
+    for idx, findings in grouped.items():
+        kept = []
+        for f in findings:
+            if f.get("type") == REGISTER_VALUE_TYPE:
+                v = f.get("value")
+                if v in ("formal", "informal", "neutral"):
+                    values[idx] = v
+            else:
+                kept.append(f)
+        if kept:
+            cleaned[idx] = kept
+    return cleaned, values
+
+
+def _count_real_findings(findings_list: list[dict]) -> int:
+    """The "N проблем"/"N найдено" count shown across the UI (multi-check
+    headline, per-language row counts, history list) — every real finding,
+    EXCLUDING the synthetic register_summary report appended by
+    _register_summary_block below. That report is a factual "here's the
+    tone actually used" note, not a problem to fix, so a check that only
+    ran "register" on an otherwise clean document must report 0 problems,
+    not 1 per language — counting it here would contradict the whole point
+    of dropping the old pass/fail tone-of-address judgment. Truncation/
+    AI-failure warnings (type "system") are deliberately still counted —
+    those genuinely are something the manager needs to notice."""
+    return sum(
+        1
+        for row in findings_list
+        for f in row["findings"]
+        if f.get("type") != "register_summary"
+    )
+
+
+def _register_summary_block(summary: str | None) -> dict | None:
+    """The synthetic "row" a per-language register report rides in as —
+    same pattern already used for _truncation_warning/_ai_failure_warning
+    (excel_row=0, a recognizable pseudo-context instead of a real row).
+    None when there's nothing to report (register wasn't selected, or no
+    register_value entries came back at all)."""
+    if summary is None:
+        return None
+    return {
+        "excel_row": 0,
+        "context": "ℹ️ Тон обращения",
+        "source": "",
+        "translation": "",
+        "findings": [{"type": "register_summary", "severity": "low", "message": f"Тон обращения: {summary}."}],
+    }
+
+
 async def _check_language_for_sheet(
     sheet: dict,
     lang: str,
@@ -585,7 +652,6 @@ async def _check_language_for_sheet(
     checks: list[str],
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
-    tone_register: str = "",
 ) -> tuple[list[dict], float]:
     relevant_rows = []
     ai_items = []
@@ -604,8 +670,9 @@ async def _check_language_for_sheet(
 
     async with semaphore:
         ai_findings_by_idx, cost_usd, truncated = await run_ai_checks_batch(
-            ai_items, checks, extra_instructions, tone_register, lang, source_lang
+            ai_items, checks, extra_instructions, lang, source_lang
         )
+    ai_findings_by_idx, register_values_by_idx = _extract_register_values(ai_findings_by_idx)
 
     out = []
     for idx, row in enumerate(relevant_rows):
@@ -634,6 +701,11 @@ async def _check_language_for_sheet(
             "translation": "",
             "findings": [_truncation_warning()],
         })
+    if "register" in checks:
+        by_excel_row = {relevant_rows[idx]["excel_row"]: v for idx, v in register_values_by_idx.items()}
+        block = _register_summary_block(summarize_register_values(by_excel_row))
+        if block is not None:
+            out.append(block)
     return out, cost_usd
 
 
@@ -642,21 +714,16 @@ async def run_multi_check(
     source_lang: str,
     checks: list[str],
     extra_instructions: str = "",
-    tone_for_lang=None,
     target_langs_filter: set[str] | None = None,
 ) -> dict:
     """
-    tone_for_lang: a callable(lang_code) -> "formal"/"informal"/"" (or ""
-    if nothing for that language), already narrowed to just what this one
-    target language needs — see app.project_docs. Each target language gets
-    its own call, so the AI prompt for e.g. "es-mx" never carries the other
-    34 languages' rows.
+    Each target language gets its own AI call, so the prompt for e.g.
+    "es-mx" never carries the other 34 languages' rows.
 
     target_langs_filter: when given, only these languages are checked even
     if the file has more columns — lets a manager check a subset of a
     large upload instead of every language every time.
     """
-    tone_for_lang = tone_for_lang or (lambda lang: "")
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
     total_findings = 0
@@ -668,10 +735,7 @@ async def run_multi_check(
         if target_langs_filter is not None:
             target_langs = [l for l in target_langs if _lang_selected(l, target_langs_filter)]
         tasks = [
-            _check_language_for_sheet(
-                sheet, lang, source_lang, checks, extra_instructions, semaphore,
-                tone_for_lang(lang),
-            )
+            _check_language_for_sheet(sheet, lang, source_lang, checks, extra_instructions, semaphore)
             for lang in target_langs
         ]
         per_lang_results = await asyncio.gather(*tasks) if tasks else []
@@ -679,7 +743,7 @@ async def run_multi_check(
         languages_out = {}
         for lang, (findings_list, lang_cost) in zip(target_langs, per_lang_results):
             languages_out[lang] = findings_list
-            total_findings += sum(len(f["findings"]) for f in findings_list)
+            total_findings += _count_real_findings(findings_list)
             total_cost_usd += lang_cost
 
         total_rows_checked += len(sheet["rows"])
@@ -741,7 +805,6 @@ def build_batch_plan(
     source_lang: str,
     checks: list[str],
     extra_instructions: str = "",
-    tone_for_lang=None,
     target_langs_filter: set[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """Prepares everything needed to submit one Anthropic Message Batch
@@ -755,7 +818,6 @@ def build_batch_plan(
     types were selected at all, in which case there's nothing to submit and
     finalize_batch_results(skeleton, {}) is already the final answer.
     """
-    tone_for_lang = tone_for_lang or (lambda lang: "")
     requests: list[dict] = []
     skeleton_sheets = []
 
@@ -806,8 +868,7 @@ def build_batch_plan(
             custom_id = f"s{s_idx}-t{lang_idx}"
             model = _model_for_lang(lang)
             prompt, number_to_index = build_batch_prompt(
-                ai_items, checks, extra_instructions,
-                tone_for_lang(lang), lang, source_lang,
+                ai_items, checks, extra_instructions, lang, source_lang,
             )
             if prompt is not None:
                 requests.append({"custom_id": custom_id, "prompt": prompt, "model": model})
@@ -886,6 +947,8 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                 if ai_result is not None:
                     total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
 
+            ai_grouped, register_values_by_idx = _extract_register_values(ai_grouped)
+
             findings_list = []
             for idx, row in enumerate(lang_skel["rows"]):
                 findings = list(row["findings"]) + ai_grouped.get(idx, [])
@@ -905,8 +968,15 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                     "translation": "",
                     "findings": [warning_finding],
                 })
+            if "register" in skeleton.get("checks", []):
+                by_excel_row = {
+                    lang_skel["rows"][idx]["excel_row"]: v for idx, v in register_values_by_idx.items()
+                }
+                block = _register_summary_block(summarize_register_values(by_excel_row))
+                if block is not None:
+                    findings_list.append(block)
             languages_out[lang] = findings_list
-            total_findings += sum(len(f["findings"]) for f in findings_list)
+            total_findings += _count_real_findings(findings_list)
 
         total_rows_checked += sheet["row_count"]
         result_sheets.append({

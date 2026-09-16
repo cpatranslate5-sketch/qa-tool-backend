@@ -70,11 +70,10 @@ def _run_migrations():
             # The structured glossary (glossary_filename/glossary_uploaded_at
             # + the glossary_terms table) was later removed entirely too —
             # see the migration further below that drops it, alongside
-            # Numerals. Tone-of-address is the only reference document left.
-            if "tone_filename" not in cols:
-                conn.execute(text("ALTER TABLE projects ADD COLUMN tone_filename VARCHAR(300) NOT NULL DEFAULT ''"))
-            if "tone_uploaded_at" not in cols:
-                conn.execute(text("ALTER TABLE projects ADD COLUMN tone_uploaded_at TIMESTAMPTZ"))
+            # Numerals. Tone-of-address (tone_filename/tone_uploaded_at) was
+            # the last reference document, dropped 2026-09-16 — see the
+            # dedicated migration further below rather than an ADD-COLUMN
+            # here, since Project no longer has these fields at all.
 
     # Very old shape only (projects used to be owned by one manager) — if
     # this ever fires, there's genuinely nothing compatible to preserve, so
@@ -295,6 +294,29 @@ def _run_migrations():
                     "added_by_name VARCHAR(120) NOT NULL DEFAULT '', "
                     "created_at TIMESTAMP)"
                 ))
+
+    # Тон обращения (the register document) is removed entirely, 2026-09-16
+    # — Александр asked to drop it and have the register check report the
+    # actually-used tone instead of judging it against a per-language rule
+    # (see models.Project's docstring, and app.claude_client's
+    # register_value/summarize_register_values). The table and the two
+    # project columns that tracked its upload are dropped here; nothing
+    # else (the language catalog already has its own table, backfilled
+    # from tone_rules long ago by the migration above — this runs after
+    # that block specifically so a not-yet-migrated install still gets its
+    # one-time backfill before the source table disappears).
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if "tone_rules" in existing_tables:
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS tone_rules{cascade}"))
+    if "projects" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("projects")}
+        with engine.begin() as conn:
+            if "tone_filename" in cols:
+                conn.execute(text("ALTER TABLE projects DROP COLUMN tone_filename"))
+            if "tone_uploaded_at" in cols:
+                conn.execute(text("ALTER TABLE projects DROP COLUMN tone_uploaded_at"))
 
 
 def _ensure_admin_exists():

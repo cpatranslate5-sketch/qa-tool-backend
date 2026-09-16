@@ -5,6 +5,20 @@ import httpx
 
 from app.config import settings
 
+# "register" (tone of address) is NOT in here — as of 2026-09-16 it isn't
+# an error-finding check at all any more, so it never appears in the
+# "Что проверять" problem list _checks_description builds from this dict.
+# It used to require Александр to upload a "Тон обращения" document naming
+# the correct formal/informal register per language, and flag a violation
+# against it — but that meant the check could be structurally blind to a
+# translator using the SAME wrong register in every single row (uniform
+# ≠ correct, but a rule that only looks for internal disagreement can't
+# tell the two apart). Александр asked to drop the whole document and
+# have the check report the register actually used instead of judging it
+# — see REGISTER_VALUE_TYPE, _register_instructions, and
+# summarize_register_values below for the replacement, and
+# _allowed_ai_types for how "register_value" gets recognized as a valid
+# response type only when "register" is one of the selected checks.
 CHECK_LABELS = {
     # (A "glossary" check used to live here too — required-term matching
     # against an uploaded glossary document. Removed: unlike the other AI
@@ -12,13 +26,6 @@ CHECK_LABELS = {
     # either matches the glossary or it doesn't, a plain text comparison —
     # so it kept missing/mislabeling things for no good reason. See git
     # history for the removal.)
-    # "register"'s value here is never actually read — _checks_description
-    # below always special-cases "register" itself (either the resolved
-    # formal/informal wording, or _REGISTER_NO_RULE_LABEL) before it would
-    # fall through to CHECK_LABELS[c]. The key still has to exist, though:
-    # membership in this dict is what marks "register" as a valid AI check
-    # type at all (see ai_checks/_allowed_ai_types below).
-    "register": None,
     "typo": (
         "опечатки/ошибки — это ДВЕ разные вещи, обе входят сюда: (1) обычные опечатки и орфографические ошибки в "
         "самом переводе — неправильно написанное слово, даже если смысл всё равно понятен из контекста (например "
@@ -99,9 +106,9 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 ни под каким из перечисленных типов; для неё есть отдельная проверка, которую нужно включить отдельно. Не подгоняй
 такую находку под ближайший по смыслу разрешённый тип только потому, что это единственный доступный вариант —
 если находка не является настоящим примером именно этого критерия, её не должно быть в ответе.
-
+{register_instructions}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
-(пустой массив [], если проблем нет):
+(пустой массив [], если проблем нет{register_array_note}):
 [
   {{"type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
 ]"""
@@ -127,9 +134,9 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 
 Пары для проверки:
 {pairs_block}
-
+{register_instructions}
 Верни ТОЛЬКО валидный JSON-массив по всем парам без markdown и пояснений, строго в этой форме
-(пустой массив [], если нигде нет проблем; не включай пары без проблем):
+(пустой массив [], если нигде нет обычных находок; не включай пары без обычных находок{register_array_note}):
 [
   {{"row": <номер пары из списка выше>, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском"}}
 ]"""
@@ -180,75 +187,123 @@ def _target_lang_line(target_lang: str) -> str:
     return f"Целевой язык перевода: {code}. Ориентируйся конкретно на этот язык — не путай с родственными языками."
 
 
-_REGISTER_NO_RULE_LABEL_GENRE_ONLY = (
-    "регистр обращения (ты/вы и аналоги) — для этого языка нет заданного правила в документе «Тон обращения», "
-    "поэтому сообщай, только если использованная форма явно не подходит характеру текста для этого языка "
-    "(например, подчёркнуто неформальное «ты» в официальном/деловом/юридическом документе, или излишне "
-    "формальное «вы» там, где по смыслу и жанру ожидается неформальное обращение) — ориентируйся на обычные "
-    "нормы этого языка и жанра, раз проектного правила нет."
-)
-
-# Batch (multi-pair) version adds a second thing to check for that only
-# makes sense when several pairs of the same language are visible together
-# in one prompt: a mix of «ты» and «вы» forms across them. SINGLE_PROMPT
-# only ever carries one source/translation pair at a time (no "pairs" — see
-# app.main's standalone /check endpoint), so that half is meaningless there
-# and _checks_description below never appends it to a single-pair prompt.
-_REGISTER_NO_RULE_LABEL_BATCH = (
-    "регистр обращения (ты/вы и аналоги) — для этого языка нет заданного правила в документе «Тон обращения», "
-    "поэтому сообщай о ДВУХ разных вещах: (1) смешение форм внутри ЭТОГО целевого языка — где-то «ты», где-то "
-    "«вы» (учитывай ВСЕ пары этого языка вместе для этого пункта, даже если по остальным критериям ты "
-    "оцениваешь каждую пару отдельно); (2) форма, которая целиком, во всех парах, явно не подходит характеру "
-    "текста для этого языка (например, подчёркнуто неформальное «ты» в официальном/деловом/юридическом "
-    "документе, или излишне формальное «вы» там, где по смыслу и жанру ожидается неформальное обращение) — "
-    "ориентируйся на обычные нормы этого языка и жанра, раз проектного правила нет."
-)
-
-
-def _checks_description(checks: list[str], tone_register: str = "", batch: bool = True) -> str | None:
-    """tone_register comes from the project's actual Tone-of-address
-    document for this specific target language (see app.main's per-language
-    lookup) — never guessed by the model. batch=True for build_batch_prompt
-    (BATCH_PROMPT, several pairs of one language visible together);
-    batch=False for run_ai_checks (SINGLE_PROMPT, exactly one pair — the
-    standalone /check endpoint) — this only changes the no-rule register
-    wording (see the two _REGISTER_NO_RULE_LABEL_* constants above); every
-    other check type's label is identical either way.
-
-    When tone_register is empty (no rule for this language — see
-    app.main._tone_lookup), this used to fall back to CHECK_LABELS["register"]'s
-    generic "должен быть единым по всему тексту" (must stay consistent
-    throughout) wording. That phrasing is structurally blind to exactly the
-    failure Александр reported on 2026-09-16: five languages where EVERY row
-    used the same wrong register. Text like that genuinely IS internally
-    consistent — it's just consistently wrong — so a check that only looks
-    for disagreement between rows can never fire on it; whether anything got
-    flagged then depended entirely on the model separately guessing there
-    was a problem from its own judgment, which is exactly the "то находит,
-    то нет" instability he saw. The batch fallback now asks for both internal
-    mixing AND a register that's implausible for the text's apparent genre,
-    so a uniformly-wrong document has a real chance of being caught even
-    without a project rule for that language; the single-pair fallback asks
-    only about genre-implausibility, since "internal mixing" isn't a
-    coherent question with just one pair in view. The right permanent fix is
-    still adding that language to the Тон обращения document — this makes
-    the check an absolute per-row rule with no guessing at all — but this
-    fallback should not be helpless in the meantime."""
+def _checks_description(checks: list[str]) -> str | None:
+    """The "Что проверять: ..." problem list — deliberately unaffected by
+    "register", which was removed from CHECK_LABELS entirely on 2026-09-16
+    (see that dict's own comment) and is instead handled by
+    _register_instructions/_register_array_note below, as a completely
+    separate, clearly-delineated task ("report what's there", not "find
+    what's wrong") rather than one more entry in this problem list."""
     ai_checks = [c for c in checks if c in CHECK_LABELS]
     if not ai_checks:
         return None
+    return "; ".join(CHECK_LABELS[c] for c in ai_checks) or None
 
-    labels = []
-    for c in ai_checks:
-        if c == "register" and tone_register.strip() in ("formal", "informal"):
-            word = "формальный (вы/аналог)" if tone_register.strip() == "formal" else "неформальный (ты/аналог)"
-            labels.append(f"регистр обращения — для этого языка должен быть {word} по всему тексту")
-        elif c == "register":
-            labels.append(_REGISTER_NO_RULE_LABEL_BATCH if batch else _REGISTER_NO_RULE_LABEL_GENRE_ONLY)
-        else:
-            labels.append(CHECK_LABELS[c])
 
-    return "; ".join(labels) if labels else None
+# The "register" (tone of address) response entries are never a "problem" —
+# see CHECK_LABELS's comment for why this replaced the old formal/informal
+# rule-and-violation design on 2026-09-16. REGISTER_VALUE_TYPE is the
+# "type" the model uses for these entries so downstream code
+# (_allowed_ai_types here; the extraction helpers in app.excel_multi and
+# in run_ai_checks below) can tell them apart from a real finding and
+# route them to the report instead of the visible findings list.
+REGISTER_VALUE_TYPE = "register_value"
+
+
+def _register_instructions(checks: list[str], batch: bool) -> str:
+    """Empty string when "register" isn't selected (nothing added to the
+    prompt at all). Otherwise, a clearly separate paragraph — deliberately
+    NOT folded into the "Что проверять" problem list _checks_description
+    builds — asking the model to classify the register actually used, for
+    every pair, regardless of whether it's "correct": this is
+    information-gathering, not error-detection, so it must never be
+    described to the model as a problem to avoid or a mistake to flag.
+
+    batch=True (BATCH_PROMPT, several pairs of one language visible
+    together) asks for one entry per pair, tagged by row number, matching
+    that prompt's existing "row" numbering. batch=False (SINGLE_PROMPT,
+    exactly one pair — the standalone /check endpoint) asks for exactly
+    one entry with no row number, since that prompt's own findings don't
+    carry one either."""
+    if "register" not in checks:
+        return ""
+    if batch:
+        return (
+            "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, "
+            "как переведено на самом деле: добавь в тот же JSON-массив ОДНУ дополнительную запись на КАЖДУЮ "
+            "пару из списка «Пары для проверки» выше, даже если для неё нет ни одной обычной находки, "
+            f'строго в форме {{"row": <номер пары>, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", '
+            '"value": "formal|informal|neutral", "message": ""} — value: "formal", если в ПЕРЕВОДЕ этой пары '
+            'использовано обращение на «вы» (или аналог для этого языка); "informal", если на «ты»; '
+            '"neutral", если в переводе этой конкретной пары нет прямого обращения к пользователю вообще '
+            '(например, только название, число, техническая метка) — тогда не угадывай по смыслу, отвечай '
+            '"neutral". Это НЕ находка об ошибке — не описывай её как проблему, не оценивай, правильная это '
+            "форма или нет, просто зафиксируй, что реально написано в переводе.\n"
+        )
+    return (
+        "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, как "
+        "переведено на самом деле: добавь в тот же JSON-массив ОДНУ дополнительную запись, строго в форме "
+        f'{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal|informal|neutral", '
+        '"message": ""} — value: "formal", если в переводе использовано обращение на «вы» (или аналог для '
+        'этого языка); "informal", если на «ты»; "neutral", если в переводе нет прямого обращения к '
+        'пользователю вообще — тогда не угадывай по смыслу, отвечай "neutral". Это НЕ находка об ошибке — не '
+        "описывай её как проблему, не оценивай, правильная это форма или нет, просто зафиксируй, что реально "
+        "написано в переводе.\n"
+    )
+
+
+def _register_array_note(checks: list[str]) -> str:
+    """Appended to the "(пустой массив [] ...)" output-format line so it
+    stays true once _register_instructions adds its own mandatory entries
+    — without this, "пустой массив, если проблем нет" would directly
+    contradict "add one entry per pair regardless" a few lines above it."""
+    if "register" not in checks:
+        return ""
+    return " — но если выбран регистр обращения, эти дополнительные записи всё равно обязательны"
+
+
+def summarize_register_values(values: dict, single: bool = False) -> str | None:
+    """values: {label: "formal"|"informal"|"neutral"}, one entry per
+    classified row — label is whatever the caller uses to identify a row
+    (an excel_row number for a multi-check language; anything at all for
+    a single-pair check, since there's only ever one label there). Returns
+    a ready-to-show Russian clause (no "Тон обращения:" prefix, no
+    trailing period — callers add those) describing the register actually
+    used, or None if there's nothing to report at all (no register_value
+    entries came back — e.g. "register" wasn't selected, or the AI call
+    itself failed and _extract_register_values in app.excel_multi never
+    got anything to extract).
+
+    single=True drops the "везде"/"кроме" multi-row framing in favour of a
+    plain "на «вы»"/"на «ты»" clause — "everywhere" reads oddly to
+    describe a single pair.
+
+    A tie between formal and informal counts (equally split, no real
+    majority) resolves to whichever value happened to appear first in
+    `values` — deterministic for a given input, but arbitrary as a
+    judgment call; a near-even split is exactly the case where the
+    manager most needs to look at the actual rows themselves anyway, not
+    trust a one-line summary."""
+    if not values:
+        return None
+    classified = {k: v for k, v in values.items() if v in ("formal", "informal")}
+    if not classified:
+        return "не удалось определить — в переведённых строках нет прямых обращений к пользователю"
+    if single:
+        only_value = next(iter(classified.values()))
+        return "на «вы»" if only_value == "formal" else "на «ты»"
+
+    counts: dict[str, int] = {}
+    for v in classified.values():
+        counts[v] = counts.get(v, 0) + 1
+    majority_value = max(counts, key=lambda v: counts[v])
+    majority_word = "вы" if majority_value == "formal" else "ты"
+    exceptions = sorted(k for k, v in classified.items() if v != majority_value)
+    if not exceptions:
+        return f"везде на «{majority_word}»"
+    exceptions_str = ", ".join(str(e) for e in exceptions)
+    row_word = "строка" if len(exceptions) == 1 else "строки"
+    return f"везде на «{majority_word}», кроме: {row_word} {exceptions_str}"
 
 
 def _allowed_ai_types(checks: list[str]) -> set[str]:
@@ -258,8 +313,15 @@ def _allowed_ai_types(checks: list[str]) -> set[str]:
     tells the model to check only these, but a model doesn't always listen
     perfectly (a glaring, unrelated problem can slip through anyway), so
     this guarantees a check the manager didn't ask for never shows up in
-    the results, rather than just hoping the prompt was followed."""
-    return {c for c in checks if c in CHECK_LABELS}
+    the results, rather than just hoping the prompt was followed.
+
+    REGISTER_VALUE_TYPE is added on top of CHECK_LABELS' own keys (rather
+    than living in CHECK_LABELS itself) because it isn't a problem type at
+    all — see that dict's comment — so it needs its own opt-in here."""
+    allowed = {c for c in checks if c in CHECK_LABELS}
+    if "register" in checks:
+        allowed.add(REGISTER_VALUE_TYPE)
+    return allowed
 
 
 def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[dict]:
@@ -462,13 +524,23 @@ def _ai_failure_warning(reason: str) -> dict:
 
 async def run_ai_checks(
     source: str, translation: str, checks: list[str], extra_instructions: str = "",
-    tone_register: str = "", target_lang: str = "", source_lang: str = "",
+    target_lang: str = "", source_lang: str = "",
 ) -> tuple[list[dict], float]:
     """Returns (findings, cost_usd) — cost_usd is this one API call's actual
     cost from Anthropic's reported token usage (0.0 when no AI check ran,
-    e.g. no API key configured or nothing to check against)."""
-    checks_description = _checks_description(checks, tone_register, batch=False)
-    if not checks_description:
+    e.g. no API key configured or nothing to check against).
+
+    checks_description being empty (nothing to check at all) short-circuits
+    before even considering register — but note that "register" alone
+    (with no other AI check selected) still needs a real API call: unlike
+    the other checks, it has no CHECK_LABELS entry of its own, so
+    _checks_description('register' only) legitimately returns None while
+    _register_instructions still has something to ask for. Guarded
+    against below by checking checks_description OR "register" in checks,
+    not just checks_description alone."""
+    checks_description = _checks_description(checks)
+    register_instructions = _register_instructions(checks, batch=False)
+    if not checks_description and not register_instructions:
         return [], 0.0
 
     prompt = SINGLE_PROMPT.format(
@@ -478,7 +550,9 @@ async def run_ai_checks(
         source=source,
         translation=translation,
         extra_instructions=extra_instructions.strip() or "нет",
-        checks_description=checks_description,
+        checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
+        register_instructions=register_instructions,
+        register_array_note=_register_array_note(checks),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
     )
     model = _model_for_lang(target_lang)
@@ -486,6 +560,19 @@ async def run_ai_checks(
     findings = _filter_findings_by_checks(parse_json_array(text_block), checks)
     if stop_reason == "max_tokens":
         findings = findings + [_truncation_warning()]
+
+    if "register" in checks:
+        register_findings = [f for f in findings if f.get("type") == REGISTER_VALUE_TYPE]
+        findings = [f for f in findings if f.get("type") != REGISTER_VALUE_TYPE]
+        value = register_findings[0].get("value") if register_findings else None
+        summary = summarize_register_values({0: value} if value else {}, single=True)
+        if summary is not None:
+            findings.append({
+                "type": "register_summary",
+                "severity": "low",
+                "message": f"Тон обращения: {summary}.",
+            })
+
     return findings, _usage_cost(model, usage)
 
 
@@ -493,7 +580,6 @@ def build_batch_prompt(
     items: list[dict],
     checks: list[str],
     extra_instructions: str = "",
-    tone_register: str = "",
     target_lang: str = "",
     source_lang: str = "",
 ) -> tuple[str | None, dict[int, int]]:
@@ -514,8 +600,9 @@ def build_batch_prompt(
     back to the caller's original item indices — pass it to
     group_batch_findings once you have the model's response.
     """
-    checks_description = _checks_description(checks, tone_register)
-    if not checks_description:
+    checks_description = _checks_description(checks)
+    register_instructions = _register_instructions(checks, batch=True)
+    if not checks_description and not register_instructions:
         return None, {}
 
     checkable = [(i, it) for i, it in enumerate(items) if it["translation"].strip()]
@@ -533,7 +620,9 @@ def build_batch_prompt(
         calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang),
         extra_instructions=extra_instructions.strip() or "нет",
-        checks_description=checks_description,
+        checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
+        register_instructions=register_instructions,
+        register_array_note=_register_array_note(checks),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
         pairs_block=pairs_block,
     )
@@ -559,7 +648,6 @@ async def run_ai_checks_batch(
     items: list[dict],
     checks: list[str],
     extra_instructions: str = "",
-    tone_register: str = "",
     target_lang: str = "",
     source_lang: str = "",
 ) -> tuple[dict[int, list[dict]], float, bool]:
@@ -567,9 +655,14 @@ async def run_ai_checks_batch(
     returns (findings keyed by index into items, this call's cost_usd,
     whether the response was truncated by the max_tokens ceiling — the
     caller adds a visible warning for that rather than presenting a
-    partial result as a complete one)."""
+    partial result as a complete one).
+
+    Findings keyed by index here still include any REGISTER_VALUE_TYPE
+    entries mixed in with real findings — app.excel_multi extracts and
+    summarizes those itself (it's the one with the excel_row numbers to
+    label them with), not this function."""
     prompt, number_to_index = build_batch_prompt(
-        items, checks, extra_instructions, tone_register, target_lang, source_lang
+        items, checks, extra_instructions, target_lang, source_lang
     )
     if prompt is None:
         return {}, 0.0, False
