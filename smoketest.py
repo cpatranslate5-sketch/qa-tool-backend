@@ -1835,4 +1835,51 @@ assert set(sheet_limits["languages"]) == {"en", "ru"}, sheet_limits["languages"]
 print("[OK] parse_workbook: per-channel character-limit columns (\"label: number\"), a bare "
       "«Лимиты» header, and «ТЗ» are dropped silently rather than flagged as unrecognized languages")
 
+# --- register check fallback (no Тон обращения rule for this target
+# language) must not use the old "должен быть единым по всему тексту"
+# (must stay consistent) wording — Александр reported that exact failure
+# mode on 2026-09-16: five languages where EVERY row used the same wrong
+# register. That text IS internally consistent (just consistently wrong),
+# so a check that only looks for disagreement between rows can never catch
+# it. The fallback now has to ask for BOTH internal mixing and an
+# implausible-for-the-genre register, so a uniformly-wrong document has a
+# real chance of being flagged even with no project rule for that
+# language. ---
+from app.claude_client import _checks_description
+
+desc_no_rule = _checks_description(["register"], tone_register="", batch=True)
+assert "должен быть единым" not in desc_no_rule, desc_no_rule
+assert "не подходит характеру" in desc_no_rule, desc_no_rule
+assert "смешение форм" in desc_no_rule, desc_no_rule
+print("[OK] register check (batch/file mode) with no Тон обращения rule for this language asks the AI "
+      "to flag both internal ты/вы mixing AND a register implausible for the text's genre, instead of "
+      "the old \"must stay consistent\" wording that a uniformly-wrong document could never trigger")
+
+# --- the single-pair path (standalone /check, SINGLE_PROMPT) must NOT get
+# the "смешение форм... даже если по остальным критериям ты оцениваешь
+# каждую пару отдельно" wording — that only makes sense with several pairs
+# of the same language visible together, which SINGLE_PROMPT never has (a
+# review pass caught this: the batch-only wording would otherwise leak into
+# a prompt that has no concept of "pairs" at all). ---
+desc_no_rule_single = _checks_description(["register"], tone_register="", batch=False)
+assert "должен быть единым" not in desc_no_rule_single, desc_no_rule_single
+assert "не подходит характеру" in desc_no_rule_single, desc_no_rule_single
+assert "смешение форм" not in desc_no_rule_single, desc_no_rule_single
+assert "пары" not in desc_no_rule_single, desc_no_rule_single
+print("[OK] register check (single-pair /check mode) with no Тон обращения rule only asks about "
+      "genre-implausibility, never the batch-only \"mixing across pairs\" wording that wouldn't make "
+      "sense with just one source/translation pair in view")
+
+desc_formal = _checks_description(["register"], tone_register="formal")
+desc_informal = _checks_description(["register"], tone_register="informal")
+assert "формальный (вы/аналог)" in desc_formal, desc_formal
+assert "неформальный (ты/аналог)" in desc_informal, desc_informal
+assert "не подходит характеру" not in desc_formal, desc_formal
+print("[OK] register check with a resolved Тон обращения rule still uses the absolute per-row "
+      "formal/informal wording, unaffected by the no-rule fallback change above")
+
+assert "прямо просит сравнить пары между собой" in BATCH_PROMPT, BATCH_PROMPT
+print("[OK] BATCH_PROMPT's default \"check each pair separately\" instruction now explicitly allows "
+      "a specific criterion's own description to ask for cross-pair comparison instead")
+
 print("\nALL SMOKETEST CHECKS PASSED")

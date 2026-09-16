@@ -12,7 +12,13 @@ CHECK_LABELS = {
     # either matches the glossary or it doesn't, a plain text comparison —
     # so it kept missing/mislabeling things for no good reason. See git
     # history for the removal.)
-    "register": "регистр обращения (ты/вы и аналоги) — должен быть единым по всему тексту",
+    # "register"'s value here is never actually read — _checks_description
+    # below always special-cases "register" itself (either the resolved
+    # formal/informal wording, or _REGISTER_NO_RULE_LABEL) before it would
+    # fall through to CHECK_LABELS[c]. The key still has to exist, though:
+    # membership in this dict is what marks "register" as a valid AI check
+    # type at all (see ai_checks/_allowed_ai_types below).
+    "register": None,
     "typo": (
         "опечатки/ошибки — это ДВЕ разные вещи, обе входят сюда: (1) обычные опечатки и орфографические ошибки в "
         "самом переводе — неправильно написанное слово, даже если смысл всё равно понятен из контекста (например "
@@ -101,7 +107,8 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 ]"""
 
 BATCH_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны пары (контекст, исходный текст, перевод) на один целевой язык.
-Проверяй только критерии из "Что проверять" ниже, каждую пару отдельно от остальных.
+Проверяй только критерии из "Что проверять" ниже. По умолчанию оценивай каждую пару отдельно от остальных — но если
+описание конкретного критерия ниже прямо просит сравнить пары между собой, следуй этому описанию для этого критерия.
 
 {target_lang_line}
 
@@ -173,10 +180,60 @@ def _target_lang_line(target_lang: str) -> str:
     return f"Целевой язык перевода: {code}. Ориентируйся конкретно на этот язык — не путай с родственными языками."
 
 
-def _checks_description(checks: list[str], tone_register: str = "") -> str | None:
+_REGISTER_NO_RULE_LABEL_GENRE_ONLY = (
+    "регистр обращения (ты/вы и аналоги) — для этого языка нет заданного правила в документе «Тон обращения», "
+    "поэтому сообщай, только если использованная форма явно не подходит характеру текста для этого языка "
+    "(например, подчёркнуто неформальное «ты» в официальном/деловом/юридическом документе, или излишне "
+    "формальное «вы» там, где по смыслу и жанру ожидается неформальное обращение) — ориентируйся на обычные "
+    "нормы этого языка и жанра, раз проектного правила нет."
+)
+
+# Batch (multi-pair) version adds a second thing to check for that only
+# makes sense when several pairs of the same language are visible together
+# in one prompt: a mix of «ты» and «вы» forms across them. SINGLE_PROMPT
+# only ever carries one source/translation pair at a time (no "pairs" — see
+# app.main's standalone /check endpoint), so that half is meaningless there
+# and _checks_description below never appends it to a single-pair prompt.
+_REGISTER_NO_RULE_LABEL_BATCH = (
+    "регистр обращения (ты/вы и аналоги) — для этого языка нет заданного правила в документе «Тон обращения», "
+    "поэтому сообщай о ДВУХ разных вещах: (1) смешение форм внутри ЭТОГО целевого языка — где-то «ты», где-то "
+    "«вы» (учитывай ВСЕ пары этого языка вместе для этого пункта, даже если по остальным критериям ты "
+    "оцениваешь каждую пару отдельно); (2) форма, которая целиком, во всех парах, явно не подходит характеру "
+    "текста для этого языка (например, подчёркнуто неформальное «ты» в официальном/деловом/юридическом "
+    "документе, или излишне формальное «вы» там, где по смыслу и жанру ожидается неформальное обращение) — "
+    "ориентируйся на обычные нормы этого языка и жанра, раз проектного правила нет."
+)
+
+
+def _checks_description(checks: list[str], tone_register: str = "", batch: bool = True) -> str | None:
     """tone_register comes from the project's actual Tone-of-address
     document for this specific target language (see app.main's per-language
-    lookup) — never guessed by the model."""
+    lookup) — never guessed by the model. batch=True for build_batch_prompt
+    (BATCH_PROMPT, several pairs of one language visible together);
+    batch=False for run_ai_checks (SINGLE_PROMPT, exactly one pair — the
+    standalone /check endpoint) — this only changes the no-rule register
+    wording (see the two _REGISTER_NO_RULE_LABEL_* constants above); every
+    other check type's label is identical either way.
+
+    When tone_register is empty (no rule for this language — see
+    app.main._tone_lookup), this used to fall back to CHECK_LABELS["register"]'s
+    generic "должен быть единым по всему тексту" (must stay consistent
+    throughout) wording. That phrasing is structurally blind to exactly the
+    failure Александр reported on 2026-09-16: five languages where EVERY row
+    used the same wrong register. Text like that genuinely IS internally
+    consistent — it's just consistently wrong — so a check that only looks
+    for disagreement between rows can never fire on it; whether anything got
+    flagged then depended entirely on the model separately guessing there
+    was a problem from its own judgment, which is exactly the "то находит,
+    то нет" instability he saw. The batch fallback now asks for both internal
+    mixing AND a register that's implausible for the text's apparent genre,
+    so a uniformly-wrong document has a real chance of being caught even
+    without a project rule for that language; the single-pair fallback asks
+    only about genre-implausibility, since "internal mixing" isn't a
+    coherent question with just one pair in view. The right permanent fix is
+    still adding that language to the Тон обращения document — this makes
+    the check an absolute per-row rule with no guessing at all — but this
+    fallback should not be helpless in the meantime."""
     ai_checks = [c for c in checks if c in CHECK_LABELS]
     if not ai_checks:
         return None
@@ -186,6 +243,8 @@ def _checks_description(checks: list[str], tone_register: str = "") -> str | Non
         if c == "register" and tone_register.strip() in ("formal", "informal"):
             word = "формальный (вы/аналог)" if tone_register.strip() == "formal" else "неформальный (ты/аналог)"
             labels.append(f"регистр обращения — для этого языка должен быть {word} по всему тексту")
+        elif c == "register":
+            labels.append(_REGISTER_NO_RULE_LABEL_BATCH if batch else _REGISTER_NO_RULE_LABEL_GENRE_ONLY)
         else:
             labels.append(CHECK_LABELS[c])
 
@@ -408,7 +467,7 @@ async def run_ai_checks(
     """Returns (findings, cost_usd) — cost_usd is this one API call's actual
     cost from Anthropic's reported token usage (0.0 when no AI check ran,
     e.g. no API key configured or nothing to check against)."""
-    checks_description = _checks_description(checks, tone_register)
+    checks_description = _checks_description(checks, tone_register, batch=False)
     if not checks_description:
         return [], 0.0
 
