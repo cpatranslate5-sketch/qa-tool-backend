@@ -665,7 +665,28 @@ async def verify_file_languages(
     file still counts as found; only a code with no safe match at all (not
     present, or genuinely ambiguous between several columns) is reported
     missing. Read-only, like detect-languages: doesn't run any check or
-    store anything."""
+    store anything.
+
+    `found` is deliberately still computed against the UNION of every
+    sheet's languages (unchanged from before) — a target language is
+    legitimately allowed to be missing from one sheet of a multi-sheet
+    file just because that sheet's content doesn't need it (Александр's
+    own call, 2026-09-17), so "present somewhere in the document" is the
+    right bar for a target language.
+
+    The SOURCE language is different: every sheet needs the original text
+    to translate from, so silently missing it on even one sheet (a column
+    renamed or deleted by mistake on just that sheet, while it's still
+    intact elsewhere — exactly what caught Александр out testing this,
+    2026-09-17: he renamed «RU» on one of two sheets, and this endpoint
+    correctly reported "ru" found, since it genuinely was — just not on
+    the sheet he'd edited) means that sheet's rows get silently skipped
+    for that language, with zero warning. `missing_from_sheets` — the
+    names of every sheet where this code did NOT resolve — lets the
+    SOURCE-language confirmation on the frontend additionally require an
+    empty list (found on every sheet), while the existing target-language
+    confirmation keeps reading only `found` and ignoring this field, so
+    its own, deliberately looser behavior is completely unchanged."""
     _get_project(project_id, db)
     requested = [c.strip() for c in codes.split(",") if c.strip()]
     if not requested:
@@ -676,10 +697,18 @@ async def verify_file_languages(
     except Exception:
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
     file_langs: set[str] = set()
+    per_sheet_langs: list[tuple[str, set[str]]] = []
     for s in sheets:
         file_langs.update(s["languages"])
+        per_sheet_langs.append((s["sheet_name"], set(s["languages"])))
     results = [
-        {"code": code, "found": resolve_lang_code(code, file_langs) is not None}
+        {
+            "code": code,
+            "found": resolve_lang_code(code, file_langs) is not None,
+            "missing_from_sheets": [
+                name for name, langs in per_sheet_langs if resolve_lang_code(code, langs) is None
+            ],
+        }
         for code in requested
     ]
     return {"results": results}

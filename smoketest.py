@@ -518,6 +518,47 @@ assert verify_results2 == {"es-mx": True, "pt-br": True, "de": False}, verify_re
 print("[OK] verify-languages: explicit per-language found/not-found confirmation, driving "
       "the new \"tick what you expect, confirm, get told exactly what's missing\" flow")
 
+# --- missing_from_sheets: a multi-sheet upload where a language is
+# present on one sheet but missing from another — Александр hit this
+# concretely testing the source-language confirmation (2026-09-17): he
+# renamed "RU" on only one of two sheets, and "found" correctly stayed
+# True (ru genuinely is still in the file), but that alone hid that one
+# whole sheet had silently lost RU coverage. missing_from_sheets exists so
+# the frontend's SOURCE-language confirmation (which needs every sheet,
+# not just "somewhere in the file") can catch exactly this, while the
+# existing target-language confirmation keeps reading only `found` and is
+# completely unaffected. ---
+_two_sheet_wb = openpyxl.Workbook()
+_ws1 = _two_sheet_wb.active
+_ws1.title = "Posts"
+_ws1.append(["Context", "ru", "en"])
+_ws1.append(["greeting", "Привет", "Hi"])
+_ws2 = _two_sheet_wb.create_sheet("Designers")
+_ws2.append(["Context", "ru", "en", "fr"])
+_ws2.append(["greeting", "Привет", "Hi", "Salut"])
+_two_sheet_buf = io.BytesIO()
+_two_sheet_wb.save(_two_sheet_buf)
+_two_sheet_buf.seek(0)
+r = check("verify-languages: missing_from_sheets names exactly the sheet(s) lacking a language, "
+          "not just whether it's in the file ANYWHERE", client.post(
+    f"/projects/{project_id}/multi-check/verify-languages",
+    files={"file": ("two_sheets.xlsx", _two_sheet_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"codes": "ru, fr"},
+))
+_two_sheet_results = {row["code"]: row for row in r.json()["results"]}
+# "ru" is on both sheets — found, and missing from none.
+assert _two_sheet_results["ru"]["found"] is True, _two_sheet_results
+assert _two_sheet_results["ru"]["missing_from_sheets"] == [], _two_sheet_results
+# "fr" is only on "Designers" — still "found" overall (unchanged, looser
+# behavior a target-language confirmation relies on), but explicitly
+# named as missing from "Posts".
+assert _two_sheet_results["fr"]["found"] is True, _two_sheet_results
+assert _two_sheet_results["fr"]["missing_from_sheets"] == ["Posts"], _two_sheet_results
+print("[OK] verify-languages: missing_from_sheets names exactly which sheet(s) a language is "
+      "absent from, while `found` itself stays unchanged (present anywhere in the file is still "
+      "enough) — the source-language confirmation on the frontend is what actually requires an "
+      "empty missing_from_sheets list; the target-language one keeps ignoring this field entirely")
+
 # --- target_langs filter: checking just 2 of the file's many languages
 # should only touch those 2 in the summary ---
 with open(sample_path, "rb") as f:
