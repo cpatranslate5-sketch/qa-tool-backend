@@ -1743,6 +1743,33 @@ print("[OK] «непереводимые термины» now explicitly tells t
       "translation is always correct on its own (never a finding), and to treat the source itself "
       "already leaving a term untranslated as a signal it should stay that way in every language")
 
+# --- untranslatable, take two: Александр's real feedback (2026-09-17,
+# same day, a follow-up on the very same check) — a tournament name
+# ("Elite & Fortune") fully respelled phonetically in a DIFFERENT alphabet
+# ("엘리트 & 포춘" in Hangul) in 2 of 9 rows, while correctly kept in Latin
+# in the other rows, went completely unflagged — because the rule above
+# used to lump "транслитерация" (any transliteration at all) in with
+# grammatical case endings as both universally fine. Asked directly, he
+# wants full alphabet-to-alphabet transliteration of a name/brand ALWAYS
+# flagged as an error — even where it's done consistently everywhere in
+# the document — while a grammatical ending attached to a term that's
+# otherwise kept in its OWN original spelling (e.g. Russian "Grand
+# Prix'а") must stay exempt, or the original "Grand Prix" self-
+# contradiction bug (above) would come right back. ---
+assert "хангылем" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "Гран При" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "ВСЕГДА ошибка" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "Grand Prix'а" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+# the old blanket exemption (ANY transliteration, no matter the alphabet,
+# is fine) must be gone — that's exactly the bug being fixed here
+assert "транслитерация и падежные/грамматические окончания" not in CHECK_LABELS["untranslatable"], (
+    CHECK_LABELS["untranslatable"]
+)
+print("[OK] «непереводимые термины»: a name/brand fully respelled phonetically into a DIFFERENT alphabet "
+      "(e.g. Latin -> Hangul/Cyrillic) is now always flagged, even if done consistently everywhere in the "
+      "document — while a grammatical ending attached to a term left in its OWN original spelling stays "
+      "exempt, so the original 'Grand Prix left correctly untouched' self-contradiction can't come back")
+
 # --- completeness: Александр's real feedback (2026-09-17) — the check was
 # missing cases where a whole sentence/chunk of the source was dropped
 # from the translation entirely (not left in the source language, just
