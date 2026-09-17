@@ -1879,6 +1879,22 @@ assert "остаётся только ОДНА пара" in BATCH_PROMPT, BATCH_
 assert "ВНУТРИ одной и той же пары" in BATCH_PROMPT, BATCH_PROMPT
 assert "не объединяй их в одну находку" in BATCH_PROMPT, BATCH_PROMPT
 
+# --- Александр's real feedback (2026-09-17): the model's own free-text
+# "message" was citing its own internal, per-request pair numbers ("пара
+# 2", "остальных парах (6, 10, 13, 15)") — numbers that mean nothing to
+# the manager reading the report, since they're positions inside THIS
+# prompt's own "Пары для проверки" list, not the real Excel row numbers
+# the report actually shows (those are handled separately, via "row"/
+# "rows" and the automatic "также в строках: …" suffix). The prompt must
+# explicitly forbid this, not just implicitly rely on the model doing the
+# sensible thing. ---
+assert "НИКОГДА не упоминай в нём номер пары/строки" in BATCH_PROMPT, BATCH_PROMPT
+assert "без номеров пар/строк" in BATCH_PROMPT, BATCH_PROMPT
+print("[OK] BATCH_PROMPT explicitly forbids citing internal pair/row numbers inside a finding's own "
+      "\"message\" text — those numbers are meaningless to the manager and don't match real Excel rows; "
+      "real row attribution is handled separately by \"row\"/\"rows\" and the automatic "
+      "\"также в строках\" suffix")
+
 from app.claude_client import group_batch_findings
 
 _gbf_map = {1: 10, 2: 11, 3: 12, 4: 13, 5: 14}  # 1-based prompt row -> item index
