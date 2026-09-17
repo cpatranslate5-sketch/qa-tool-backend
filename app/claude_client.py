@@ -67,7 +67,11 @@ CALIBRATION_BASE = (
     "Общее правило: сообщай, только если уверен(а), что это настоящая ошибка. Сомневаешься или это может быть "
     "допустимым вариантом — не включай. Лучше меньше, но точных находок. Порядок символа валюты относительно числа, "
     "разделители тысяч/десятичных знаков, а также сам порядок частей даты (день/месяц/год) и то, точкой или "
-    "слэшем они разделены — это НЕ ошибка перевода сама по себе, и об этом никогда не нужно сообщать."
+    "слэшем они разделены — это НЕ ошибка перевода сама по себе, и об этом никогда не нужно сообщать. Важно: одна "
+    "пара «исходник/перевод» может содержать НЕСКОЛЬКО разных проблем одновременно, в том числе разных типов из "
+    "списка ниже — не останавливайся после первой найденной в паре ошибки, полностью проверь пару на КАЖДЫЙ "
+    "выбранный критерий и включи в ответ отдельную запись на каждую отдельную настоящую находку, даже если несколько "
+    "находок относятся к одной и той же паре."
 )
 
 # When "numbers" is also running (a free, 100%-reliable rule check — see
@@ -147,14 +151,30 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 такую находку под ближайший по смыслу разрешённый тип только потому, что это единственный доступный вариант —
 если находка не является настоящим примером именно этого критерия, её не должно быть в ответе.
 
+Отдельно — про повторяющиеся ошибки (это НЕ противоречит правилу "оценивай каждую пару отдельно" выше: ты всё равно
+оцениваешь и находишь проблему в каждой паре независимо, а правило ниже только про то, как ОФОРМИТЬ ответ, если
+независимая оценка нескольких разных пар дала одну и ту же находку): если ты видишь, что у тебя есть весь список пар
+целиком, и ОДНА И ТА ЖЕ конкретная проблема (не просто похожий тип, а именно тот же самый термин/фраза/ошибка)
+встречается одинаково в НЕСКОЛЬКИХ парах — не повторяй её отдельной находкой на каждую пару. Вместо этого включи её
+ОДИН раз в форме {{"rows": [номера всех пар, где встречается], ...}} (вместо "row") с сообщением, начинающимся с
+"Повторяется по всему документу: " и описанием самой проблемы. Если проблема встречается не во всех повторениях
+одного и того же (где-то переведено правильно, где-то нет) — перечисли в "rows" только те пары, где она РЕАЛЬНО есть,
+и явно скажи в сообщении, что не везде одинаково; но если после такого отбора остаётся только ОДНА пара — это уже не
+повторение, а обычная одиночная находка, оформи её как "row", без формулировки "Повторяется по всему документу".
+Если сомневаешься, что это действительно одна и та же проблема, а не просто похожая — сообщай как обычно, отдельными
+находками с "row".
+
 Пары для проверки:
 {pairs_block}
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив по всем парам без markdown и пояснений, строго в этой форме
 (пустой массив [], если нигде нет обычных находок; не включай пары без обычных находок{register_array_note}):
 [
-  {{"row": <номер пары из списка выше>, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском"}}
-]"""
+  {{"row": <номер пары из списка выше>, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском"}},
+  {{"rows": [<номера ВСЕХ пар, где повторяется одна и та же проблема>], "type": "{type_enum}", "severity": "low|medium|high", "message": "Повторяется по всему документу: ..."}}
+]
+(используй "rows" вместо "row" ТОЛЬКО для настоящего повторения одной и той же проблемы в нескольких парах — см.
+выше; для обычной, отдельной находки в одной паре используй "row" как всегда)"""
 
 
 def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
@@ -834,9 +854,31 @@ def build_batch_prompt(
 
 def group_batch_findings(raw: list, number_to_index: dict[int, int]) -> dict[int, list[dict]]:
     """Maps the model's {"row": n, ...} entries back to the caller's item
-    indices via the number_to_index from build_batch_prompt."""
+    indices via the number_to_index from build_batch_prompt.
+
+    An entry can instead carry {"rows": [n1, n2, ...], ...} — the same
+    exact problem repeated identically across several pairs, reported ONCE
+    per BATCH_PROMPT's own instructions (Александр's ask, 2026-09-17: the
+    same mistranslated term showing up in 5 rows shouldn't be 5 separate,
+    near-duplicate findings). That's attached to only the FIRST of those
+    rows here, carrying every OTHER one's item index in an internal
+    "_also_idx" key — app.excel_multi (which has the real Excel row
+    numbers, meaningless here) resolves that into the finding's final
+    message via its own _resolve_repeated_findings, and strips the key
+    before it ever reaches a response. An unrecognized/empty "rows" list
+    (every number failed to resolve) is dropped rather than guessed at."""
     grouped: dict[int, list[dict]] = {}
     for entry in raw:
+        rows_nums = entry.get("rows")
+        if isinstance(rows_nums, list):
+            indices = [number_to_index[n] for n in rows_nums if n in number_to_index]
+            if not indices:
+                continue
+            finding = {k: v for k, v in entry.items() if k not in ("row", "rows")}
+            if len(indices) > 1:
+                finding["_also_idx"] = indices[1:]
+            grouped.setdefault(indices[0], []).append(finding)
+            continue
         row_num = entry.get("row")
         idx = number_to_index.get(row_num)
         if idx is None:

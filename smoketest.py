@@ -1788,6 +1788,20 @@ print("[OK] the AI is told to skip plain digit/date mismatches under «опеч�
       "reported twice under two different labels), and stays the sole backstop for numbers "
       "otherwise")
 
+# --- Александр's team's real observation (2026-09-17): the AI seemed to
+# stop checking a pair once it found ONE problem, even though a real pair
+# can have several distinct issues at once. CALIBRATION_BASE (folded into
+# both SINGLE_PROMPT and BATCH_PROMPT via {calibration}) now explicitly
+# says a pair can hold several different problems and the model must check
+# EVERY selected criterion rather than stopping after the first hit. ---
+from app.claude_client import CALIBRATION_BASE
+
+assert "НЕСКОЛЬКО разных проблем" in CALIBRATION_BASE, CALIBRATION_BASE
+assert "не останавливайся после первой" in CALIBRATION_BASE, CALIBRATION_BASE
+print("[OK] the calibration text explicitly tells the model a single pair can hold several distinct "
+      "problems at once and it must keep checking every selected criterion instead of stopping after "
+      "the first finding in that pair")
+
 # --- the prompt also tells the model not to squeeze an out-of-scope
 # finding into whichever type happens to be the only one allowed —
 # Александр hit exactly this with the (now-removed) glossary check, but
@@ -1798,6 +1812,215 @@ from app.claude_client import SINGLE_PROMPT, BATCH_PROMPT
 assert "Не подгоняй" in SINGLE_PROMPT and "Не подгоняй" in BATCH_PROMPT
 print("[OK] the prompt explicitly forbids squeezing an out-of-scope finding into whichever "
       "type happens to be the only one allowed")
+
+# --- BATCH_PROMPT explicitly tells the model how to report the SAME exact
+# problem repeating identically across several pairs (Александр's ask,
+# 2026-09-17: e.g. a tournament name "Fly & Win" mistranslated the same
+# way in 5 rows shouldn't come back as 5 separate, near-duplicate
+# findings) — via "rows": [...] instead of "row", with a message starting
+# "Повторяется по всему документу: ...". group_batch_findings must turn
+# that into ONE finding attached to the FIRST of those rows, carrying
+# every other one's item index internally (as "_also_idx") for
+# app.excel_multi to resolve into real Excel row numbers later — not lost,
+# not duplicated across every row it lists. ---
+assert "Повторяется по всему документу" in BATCH_PROMPT, BATCH_PROMPT
+assert '"rows"' in BATCH_PROMPT, BATCH_PROMPT
+# the repeat-aggregation rule explicitly reconciles itself with the prompt's own "evaluate each pair
+# separately" opening line, and explicitly tells the model to fall back to an ordinary "row" finding if
+# filtering a partial repeat down to where it's actually present leaves only one pair (review findings —
+# both were "plausible" prompt-ambiguity risks, not confirmed model failures, but cheap to close off)
+assert "НЕ противоречит" in BATCH_PROMPT, BATCH_PROMPT
+assert "остаётся только ОДНА пара" in BATCH_PROMPT, BATCH_PROMPT
+
+from app.claude_client import group_batch_findings
+
+_gbf_map = {1: 10, 2: 11, 3: 12, 4: 13, 5: 14}  # 1-based prompt row -> item index
+_gbf_raw = [
+    {"row": 2, "type": "typo", "severity": "medium", "message": "обычная опечатка только в этой паре"},
+    {
+        "rows": [1, 3, 5],
+        "type": "untranslatable",
+        "severity": "medium",
+        "message": "Повторяется по всему документу: «Fly & Win» переведено, должно остаться как есть",
+    },
+]
+_gbf_grouped = group_batch_findings(_gbf_raw, _gbf_map)
+# only TWO top-level keys: the "rows" entry's FIRST index (10) and the
+# ordinary "row" entry's index (11) — items 12/14 (the other two rows the
+# repeated problem also names) are NOT separate top-level entries, only
+# referenced inside the first one's "_also_idx", so they never show up
+# duplicated in the grouped dict's own keys.
+assert set(_gbf_grouped.keys()) == {10, 11}, _gbf_grouped
+assert _gbf_grouped[10][0]["type"] == "untranslatable" and "_also_idx" in _gbf_grouped[10][0], _gbf_grouped
+assert _gbf_grouped[10][0]["_also_idx"] == [12, 14], _gbf_grouped  # items 3 and 5's own indices, in order
+assert "rows" not in _gbf_grouped[10][0] and "row" not in _gbf_grouped[10][0], _gbf_grouped
+assert _gbf_grouped[11][0]["message"] == "обычная опечатка только в этой паре", _gbf_grouped
+# an unresolvable "rows" list (every number missing from the map) is dropped rather than guessed at
+assert group_batch_findings([{"rows": [99], "type": "typo", "severity": "low", "message": "x"}], _gbf_map) == {}
+# a single-element "rows" list is exactly equivalent to an ordinary "row" finding — no "_also_idx" at all
+_gbf_single = group_batch_findings([{"rows": [2], "type": "typo", "severity": "low", "message": "x"}], _gbf_map)
+assert set(_gbf_single.keys()) == {11} and "_also_idx" not in _gbf_single[11][0], _gbf_single
+# a non-list "rows" value (model misformats it, e.g. as a bare number or string) doesn't match the
+# isinstance(list) check, falls through to the ordinary "row" lookup, finds no "row" key either, and is
+# dropped rather than crashing or being guessed at
+assert group_batch_findings([{"rows": 2, "type": "typo", "severity": "low", "message": "x"}], _gbf_map) == {}
+assert group_batch_findings([{"rows": "2", "type": "typo", "severity": "low", "message": "x"}], _gbf_map) == {}
+# a "rows" list with a duplicated number (model repeats itself, e.g. [3, 3, 7]) still resolves — and,
+# because the group key is always indices[0], the duplicate can end up INSIDE "_also_idx" alongside the
+# entry's own index; this is exactly the shape that used to cause the self-reference bug below, so
+# app.excel_multi._resolve_repeated_findings (not group_batch_findings itself) is what has to cope with it.
+_gbf_dup = group_batch_findings(
+    [{"rows": [2, 2, 4], "type": "untranslatable", "severity": "medium", "message": "Повторяется по всему документу: x"}],
+    _gbf_map,
+)
+assert set(_gbf_dup.keys()) == {11}, _gbf_dup
+assert _gbf_dup[11][0]["_also_idx"] == [11, 13], _gbf_dup  # item 2's own index (11) shows up here too
+print("[OK] group_batch_findings: a \"rows\"-tagged entry (the same repeated problem across several "
+      "pairs) is attached once, to its first row, carrying every other row's index internally for later "
+      "resolution — never duplicated across each row it lists, a single-row \"rows\" list behaves exactly "
+      "like an ordinary \"row\" finding, a non-list \"rows\" value is dropped rather than crashing, and an "
+      "ordinary single-\"row\" finding is completely unaffected")
+
+# --- app.excel_multi._resolve_repeated_findings is what turns that
+# internal "_also_idx" into the ACTUAL Excel row numbers the manager reads
+# in the report (item indices mean nothing to them), folded into the
+# finding's own message, with the internal key stripped so it never
+# leaks into a response. ---
+from app.excel_multi import _resolve_repeated_findings
+
+_rrf_rows = [{"excel_row": 5}, {"excel_row": 6}, {"excel_row": 9}, {"excel_row": 12}, {"excel_row": 20}]
+_rrf_resolved = _resolve_repeated_findings(
+    {0: [{"type": "untranslatable", "severity": "medium", "message": "Повторяется по всему документу: ...",
+          "_also_idx": [2, 4]}]},
+    _rrf_rows,
+)
+assert "_also_idx" not in _rrf_resolved[0][0], _rrf_resolved
+assert _rrf_resolved[0][0]["message"] == "Повторяется по всему документу: ... (также в строках: 9, 20)", _rrf_resolved
+# a finding with no "_also_idx" at all (the ordinary case) passes through unchanged
+assert _resolve_repeated_findings({0: [{"type": "typo", "message": "m"}]}, _rrf_rows) == {0: [{"type": "typo", "message": "m"}]}
+# self-reference bug (found by review, since fixed): if "_also_idx" names the SAME item index the
+# finding is already keyed under (e.g. group_batch_findings resolved a duplicated "rows" number back to
+# its own index — see the group_batch_findings test above), the finding's own Excel row must NOT show up
+# in its own "также в строках: ..." list — a row can't "also" repeat in itself.
+_rrf_self = _resolve_repeated_findings(
+    {0: [{"type": "untranslatable", "severity": "medium", "message": "Повторяется по всему документу: ...",
+          "_also_idx": [0, 2]}]},  # 0 is this finding's OWN index, alongside the real other occurrence (2)
+    _rrf_rows,
+)
+assert _rrf_self[0][0]["message"] == "Повторяется по всему документу: ... (также в строках: 9)", _rrf_self
+# and if EVERY index in "_also_idx" turns out to be self-referencing, there's nothing left to name at
+# all — the message is left exactly as the model wrote it, no dangling "(также в строках: )"
+_rrf_all_self = _resolve_repeated_findings(
+    {0: [{"type": "untranslatable", "severity": "medium", "message": "Повторяется по всему документу: ...",
+          "_also_idx": [0]}]},
+    _rrf_rows,
+)
+assert _rrf_all_self[0][0]["message"] == "Повторяется по всему документу: ...", _rrf_all_self
+print("[OK] _resolve_repeated_findings: the internal row-index list is turned into the actual Excel row "
+      "numbers and folded into the finding's own message, with the internal key never leaking through — "
+      "an ordinary finding with nothing to resolve passes through untouched, and a self-referencing index "
+      "(the finding's own row named inside its own \"_also_idx\") is correctly excluded rather than making "
+      "a row's message claim it also repeats in itself")
+
+# --- end-to-end through the live multi-check path: a mocked batch
+# response using "rows" for one repeated problem (rows 1 and 3) plus an
+# ordinary "row" finding (row 2) — the repeated one must be attached to
+# its FIRST occurrence (excel_row 2), naming the other one (excel_row 5)
+# in its own message, and excel_row 5 must NOT show that same finding
+# a second time. ---
+from app.excel_multi import _check_language_for_sheet
+
+
+async def _fake_call_claude_repeated_batch(prompt, model=None):
+    return (
+        '[{"row": 2, "type": "typo", "severity": "low", "message": "мелкая опечатка только здесь"},'
+        '{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
+        '"message": "Повторяется по всему документу: «Fly & Win» переведено"}]',
+        {"input_tokens": 30, "output_tokens": 30},
+        "end_turn",
+    )
+
+
+_rep_sheet = {
+    "sheet_name": "Sheet1",
+    "languages": ["en", "ru"],
+    "rows": [
+        {"excel_row": 2, "context": "title 1", "max_length": None, "values": {"en": "Fly & Win", "ru": "Лети и выигрывай"}},
+        {"excel_row": 3, "context": "body", "max_length": None, "values": {"en": "Terms apply", "ru": "Условия дейстуют"}},
+        {"excel_row": 5, "context": "title 2", "max_length": None, "values": {"en": "Fly & Win", "ru": "Лети и выигрывай"}},
+    ],
+}
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_repeated_batch
+_rep_out, _rep_cost = asyncio.get_event_loop().run_until_complete(
+    _check_language_for_sheet(_rep_sheet, "ru", "en", ["typo", "untranslatable"], "", asyncio.Semaphore(5))
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+# excel_row 5 has NOTHING of its own to show — the repeated finding lives
+# only at its first occurrence (excel_row 2), so only rows 2 and 3 show up
+# at all; row 5 isn't in the output, which IS the point of not repeating
+# the same finding a second time.
+assert {r["excel_row"] for r in _rep_out} == {2, 3}, _rep_out
+_rep_by_row = {r["excel_row"]: r["findings"] for r in _rep_out}
+_rep_repeated = [f for f in _rep_by_row[2] if f["type"] == "untranslatable"]
+assert len(_rep_repeated) == 1, _rep_by_row[2]
+assert _rep_repeated[0]["message"] == "Повторяется по всему документу: «Fly & Win» переведено (также в строках: 5)", _rep_by_row[2]
+print("[OK] multi-check live path: a \"rows\"-tagged repeated finding shows up once, at its first "
+      "occurrence, naming the other Excel row(s) it also applies to in its own message — the other row(s) "
+      "don't show the same finding a second time")
+
+# --- same thing, but through the OTHER path: finalize_batch_results, used for large uploads that go "
+# through the Anthropic Message Batches API instead of a synchronous call. Only the live path above was "
+# --- exercised end-to-end before (review finding — coverage gap). Skeleton shape matches what "
+# build_batch_plan actually produces (see excel_multi.build_batch_plan). ---
+from app.excel_multi import finalize_batch_results
+
+_fbr_skeleton = {
+    "sheets": [{
+        "sheet_name": "Sheet1",
+        "target_langs": ["ru"],
+        "languages": {
+            "ru": {
+                "custom_id": "s0-t0",
+                "model": "claude-sonnet-4-5-20250929",
+                "number_to_index": {"1": 0, "2": 1, "3": 2},
+                "rows": [
+                    {"excel_row": 2, "context": "title 1", "source": "Fly & Win", "translation": "Лети и выигрывай", "findings": []},
+                    {"excel_row": 3, "context": "body", "source": "Terms apply", "translation": "Условия дейстуют", "findings": []},
+                    {"excel_row": 5, "context": "title 2", "source": "Fly & Win", "translation": "Лети и выигрывай", "findings": []},
+                ],
+            },
+        },
+        "unrecognized_columns": [],
+        "row_count": 3,
+    }],
+    "source_lang": "en",
+    "checks": ["typo", "untranslatable"],
+}
+_fbr_results = {
+    "s0-t0": {
+        "text": (
+            '[{"row": 2, "type": "typo", "severity": "low", "message": "мелкая опечатка только здесь"},'
+            '{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
+            '"message": "Повторяется по всему документу: «Fly & Win» переведено"}]'
+        ),
+        "usage": {"input_tokens": 30, "output_tokens": 30},
+        "result_type": "succeeded",
+        "stop_reason": "end_turn",
+    },
+}
+_fbr_out = finalize_batch_results(_fbr_skeleton, _fbr_results)
+_fbr_lang = _fbr_out["sheets"][0]["languages"]["ru"]
+# same expectation as the live-path test: excel_row 5 has nothing of its own to show, only 2 and 3 appear
+assert {r["excel_row"] for r in _fbr_lang} == {2, 3}, _fbr_lang
+_fbr_by_row = {r["excel_row"]: r["findings"] for r in _fbr_lang}
+_fbr_repeated = [f for f in _fbr_by_row[2] if f["type"] == "untranslatable"]
+assert len(_fbr_repeated) == 1, _fbr_by_row[2]
+assert _fbr_repeated[0]["message"] == "Повторяется по всему документу: «Fly & Win» переведено (также в строках: 5)", _fbr_by_row[2]
+print("[OK] finalize_batch_results (Message Batches / large-file path): a \"rows\"-tagged repeated "
+      "finding is resolved exactly the same way as on the live synchronous path — once, at its first "
+      "occurrence, naming the other Excel row(s) in its own message")
 
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something

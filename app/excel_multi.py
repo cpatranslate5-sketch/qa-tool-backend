@@ -622,6 +622,38 @@ def _extract_register_values(grouped: dict[int, list[dict]]) -> tuple[dict[int, 
     return cleaned, values
 
 
+def _resolve_repeated_findings(grouped: dict[int, list[dict]], rows: list[dict]) -> dict[int, list[dict]]:
+    """A finding that named several pairs at once via "rows" in the model's
+    response (see BATCH_PROMPT — Александр's ask, 2026-09-17: the same
+    exact problem repeated identically across many rows shouldn't be N
+    separate, near-duplicate findings) survives group_batch_findings as
+    ONE finding attached to its first row, carrying the OTHER rows' item
+    indices in an internal "_also_idx" key (item indices mean nothing
+    outside this module). This resolves that into the actual Excel row
+    numbers the manager sees in the report, folds them into the finding's
+    own message, and strips the internal key so it never reaches the
+    response. Runs on whatever ai_grouped looks like BEFORE the "if
+    findings: show this row" step, same as _extract_register_values."""
+    resolved: dict[int, list[dict]] = {}
+    for idx, findings in grouped.items():
+        new_findings = []
+        for f in findings:
+            also_idx = f.get("_also_idx")
+            if also_idx:
+                f = {k: v for k, v in f.items() if k != "_also_idx"}
+                own_excel_row = rows[idx]["excel_row"] if 0 <= idx < len(rows) else None
+                also_rows = sorted(
+                    {rows[i]["excel_row"] for i in also_idx if 0 <= i < len(rows)}
+                    - {own_excel_row}
+                )
+                if also_rows:
+                    rows_str = ", ".join(str(r) for r in also_rows)
+                    f["message"] = f"{f.get('message', '')} (также в строках: {rows_str})"
+            new_findings.append(f)
+        resolved[idx] = new_findings
+    return resolved
+
+
 def _count_real_findings(findings_list: list[dict]) -> int:
     """The "N проблем"/"N найдено" count shown across the UI (multi-check
     headline, per-language row counts, history list) — every real finding,
@@ -704,6 +736,7 @@ async def _check_language_for_sheet(
         ai_findings_by_idx, cost_usd, truncated = await run_ai_checks_batch(
             ai_items, checks, extra_instructions, lang, source_lang
         )
+    ai_findings_by_idx = _resolve_repeated_findings(ai_findings_by_idx, relevant_rows)
     ai_findings_by_idx, register_values_by_idx = _extract_register_values(ai_findings_by_idx)
 
     out = []
@@ -983,6 +1016,7 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                 if ai_result is not None:
                     total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
 
+            ai_grouped = _resolve_repeated_findings(ai_grouped, lang_skel["rows"])
             ai_grouped, register_values_by_idx = _extract_register_values(ai_grouped)
 
             findings_list = []
