@@ -1598,6 +1598,66 @@ print("[OK] check_placeholders: a literal \"\\u00A0\" escape token (and any othe
       "is now recognized as a placeholder just like {name}/%s/<tag>, alongside every style already "
       "supported before")
 
+# --- letter-run placeholder protection (e.g. "XXXXXXXX", "YYYY" standing in
+# for masked/dynamic data): the letter count must survive translation
+# exactly, and the alphabet (Latin vs Cyrillic) must never silently swap —
+# both invisible-to-the-eye mistakes, same spirit as check_mixed_script
+# below. Александр's ask, 2026-09-17. ---
+from app.rule_checks import check_letter_placeholders
+
+# unchanged run — no finding
+assert check_letter_placeholders("Card: XXXXXXXX", "Карта: XXXXXXXX") == []
+# letter count changed (one X dropped) — must be caught, and the message
+# must show both the original and the (wrong) new length
+count_result = check_letter_placeholders("Card: XXXXXXXX", "Карта: XXXXXXX")
+assert count_result != [] and count_result[0]["type"] == "placeholders" and count_result[0]["severity"] == "high"
+assert "XXXXXXXX" in count_result[0]["message"] and "XXXXXXX" in count_result[0]["message"]
+# alphabet swapped to a look-alike Cyrillic letter, same length — must be
+# caught even though "ХХХХХХХХ" looks pixel-identical to "XXXXXXXX"
+script_result = check_letter_placeholders("Card: XXXXXXXX", "Карта: ХХХХХХХХ")
+assert script_result != [] and "алфавитом" in script_result[0]["message"]
+# the placeholder disappearing entirely from the translation
+assert check_letter_placeholders("Year: YYYY", "Год: 2026") != []
+# a genuinely different letter/length in the translation that's actually a
+# SECOND, unrelated placeholder later in a longer source is still paired up
+# positionally and checked independently
+assert check_letter_placeholders("XXXX and YYYY", "XXXX и YYYY") == []
+# two bugs caught in review of the first version and fixed:
+# (1) a translator reordering the clauses (completely normal in Russian)
+# must NOT make two untouched, merely-swapped placeholders look "changed"
+assert check_letter_placeholders("Card XXXXXXXX, Year YYYY", "Год YYYY, Карта XXXXXXXX") == [], \
+    "reordered-but-unchanged placeholders must never be cross-matched and flagged"
+# (2) one placeholder genuinely dropped from the middle of several must be
+# reported as itself missing, not misattributed to a different, unrelated
+# placeholder that's actually still present
+dropped_result = check_letter_placeholders("XXXX and YYYY", "YYYY")
+assert dropped_result != [] and "XXXX" in dropped_result[0]["message"] and "потерялась" in dropped_result[0]["message"], dropped_result
+assert not any("YYYY" in f["message"] and "потерялась" in f["message"] for f in dropped_result), (
+    "YYYY is still present (just reordered to the front) and must never be reported as missing", dropped_result
+)
+# (1b) the mirror bug: a source with NO letter-run placeholder at all used
+# to short-circuit before the translation was even inspected, so a run
+# appearing only in the (garbled) translation went completely unreported
+assert check_letter_placeholders("Special offer today", "Специальное предложение ХХХХХХХХ") != [], (
+    "an extra letter-run placeholder appearing only in the translation must be caught even when the "
+    "source has no letter-run placeholder of its own"
+)
+# a short, coincidental repeated-letter token that's NOT a placeholder
+# (a roman numeral, a batteries size, a URL prefix, a Russian company
+# abbreviation) must never be mistaken for one — none of these reach the
+# minimum run length of 4
+assert check_letter_placeholders("Buy III tickets now, see www.site.com, need 2 AA batteries, ООО Ромашка", "Купите III билетов, см. www.site.com, нужны 2 AA батарейки, ООО Ромашка") == []
+# folded into run_rule_checks under the same "placeholders" checkbox as the
+# existing tag/placeholder check — no new checkbox needed on the frontend
+from app.rule_checks import run_rule_checks
+folded = run_rule_checks("Card: XXXXXXXX", "Карта: XXXXXXX", checks=["placeholders"])
+assert any(f["type"] == "placeholders" for f in folded), folded
+print("[OK] check_letter_placeholders: a letter-run placeholder (\"XXXXXXXX\", \"YYYY\") losing or gaining "
+      "letters, or silently swapping to a look-alike letter from the other alphabet (Cyrillic \"Х\" for "
+      "Latin \"X\"), is caught under the existing \"placeholders\" checkbox — while an ordinary short "
+      "repeated-letter token that isn't really a placeholder (roman numeral, battery size, URL, company "
+      "abbreviation) is correctly left alone")
+
 # --- mixed-script (homoglyph) detection, folded into check_punctuation: a
 # word mixing a look-alike Cyrillic letter into an otherwise-Latin word (or
 # vice versa) is invisible to the eye but real in the text — Александр
@@ -1782,6 +1842,18 @@ assert "КУСОК СМЫСЛА" in CHECK_LABELS["completeness"], CHECK_LABELS["
 print("[OK] «неполнота перевода» now explicitly covers a whole sentence/chunk being dropped from the "
       "translation entirely (not just left-over source-language text), while still distinguishing that "
       "from a small, natural stylistic omission that isn't a finding")
+
+# --- completeness: Александр's ask (2026-09-17) — a dropped/malformed
+# call-to-action arrow ("->", "→", "=>", used in mailings as a link/button
+# cue) should also be caught, but deliberately by the AI/prompt rather than
+# a hardcoded rule check, since he wasn't confident every real-world variant
+# could be enumerated in an algorithm. ---
+assert "->" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+assert "призыва к действию" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+assert "искажён" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+print("[OK] «неполнота перевода» now also asks the AI to flag a call-to-action arrow (\"->\" and similar) "
+      "that's dropped or altered between source and translation, per Александр's explicit ask that this "
+      "stay AI-judged rather than a hardcoded rule (the forms vary too much to enumerate reliably)")
 
 # --- a plain misspelling in the translation itself ("resulits" for
 # "results") must be in scope too, even though the meaning is still

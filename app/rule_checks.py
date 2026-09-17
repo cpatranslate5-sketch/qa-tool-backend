@@ -266,6 +266,142 @@ def check_placeholders(source: str, translation: str) -> list[dict]:
     return findings
 
 
+# Letter-run placeholder protection — Александр's ask (2026-09-17): some
+# documents use a run of the SAME letter repeated several times as a
+# stand-in for masked/dynamic data (a card number shown as "XXXXXXXX", a
+# year format as "YYYY"). Two things must survive translation exactly:
+# (1) the number of letters in the run — one added or dropped letter
+# quietly breaks whatever format the placeholder represents — and
+# (2) which ALPHABET it's written in — a Cyrillic "Х" looks pixel-for-
+# pixel identical to a Latin "X" (the same invisible-swap problem
+# check_mixed_script above already catches inside ordinary words), so a
+# translator's Cyrillic keyboard slipping in a look-alike character is
+# impossible to spot by eye and needs its own check here too.
+#
+# Anchored to a whole standalone token (\b...\b on both ends) so this never
+# fires on a doubled letter buried INSIDE an ordinary word (Russian
+# "аллея", English "spoonful") — only an isolated run of nothing but that
+# one letter counts. Minimum length 4 (the first letter plus 3+ repeats)
+# keeps it away from short tokens that are also a repeated letter purely by
+# coincidence and appear constantly in ordinary text — "AA" batteries,
+# "III" as a roman numeral, "www" in a URL, "ООО" as the Russian company
+# suffix — none of which reach 4 in a row.
+#
+# NOTE: deliberately named differently from the (unrelated) _LETTER_RUN_RE
+# further down in this file (used by check_mixed_script to match ANY run of
+# letters, repeated or not, for homoglyph detection) — reusing that name
+# here would silently shadow it at module load time, since Python just
+# keeps the LAST top-level assignment to a name; the two patterns are not
+# interchangeable, and this exact collision was caught live in review.
+_PLACEHOLDER_LETTER_RUN_RE = re.compile(r"\b([A-Za-zА-Яа-яЁё])\1{3,}\b")
+
+
+def _extract_letter_runs(text: str) -> list[str]:
+    return [m.group(0) for m in _PLACEHOLDER_LETTER_RUN_RE.finditer(text)]
+
+
+def _run_script(run: str) -> str:
+    return "cyrillic" if _CYRILLIC_LETTER_RE.search(run) else "latin"
+
+
+def check_letter_placeholders(source: str, translation: str) -> list[dict]:
+    """Two real bugs were caught in review of the first version of this
+    function (naive position-by-position pairing of every extracted run)
+    and fixed here:
+
+    (1) A source with NO letter-run placeholder at all used to short-
+    circuit with an early `return []` before the translation was ever even
+    looked at — so a run that appeared ONLY in the translation (e.g. a
+    Cyrillic keyboard slip producing a coincidental "ХХХХХХХХ") was never
+    reported at all, even though the exact same "extra placeholder" case
+    WAS caught whenever the source already had at least one real one.
+
+    (2) Pairing purely by list position broke the moment there were 2+
+    placeholders and the translator reordered the clauses containing them
+    (completely normal in Russian) — a survived-but-moved placeholder got
+    compared against a different, unrelated one and flagged as "changed"
+    even though both were actually untouched; and a placeholder genuinely
+    DROPPED from the middle of several could get blamed on the wrong one
+    entirely (the drop silently passed while an unrelated later one was
+    wrongly reported "missing").
+
+    Fixed by resolving every EXACT match between the two runs lists first,
+    as a multiset (so reordering and duplicate placeholders are both
+    handled correctly and never flagged) — only what's left over on either
+    side after that gets paired up positionally, which is where a genuine
+    count/alphabet change actually shows up.
+
+    Known remaining edge case, accepted as out of scope: if a document has
+    TWO OR MORE DIFFERENT placeholders that are each independently changed
+    AND reordered AND their new lengths happen to cross-match each other's
+    original length (e.g. a 6-letter run shrinks to 5 while a different
+    5-letter run grows to 6, and the two also swap position), the leftover
+    positional pairing above can match them to each other instead of to
+    themselves and miss both changes. A real-world file with several
+    letter-run placeholders in one cell is already an edge case on its
+    own; independently changing two of them AND having the new lengths
+    swap with each other is vanishingly unlikely on top of that — solving
+    it properly would need a full alignment (e.g. edit-distance/
+    assignment) between leftovers rather than a simple position pairing,
+    which isn't worth the complexity for how rare this combination is."""
+    src_runs = _extract_letter_runs(source)
+    tr_runs = _extract_letter_runs(translation)
+    if not src_runs and not tr_runs:
+        return []
+
+    tr_pool = list(tr_runs)
+    leftover_src = []
+    for run in src_runs:
+        if run in tr_pool:
+            tr_pool.remove(run)  # consumes exactly one matching instance, so duplicates stay balanced
+        else:
+            leftover_src.append(run)
+    leftover_tr = tr_pool
+
+    findings = []
+    for i, src_run in enumerate(leftover_src):
+        if i >= len(leftover_tr):
+            findings.append({
+                "type": "placeholders",
+                "severity": "high",
+                "message": (
+                    f"В исходнике есть буквенная заглушка «{src_run}» ({len(src_run)} букв) — в переводе такой "
+                    "заглушки не осталось. Проверьте, не потерялась ли она."
+                ),
+            })
+            continue
+        tr_run = leftover_tr[i]
+        if len(src_run) != len(tr_run):
+            findings.append({
+                "type": "placeholders",
+                "severity": "high",
+                "message": (
+                    f"Буквенная заглушка «{src_run}» ({len(src_run)} букв) в переводе стала «{tr_run}» "
+                    f"({len(tr_run)} букв) — количество букв в такой заглушке менять нельзя (это, скорее всего, "
+                    "формат маскированных данных, например номера карты)."
+                ),
+            })
+        elif _run_script(src_run) != _run_script(tr_run):
+            findings.append({
+                "type": "placeholders",
+                "severity": "high",
+                "message": (
+                    f"Буквенная заглушка «{src_run}» в переводе набрана другим алфавитом — «{tr_run}» выглядит "
+                    "так же на глаз, но это буквы кириллицы вместо латиницы (или наоборот). Замените на буквы "
+                    "исходного алфавита."
+                ),
+            })
+    if len(leftover_tr) > len(leftover_src):
+        extra = leftover_tr[len(leftover_src):]
+        shown = ", ".join(f"«{r}»" for r in extra)
+        findings.append({
+            "type": "placeholders",
+            "severity": "medium",
+            "message": f"В переводе появилась лишняя буквенная заглушка, которой не было в исходнике: {shown}.",
+        })
+    return findings
+
+
 def check_max_length(translation: str, max_length: int | None) -> list[dict]:
     if not max_length:
         return []
@@ -539,6 +675,7 @@ def run_rule_checks(
         findings += check_numbers(source, translation)
     if "placeholders" in checks:
         findings += check_placeholders(source, translation)
+        findings += check_letter_placeholders(source, translation)
     if "max_length" in checks:
         findings += check_max_length(translation, max_length)
     if "punctuation" in checks:
