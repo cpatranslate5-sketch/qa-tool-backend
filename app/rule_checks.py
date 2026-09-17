@@ -9,8 +9,16 @@ import re
 from collections import Counter
 
 NUMBER_RE = re.compile(r"\d[\d.,]*\d|\d")
-# Common placeholder styles: {name}, {{name}}, %s, %1$s, <tag>...</tag>, [tag]
-PLACEHOLDER_RE = re.compile(r"\{\{?[^}]+\}?\}|%\d*\$?[sd]|<[^>]+>|\[[^\]]+\]")
+# Common placeholder styles: {name}, {{name}}, %s, %1$s, <tag>...</tag>,
+# [tag], \uXXXX (a literal escaped-unicode token, e.g. " " for a
+# non-breaking space — some of Александр's Crowdin exports write it out
+# literally as this six-character escape sequence rather than embedding
+# the actual invisible character, so it needs its own pattern: none of the
+# other styles above match a bare backslash+u+4-hex-digits run at all,
+# which is exactly why it went unrecognized — "Earn points in tournament
+# games and win cash prizes" lost that " " in translation
+# without check_placeholders ever noticing).
+PLACEHOLDER_RE = re.compile(r"\{\{?[^}]+\}?\}|%\d*\$?[sd]|<[^>]+>|\[[^\]]+\]|\\u[0-9a-fA-F]{4}")
 
 # A comma used as a DECIMAL separator, e.g. "0,40" (kopecks/cents,
 # Russian/Azerbaijani-style) — matched only when 1-2 digits follow the
@@ -226,6 +234,57 @@ TERMINAL_PUNCT_ACCEPTABLE = ".!?…" + "।॥" + "。！？" + "۔" + "։" + "�
 NO_TERMINAL_PUNCT_LANGS = {"th", "lo"}
 
 
+# Cyrillic and Latin both use the ordinary alphabet range here (no
+# diacritics/extended letters needed — every real look-alike pair Александр
+# asked about is a plain a-z letter on one side) — а/a, е/e, о/o, р/p, с/c,
+# у/y, х/x, and their uppercase forms, plus а few more that are just as
+# visually identical (В/B, Н/H, К/K, М/M, Т/T) even though they're less
+# likely to be typed by accident mid-word. Used only to detect that a SINGLE
+# word contains letters from BOTH alphabets — never to guess which specific
+# letter is "the" mistake, since from the raw character alone there's no way
+# to tell it apart from its look-alike twin.
+_CYRILLIC_LETTER_RE = re.compile(r"[а-яА-ЯёЁ]")
+_LATIN_LETTER_RE = re.compile(r"[a-zA-Z]")
+# A "word" for this purpose only ever needs letters — digits/punctuation
+# inside a token (e.g. a placeholder-ish "id123") never affect whether it
+# mixes scripts, and stripping them out avoids splitting a genuine mixed-
+# script run into several separately-innocent-looking pieces.
+_LETTER_RUN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ]+")
+
+
+def check_mixed_script(translation: str) -> list[dict]:
+    """Catches an invisible-to-the-eye typo: a word that LOOKS like it's
+    written in one alphabet but actually mixes in a look-alike letter from
+    the other (Cyrillic "с" typed where a Latin "c" belongs, or vice versa)
+    — Александр's example was exactly this, human eyes can't tell "с" from
+    "c" apart at a glance. Flags any single letter-run that contains BOTH a
+    Cyrillic and a Latin letter; a legitimate brand name or code embedded in
+    an otherwise-Cyrillic sentence (e.g. "используйте Google") is still a
+    PURE-Latin word on its own and never trips this — only an actual mix
+    WITHIN one word does. No real word in any of these languages is
+    genuinely both-alphabet, so this has essentially no false-positive risk
+    and needs no opt-in of its own — folded directly into check_punctuation
+    below, the same way check_numbers is silently folded in whenever
+    "Оформление" is ticked (see CHECK_OPTIONS/buildChecksToSend on the
+    frontend)."""
+    suspects = sorted({
+        m.group(0) for m in _LETTER_RUN_RE.finditer(translation)
+        if _CYRILLIC_LETTER_RE.search(m.group(0)) and _LATIN_LETTER_RE.search(m.group(0))
+    })
+    if not suspects:
+        return []
+    shown = ", ".join(f"«{w}»" for w in suspects[:10])
+    return [{
+        "type": "punctuation",
+        "severity": "medium",
+        "message": (
+            f"В переводе есть слово(-а), где вперемешку кириллица и латиница — на глаз не видно, но буквы "
+            f"разных алфавитов (например, «с»/«c», «о»/«o», «р»/«p», «х»/«x», «а»/«a», «е»/«e»): {shown}. "
+            "Похоже на случайно попавшую букву другого алфавита — проверьте и исправьте."
+        ),
+    }]
+
+
 def check_punctuation(source: str, translation: str, lang_code: str = "") -> list[dict]:
     findings = []
     src = source.rstrip()
@@ -247,7 +306,53 @@ def check_punctuation(source: str, translation: str, lang_code: str = "") -> lis
             "message": "В переводе есть двойной пробел.",
         })
 
+    findings += check_mixed_script(translation)
+
     return findings
+
+
+# The GSM 03.38 "default alphabet" SMS actually transmits in 7-bit-per-
+# character mode — anything outside it either fails to send correctly or
+# silently forces the WHOLE message into 16-bit UCS-2 (halving how many
+# characters fit per SMS segment, and doubling how many segments/how much a
+# long message costs to send) depending on the carrier/gateway. Deliberately
+# narrower than the full real GSM 7-bit table (which also allows a handful of
+# accented Western-European letters like é/ñ/ü) — Александр's own spec below
+# is stricter than that on purpose, since it's written for languages that
+# would otherwise rely on diacritics precisely to spell ordinary words
+# (Turkish ş/ı/ğ, Romanian ș/ț, Azerbaijani ə, etc.), and those must be
+# transliterated to plain Latin instead of merely tolerated — "Günaydın" ->
+# "Gunaydin", not left as-is. So this list is exactly his allowed set, not
+# the carrier standard's full one: Latin A-Z/a-z, digits, a specific
+# punctuation set, a single ASCII hyphen (never an en/em dash), and spaces.
+_SMS_SAFE_RE = re.compile(r"[^A-Za-z0-9@!?.,'\"&%=+\-/:;() ]")
+
+
+def check_sms_charset(translation: str) -> list[dict]:
+    """Opt-in only (see CHECK_OPTIONS's "sms_charset" entry on the
+    frontend, unticked by default) — Александр only wants this run for an
+    SMS deliverable, and running it against an ordinary Cyrillic/Arabic/
+    CJK/etc. translation by mistake would flag nearly every character, not
+    a handful of genuine problems. When it IS the right check, this is a
+    plain character-set membership test, not a judgment call — no AI
+    needed, and none of the ambiguity a probabilistic check would add."""
+    bad_chars = sorted(set(_SMS_SAFE_RE.findall(translation)))
+    if not bad_chars:
+        return []
+    shown = ", ".join(f"«{c}»" for c in bad_chars[:15])
+    tail = "" if len(bad_chars) <= 15 else f" и ещё {len(bad_chars) - 15} символ(а/ов)"
+    return [{
+        "type": "sms_charset",
+        "severity": "high",
+        "message": (
+            f"В переводе есть символы, недопустимые для SMS (GSM 7-bit): {shown}{tail}. Разрешены только "
+            "латинские буквы A-Z/a-z, цифры, пробел и знаки @!?.,'\"&%=+-/:;() — без диакритики (ş, ç, ñ, ș "
+            "и т.п.), без «умных»/типографских кавычек (“ ” ‘ ’), без ¿¡ и без длинного "
+            "тире (—, только обычный дефис -). Замените такие символы на латинские без диакритики (например, "
+            "«Günaydın» → «Gunaydin») — а если из-за этого слово меняет смысл на неприемлемый, согласуйте "
+            "исключение для этой конкретной SMS с менеджером, не меняя слово молча."
+        ),
+    }]
 
 
 def run_rule_checks(
@@ -268,4 +373,6 @@ def run_rule_checks(
         findings += check_max_length(translation, max_length)
     if "punctuation" in checks:
         findings += check_punctuation(source, translation, lang_code)
+    if "sms_charset" in checks:
+        findings += check_sms_charset(translation)
     return findings

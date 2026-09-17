@@ -1435,6 +1435,74 @@ assert check_numbers("$50,000 prize", "50 тысяч приз") != []
 print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no longer "
       "false-flagged as a numbers mismatch; real mismatches and thousands-grouping still caught")
 
+# --- placeholders check: a literal "\u00A0" escape token (some of
+# Александр's Crowdin exports write a non-breaking space out this way,
+# rather than as the actual invisible character) must be recognized as a
+# placeholder just like {name}/%s/<tag> — Александр hit this live: "Earn
+# points in tournament games and\u00A0win cash prizes" lost the "\u00A0" in
+# translation and check_placeholders never noticed, since none of the
+# existing placeholder styles matched a bare backslash+u+4-hex-digit run. ---
+from app.rule_checks import check_placeholders
+
+nbsp_source = "Earn points in tournament games and\\u00A0win cash prizes"
+nbsp_translation_missing = "Заработайте очки в турнирных играх и выиграйте денежные призы"
+nbsp_translation_kept = "Заработайте очки в турнирных играх и\\u00A0выиграйте денежные призы"
+assert check_placeholders(nbsp_source, nbsp_translation_missing) != [], "must catch a dropped \\u00A0"
+assert check_placeholders(nbsp_source, nbsp_translation_kept) == [], "must not flag when \\u00A0 survives"
+# still recognizes every previously-supported style alongside the new one
+assert check_placeholders("Hello {name}, you have %d points", "Привет {name}, у вас %d очков") == []
+assert check_placeholders("Hello {name}", "Привет") != []  # {name} genuinely dropped
+print("[OK] check_placeholders: a literal \"\\u00A0\" escape token (and any other \\uXXXX-style escape) "
+      "is now recognized as a placeholder just like {name}/%s/<tag>, alongside every style already "
+      "supported before")
+
+# --- mixed-script (homoglyph) detection, folded into check_punctuation: a
+# word mixing a look-alike Cyrillic letter into an otherwise-Latin word (or
+# vice versa) is invisible to the eye but real in the text — Александр
+# asked whether this could be caught algorithmically. No opt-in checkbox
+# needed (folded straight into "Оформление", like check_numbers already
+# is) since a genuinely mixed-script word has essentially no legitimate
+# reason to exist in any of these languages. ---
+from app.rule_checks import check_mixed_script, check_punctuation
+
+assert check_mixed_script("Это обычный русский текст.") == []  # pure Cyrillic — fine
+assert check_mixed_script("This is plain English text.") == []  # pure Latin — fine
+assert check_mixed_script("Используйте Google Play для входа.") == []  # a pure-Latin brand NEXT TO Cyrillic words is fine
+mixed_result = check_mixed_script("Используйте Gооgle Play для входа.")  # Cyrillic "оо" inside a Latin word
+assert mixed_result != [] and "Gооgle" in mixed_result[0]["message"], mixed_result
+assert mixed_result[0]["type"] == "punctuation"  # rides along under the same check type, no new checkbox
+# check_punctuation (the actual dispatch point run_rule_checks calls) picks
+# this up automatically, without any separate call needed.
+assert any(f["type"] == "punctuation" for f in check_punctuation("Go.", "Идите в Gооgle Play.")), \
+    "check_punctuation must include the mixed-script finding, not just check_mixed_script on its own"
+print("[OK] check_mixed_script: a word mixing look-alike Cyrillic/Latin letters (e.g. Cyrillic \"о\" "
+      "inside an otherwise-Latin word) is caught automatically under \"Оформление\" — a pure-script "
+      "word, even a Latin brand name sitting next to Cyrillic text, is never flagged")
+
+# --- SMS/GSM-7bit charset check: opt-in only (see CHECK_OPTIONS on the
+# frontend — unticked by default), flags any character outside the strict
+# Latin set Александр's SMS spec allows, so a Turkish "Günaydın" is caught
+# (İ/diacritics aren't GSM-safe) while its transliterated "Gunaydin" is
+# clean, and ordinary Cyrillic/CJK/etc. text is obviously NOT what this
+# check is for (enabling it there would flag nearly every character — by
+# design, since it's never on by default and must be deliberately ticked
+# only for an actual SMS deliverable). ---
+from app.rule_checks import check_sms_charset
+from app import schemas
+from app import main
+
+assert check_sms_charset("Gunaydin! Win up to 100 USD, terms apply (18+).") == []  # fully GSM-safe
+bad = check_sms_charset("G\u00fcnaydın! Ma\u00f1ana \u2018special\u2019 \u2014 win now.")
+assert bad != [], "diacritics, curly quotes and an em dash must all be flagged"
+assert bad[0]["type"] == "sms_charset"
+assert "ü" in bad[0]["message"] or "\u00fc" in bad[0]["message"]
+# not wired into any default check list — must be explicitly requested
+assert "sms_charset" not in schemas.DEFAULT_CHECKS
+assert "sms_charset" not in main.DEFAULT_MULTI_CHECKS
+print("[OK] check_sms_charset: flags diacritics/typographic quotes/em dash/etc. against the strict "
+      "GSM 7-bit Latin set Александр's SMS spec requires, stays silent on plain GSM-safe text, and is "
+      "excluded from every default check list (opt-in only, never on unless explicitly ticked)")
+
 # --- dropping (or keeping) a thousands-grouping comma must not be flagged
 # either — Александр hit this live: a translation correctly kept some of a
 # promo's big numbers grouped ("1,500,000") but wrote a smaller one
@@ -1743,7 +1811,7 @@ from app.claude_client import (
     _checks_description,
     _register_array_note,
     _register_instructions,
-    summarize_register_values,
+    build_register_report,
 )
 
 # _checks_description itself is now completely unaware of "register" —
@@ -1770,34 +1838,65 @@ print("[OK] _register_instructions carries the entire register task now (empty w
       "explicitly framed as information-gathering rather than error-detection), and only the batch "
       "(multi-row) prompt tags entries by row number")
 
-# summarize_register_values: the actual Russian summary line the manager
-# reads. This is the function Александр's use case hinges on — his report
-# was five languages where EVERY row used the same wrong register, which
-# is exactly the "everywhere, no exceptions" case below.
-assert summarize_register_values({}) is None
-assert summarize_register_values({5: "formal", 12: "formal"}) == "везде на «вы»"
-assert summarize_register_values({1: "informal", 2: "informal", 3: "informal"}) == "везде на «ты»"
-# a genuine minority gets called out by row number
-mixed = summarize_register_values({1: "formal", 2: "formal", 3: "formal", 5: "informal", 12: "informal"})
-assert mixed == "везде на «вы», кроме: строки 5, 12", mixed
+# build_register_report: the actual Russian summary the manager reads,
+# now a structured dict (not a plain string) so a caller can colorize
+# «вы»/«ты» and, for a handful of exceptions, show the actual wrongly-toned
+# text instead of just a row number (Александр's ask, 2026-09-17). This is
+# the function his original use case hinges on — his report was five
+# languages where EVERY row used the same wrong register, which is exactly
+# the "everywhere, no exceptions" case below.
+assert build_register_report({}) is None
+everywhere_formal = build_register_report({5: "formal", 12: "formal"})
+assert everywhere_formal == {"text": "везде на «вы»", "majority": "formal", "exceptions": None, "exception_labels": None}, everywhere_formal
+everywhere_informal = build_register_report({1: "informal", 2: "informal", 3: "informal"})
+assert everywhere_informal["text"] == "везде на «ты»" and everywhere_informal["majority"] == "informal"
+# a genuine minority gets called out by row number in `text` either way —
+# and, when `texts` is given and there are few enough exceptions (<=3),
+# ALSO gets each exception's actual text in `exceptions` instead of `exception_labels`
+mixed = build_register_report({1: "formal", 2: "formal", 3: "formal", 5: "informal", 12: "informal"})
+assert mixed["text"] == "везде на «вы», кроме: строки 5, 12", mixed
+assert mixed["majority"] == "formal"
+assert mixed["exceptions"] is None and mixed["exception_labels"] == [5, 12], mixed  # no `texts` given here
+mixed_with_texts = build_register_report(
+    {1: "formal", 2: "formal", 3: "formal", 5: "informal", 12: "informal"},
+    {1: "Hi", 2: "Hi", 3: "Hi", 5: "wrong tone here", 12: "and here too"},
+)
+assert mixed_with_texts["exception_labels"] is None, mixed_with_texts
+assert mixed_with_texts["exceptions"] == [
+    {"label": 5, "text": "wrong tone here"}, {"label": 12, "text": "and here too"},
+], mixed_with_texts
+# more than 3 exceptions falls back to plain row numbers even WITH texts —
+# Александр's own cutoff ("если строк ... более трёх, то лучше номера").
+# Majority (formal) must outnumber the exceptions (informal) for "formal"
+# to actually win the majority — 5 formal rows vs. 4 informal ones.
+many_exceptions = build_register_report(
+    {1: "formal", 2: "formal", 3: "formal", 4: "formal", 5: "formal",
+     6: "informal", 7: "informal", 8: "informal", 9: "informal"},
+    {1: "Hi", 2: "Hi", 3: "Hi", 4: "Hi", 5: "Hi", 6: "a", 7: "b", 8: "c", 9: "d"},
+)
+assert many_exceptions["exceptions"] is None, many_exceptions
+assert many_exceptions["exception_labels"] == [6, 7, 8, 9], many_exceptions
 # a SINGLE exception uses the singular "строка", not "строки" ("кроме:
 # строки 3" reads as a grammar mistake to a Russian speaker)
-single_exc = summarize_register_values({1: "formal", 2: "formal", 3: "informal"})
-assert single_exc == "везде на «вы», кроме: строка 3", single_exc
+single_exc = build_register_report({1: "formal", 2: "formal", 3: "informal"})
+assert single_exc["text"] == "везде на «вы», кроме: строка 3", single_exc
 # "neutral" rows (no direct address at all — a title, a number) are excluded
 # from the count entirely, not treated as a third camp
-assert summarize_register_values({1: "formal", 2: "neutral", 3: "formal"}) == "везде на «вы»"
-# nothing classifiable at all -> an honest "couldn't tell", not a guess
-assert summarize_register_values({1: "neutral", 2: "neutral"}) == (
-    "не удалось определить — в переведённых строках нет прямых обращений к пользователю"
-)
+assert build_register_report({1: "formal", 2: "neutral", 3: "formal"})["text"] == "везде на «вы»"
+# nothing classifiable at all -> an honest "couldn't tell", not a guess, and
+# `majority` is None so a caller never tries to color a non-existent value
+undetermined = build_register_report({1: "neutral", 2: "neutral"})
+assert undetermined["majority"] is None, undetermined
+assert undetermined["text"] == "не удалось определить — в переведённых строках нет прямых обращений к пользователю"
 # single-pair mode drops the "везде"/"кроме" framing (nothing to compare
-# a lone pair against)
-assert summarize_register_values({0: "formal"}, single=True) == "на «вы»"
-assert summarize_register_values({0: "informal"}, single=True) == "на «ты»"
-print("[OK] summarize_register_values: everywhere-the-same reports plainly, a genuine minority is "
-      "called out by row number, rows with no direct address are excluded from the count rather than "
-      "treated as a third camp, and single-pair mode drops the \"везде\"/\"кроме\" framing")
+# a lone pair against) and never has exceptions
+single_formal = build_register_report({0: "formal"}, single=True)
+assert single_formal == {"text": "на «вы»", "majority": "formal", "exceptions": None, "exception_labels": None}
+assert build_register_report({0: "informal"}, single=True)["text"] == "на «ты»"
+print("[OK] build_register_report: everywhere-the-same reports plainly, a genuine minority is called "
+      "out by row number (or, for <=3 exceptions with texts given, by the actual wrongly-toned text), "
+      "rows with no direct address are excluded from the count rather than treated as a third camp, and "
+      "single-pair mode drops the \"везде\"/\"кроме\" framing")
 
 # --- end-to-end: the standalone /check endpoint actually produces a
 # "register_summary" finding from a mocked AI response, and — critically —
@@ -1821,6 +1920,7 @@ reg_findings = r.json()["findings"]
 assert len(reg_findings) == 1, reg_findings
 assert reg_findings[0]["type"] == "register_summary", reg_findings
 assert reg_findings[0]["message"] == "Тон обращения: на «вы».", reg_findings
+assert reg_findings[0]["register_majority"] == "formal", reg_findings
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
 print("[OK] standalone /check with only \"register\" selected turns a mocked AI response into a "
@@ -1865,15 +1965,22 @@ _reg_out, _reg_cost = asyncio.get_event_loop().run_until_complete(
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
 assert len(_reg_out) == 1, _reg_out  # nothing else had a real finding — just the one summary row
-assert _reg_out[0]["findings"][0]["type"] == "register_summary", _reg_out
-assert _reg_out[0]["findings"][0]["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_out
+_reg_finding = _reg_out[0]["findings"][0]
+assert _reg_finding["type"] == "register_summary", _reg_out
+assert _reg_finding["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_out
+assert _reg_finding["register_majority"] == "formal", _reg_finding
+# 1 exception (<=3) and the row's own translated text was available, so the
+# structured fields carry the actual wrongly-toned text, not just the row
+# number — see build_register_report/_register_summary_block.
+assert _reg_finding["register_exceptions"] == [{"label": 3, "text": "Здарова, пока"}], _reg_finding
+assert "register_exception_labels" not in _reg_finding, _reg_finding
 assert not any(
     f.get("type") == REGISTER_VALUE_TYPE for row in _reg_out for f in row["findings"]
 ), "raw register_value must never reach the live multi-check path's visible findings"
 print("[OK] multi-check live path (_check_language_for_sheet): a mocked per-row register_value "
       "response becomes one register_summary row naming the excel_row of the actual exception "
-      "(3 — the row deliberately given a different register than the other two), with no raw "
-      "register_value finding ever reaching the visible list")
+      "(3 — the row deliberately given a different register than the other two), carrying that row's "
+      "actual translated text, with no raw register_value finding ever reaching the visible list")
 
 # --- and the Message-Batches (large-file) path — finalize_batch_results,
 # which merges a polled batch result back into the skeleton. Same
@@ -1899,14 +2006,18 @@ _reg_batch_results = {
 _reg_finalized = finalize_batch_results(_reg_skeleton, _reg_batch_results)
 _reg_lang_findings = _reg_finalized["sheets"][0]["languages"]["ru"]
 assert len(_reg_lang_findings) == 1, _reg_lang_findings
-assert _reg_lang_findings[0]["findings"][0]["type"] == "register_summary", _reg_lang_findings
-assert _reg_lang_findings[0]["findings"][0]["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_lang_findings
+_reg_batch_finding = _reg_lang_findings[0]["findings"][0]
+assert _reg_batch_finding["type"] == "register_summary", _reg_lang_findings
+assert _reg_batch_finding["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_lang_findings
+assert _reg_batch_finding["register_majority"] == "formal", _reg_batch_finding
+assert _reg_batch_finding["register_exceptions"] == [{"label": 3, "text": "Здарова, пока"}], _reg_batch_finding
+assert "register_exception_labels" not in _reg_batch_finding, _reg_batch_finding
 assert not any(
     f.get("type") == REGISTER_VALUE_TYPE for row in _reg_lang_findings for f in row["findings"]
 ), "raw register_value must never reach the Message-Batches path's visible findings either"
 print("[OK] multi-check Message-Batches path (finalize_batch_results): the same polled register_value "
-      "response produces the identical register_summary, with the same excel_row exception and no raw "
-      "register_value finding reaching the visible list")
+      "response produces the identical register_summary, with the same excel_row exception and its "
+      "actual translated text, and no raw register_value finding reaching the visible list")
 
 # _count_real_findings: the "N проблем"/"N найдено" number shown across the
 # UI must never count the register_summary report as a problem — a check

@@ -18,6 +18,7 @@ from app.claude_client import (
     _truncation_warning,
     _usage_cost,
     build_batch_prompt,
+    build_register_report,
     cancel_message_batch,
     create_message_batch,
     get_batch_results,
@@ -25,7 +26,6 @@ from app.claude_client import (
     group_batch_findings,
     parse_json_array,
     run_ai_checks_batch,
-    summarize_register_values,
 )
 from app.rule_checks import run_rule_checks
 
@@ -628,20 +628,39 @@ def _count_real_findings(findings_list: list[dict]) -> int:
     )
 
 
-def _register_summary_block(summary: str | None) -> dict | None:
+def _register_summary_block(report: dict | None) -> dict | None:
     """The synthetic "row" a per-language register report rides in as —
     same pattern already used for _truncation_warning/_ai_failure_warning
     (excel_row=0, a recognizable pseudo-context instead of a real row).
     None when there's nothing to report (register wasn't selected, or no
-    register_value entries came back at all)."""
-    if summary is None:
+    register_value entries came back at all).
+
+    report is build_register_report's structured return value — its
+    "majority"/"exceptions"/"exception_labels" keys ride along on the
+    finding itself (register_majority/register_exceptions/
+    register_exception_labels) so the frontend can colorize «вы»/«ты» and
+    highlight each exception's actual text (Александр's ask, 2026-09-17)
+    without having to re-parse the plain-text message. "message" itself is
+    unchanged from before — still the plain-text fallback for the Excel
+    export or any other plain-text-only reader."""
+    if report is None:
         return None
+    finding = {
+        "type": "register_summary",
+        "severity": "low",
+        "message": f"Тон обращения: {report['text']}.",
+        "register_majority": report["majority"],
+    }
+    if report.get("exceptions") is not None:
+        finding["register_exceptions"] = report["exceptions"]
+    if report.get("exception_labels") is not None:
+        finding["register_exception_labels"] = report["exception_labels"]
     return {
         "excel_row": 0,
         "context": "ℹ️ Тон обращения",
         "source": "",
         "translation": "",
-        "findings": [{"type": "register_summary", "severity": "low", "message": f"Тон обращения: {summary}."}],
+        "findings": [finding],
     }
 
 
@@ -703,7 +722,11 @@ async def _check_language_for_sheet(
         })
     if "register" in checks:
         by_excel_row = {relevant_rows[idx]["excel_row"]: v for idx, v in register_values_by_idx.items()}
-        block = _register_summary_block(summarize_register_values(by_excel_row))
+        texts_by_excel_row = {
+            relevant_rows[idx]["excel_row"]: relevant_rows[idx]["values"].get(lang, "")
+            for idx in register_values_by_idx
+        }
+        block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
         if block is not None:
             out.append(block)
     return out, cost_usd
@@ -972,7 +995,11 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                 by_excel_row = {
                     lang_skel["rows"][idx]["excel_row"]: v for idx, v in register_values_by_idx.items()
                 }
-                block = _register_summary_block(summarize_register_values(by_excel_row))
+                texts_by_excel_row = {
+                    lang_skel["rows"][idx]["excel_row"]: lang_skel["rows"][idx]["translation"]
+                    for idx in register_values_by_idx
+                }
+                block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
                 if block is not None:
                     findings_list.append(block)
             languages_out[lang] = findings_list

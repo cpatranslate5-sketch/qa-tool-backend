@@ -262,17 +262,50 @@ def _register_array_note(checks: list[str]) -> str:
     return " — но если выбран регистр обращения, эти дополнительные записи всё равно обязательны"
 
 
-def summarize_register_values(values: dict, single: bool = False) -> str | None:
+# Александр's own cutoff for when showing each exception row's actual text
+# (see build_register_report below) stops being more useful than just
+# naming the rows.
+MAX_EXCEPTIONS_WITH_TEXT = 3
+
+
+def build_register_report(values: dict, texts: dict | None = None, single: bool = False) -> dict | None:
     """values: {label: "formal"|"informal"|"neutral"}, one entry per
     classified row — label is whatever the caller uses to identify a row
     (an excel_row number for a multi-check language; anything at all for
-    a single-pair check, since there's only ever one label there). Returns
-    a ready-to-show Russian clause (no "Тон обращения:" prefix, no
-    trailing period — callers add those) describing the register actually
-    used, or None if there's nothing to report at all (no register_value
+    a single-pair check, since there's only ever one label there).
+
+    texts: optional {label: translated text} for the SAME labels — when
+    given, and there are few enough exceptions (see MAX_EXCEPTIONS_WITH_TEXT
+    below), the report includes each exception's actual translated text so
+    the manager can see AT A GLANCE what was written differently, instead of
+    having to go look up each row number by hand (Александр's own ask,
+    2026-09-17). Ignored entirely in single mode (a lone pair has no
+    "exceptions" to begin with) or once there are too many to usefully quote.
+
+    Returns None if there's nothing to report at all (no register_value
     entries came back — e.g. "register" wasn't selected, or the AI call
-    itself failed and _extract_register_values in app.excel_multi never
-    got anything to extract).
+    itself failed and _extract_register_values in app.excel_multi never got
+    anything to extract). Otherwise a dict:
+      {
+        "text": <the plain-text clause this function used to return
+                 directly, unprefixed/unpunctuated — still what the Excel
+                 export and any other plain-text-only reader uses>,
+        "majority": "formal" | "informal" | None,   # None only for the
+                     "couldn't determine" case — lets a caller colorize
+                     "вы" (formal) and "ты" (informal) differently
+                     (Александр asked for blue/orange) without re-parsing
+                     the Russian text back out of `text`.
+        "exceptions": [{"label": ..., "text": ...}, ...] | None,  # set only
+                     when there ARE exceptions AND there are few enough of
+                     them AND texts was given — the caller highlights each
+                     one's text (Александр asked for red) instead of just
+                     a row number.
+        "exception_labels": [...] | None,  # set instead of "exceptions"
+                     when there are exceptions but either too many of them
+                     or no texts were given — same plain "строка N, M, ..."
+                     listing as `text` already spells out, just broken out
+                     for a caller that wants the raw labels on their own.
+      }
 
     single=True drops the "везде"/"кроме" multi-row framing in favour of a
     plain "на «вы»"/"на «ты»" clause — "everywhere" reads oddly to
@@ -288,22 +321,46 @@ def summarize_register_values(values: dict, single: bool = False) -> str | None:
         return None
     classified = {k: v for k, v in values.items() if v in ("formal", "informal")}
     if not classified:
-        return "не удалось определить — в переведённых строках нет прямых обращений к пользователю"
+        return {
+            "text": "не удалось определить — в переведённых строках нет прямых обращений к пользователю",
+            "majority": None,
+            "exceptions": None,
+            "exception_labels": None,
+        }
     if single:
         only_value = next(iter(classified.values()))
-        return "на «вы»" if only_value == "formal" else "на «ты»"
+        word = "вы" if only_value == "formal" else "ты"
+        return {"text": f"на «{word}»", "majority": only_value, "exceptions": None, "exception_labels": None}
 
     counts: dict[str, int] = {}
     for v in classified.values():
         counts[v] = counts.get(v, 0) + 1
     majority_value = max(counts, key=lambda v: counts[v])
     majority_word = "вы" if majority_value == "formal" else "ты"
-    exceptions = sorted(k for k, v in classified.items() if v != majority_value)
-    if not exceptions:
-        return f"везде на «{majority_word}»"
-    exceptions_str = ", ".join(str(e) for e in exceptions)
-    row_word = "строка" if len(exceptions) == 1 else "строки"
-    return f"везде на «{majority_word}», кроме: {row_word} {exceptions_str}"
+    exception_labels = sorted(k for k, v in classified.items() if v != majority_value)
+    if not exception_labels:
+        return {"text": f"везде на «{majority_word}»", "majority": majority_value, "exceptions": None, "exception_labels": None}
+
+    exceptions_str = ", ".join(str(e) for e in exception_labels)
+    row_word = "строка" if len(exception_labels) == 1 else "строки"
+    text = f"везде на «{majority_word}», кроме: {row_word} {exceptions_str}"
+
+    # Show the actual (wrongly-toned) text for up to MAX_EXCEPTIONS_WITH_TEXT
+    # exceptions, so the manager sees what was written differently without
+    # hunting down each row — beyond that, a wall of quoted text is harder
+    # to scan than the short numeric list `text` above already gives, so it
+    # falls back to just the labels (Александр's own cutoff: "если строк ...
+    # более трёх, то тогда уже лучше перечислить их номера").
+    exceptions_detail = None
+    if texts and len(exception_labels) <= MAX_EXCEPTIONS_WITH_TEXT:
+        exceptions_detail = [{"label": lbl, "text": texts.get(lbl, "")} for lbl in exception_labels]
+
+    return {
+        "text": text,
+        "majority": majority_value,
+        "exceptions": exceptions_detail,
+        "exception_labels": None if exceptions_detail is not None else exception_labels,
+    }
 
 
 def _allowed_ai_types(checks: list[str]) -> set[str]:
@@ -565,12 +622,13 @@ async def run_ai_checks(
         register_findings = [f for f in findings if f.get("type") == REGISTER_VALUE_TYPE]
         findings = [f for f in findings if f.get("type") != REGISTER_VALUE_TYPE]
         value = register_findings[0].get("value") if register_findings else None
-        summary = summarize_register_values({0: value} if value else {}, single=True)
-        if summary is not None:
+        report = build_register_report({0: value} if value else {}, single=True)
+        if report is not None:
             findings.append({
                 "type": "register_summary",
                 "severity": "low",
-                "message": f"Тон обращения: {summary}.",
+                "message": f"Тон обращения: {report['text']}.",
+                "register_majority": report["majority"],
             })
 
     return findings, _usage_cost(model, usage)
