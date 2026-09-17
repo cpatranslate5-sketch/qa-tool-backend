@@ -1476,6 +1476,107 @@ assert check_numbers("$50,000 prize", "50 тысяч приз") != []
 print("[OK] check_numbers: decimal-comma and zero-padded-hour localization no longer "
       "false-flagged as a numbers mismatch; real mismatches and thousands-grouping still caught")
 
+# --- Indian numbering (lakh/crore): a rupee amount grouped "1,00,000" style
+# (2-digit groups, not the Western 3-digit "100,000") is the same value,
+# not a mismatch — Александр's real complaint (2026-09-17), where an
+# Indian-language column correctly localized a source amount that showed
+# up "wrong" purely because the grouping shape itself wasn't recognized. ---
+assert check_numbers("Prize: ₹100,000", "Prize: ₹1,00,000") == []
+assert check_numbers("1 000 000₹ prize", "₹10,00,000 prize") == []
+assert check_numbers("₹1,23,45,678 prize", "₹12345678 prize") == []  # crore-scale, ungrouped translation
+assert check_numbers("₹100,000", "₹1,50,000") != []  # genuinely different amount must still be caught
+print("[OK] check_numbers: Indian-style lakh/crore digit grouping (e.g. ₹1,00,000 for ₹100,000) is "
+      "recognized as the same grouping shape, not a different number, while an actually different "
+      "rupee amount is still caught")
+
+# --- short day.month dates with NO year at all ("20.09" vs "09/20") —
+# Александр's second date complaint (2026-09-17): the existing multiset
+# comparison only decomposed a date with 2+ separators (day.month.year);
+# a bare 2-part dotted date fell through and was compared as one literal
+# string, so a correctly reordered/reformatted short date without a year
+# was wrongly flagged as a numbers mismatch. An ordinary decimal ("$0.40")
+# must stay completely unaffected. ---
+assert check_numbers("Confirm by 09/20, 23:59", "Подтверди до 20.09, 23:59") == []
+assert check_numbers("Confirm by 09/21, 23:59", "Подтверди до 20.09, 23:59") != []  # genuinely different day
+assert check_numbers("Minimum bet: $0.40", "Мин. ставка: $0.40") == []
+assert check_numbers("Minimum bet: $0.40", "Мин. ставка: $0.44") != []  # genuine decimal difference
+print("[OK] check_numbers: a short day.month date with no year (\"20.09\" vs \"09/20\") can be freely "
+      "reordered/reformatted between languages without being flagged, while an actually different day "
+      "and an ordinary decimal value (\"$0.40\") are both still handled correctly")
+
+# --- the short-date fix above is genuinely ambiguous with an ordinary
+# 2-decimal-place price (a caught-in-review risk, 2026-09-17): "$20.09"
+# transposed to "$9.20" is exactly as shaped as a reordered date. Fixed by
+# context instead of shape — a currency symbol/code close to the number
+# suppresses the date interpretation, so a transposed price is still an
+# exact-string mismatch and gets caught, while the date fix above (nothing
+# currency-shaped nearby) is untouched. ---
+assert check_numbers("Bonus: $20.09", "Bonus: $9.20") != [], "a transposed price must still be caught"
+assert check_numbers("Min deposit $10.15", "Min deposit $15.10") != []
+assert check_numbers("Cashback: 1500 USDT", "Кэшбэк: 1500 USDT") == []  # unaffected sanity check
+print("[OK] check_numbers: the short-date fix doesn't come at the cost of missing a genuinely transposed "
+      "price — a number sitting next to a currency symbol or code keeps its exact digit order compared, "
+      "even though it's shaped just like a reorderable date")
+
+# --- emoji: presence/absence (folded into check_punctuation, same as
+# check_mixed_script — no separate checkbox) and spacing around an emoji.
+# Александр's ask (2026-09-17): the platform wasn't reliably catching a
+# missing emoji, or an emoji glued to surrounding text without a space. ---
+from app.rule_checks import check_emoji, check_punctuation
+
+emoji_src = "Halloween Lootbox 🔥\n\nResults sent to this bot 🫶"
+assert check_emoji(emoji_src, "Хэллоуин Lootbox 🔥\n\nРезультаты придут в бот 🫶") == []
+missing_emoji = check_emoji(emoji_src, "Хэллоуин Lootbox\n\nРезультаты придут в бот")
+assert missing_emoji and missing_emoji[0]["type"] == "emoji" and "🔥" in missing_emoji[0]["message"] \
+    and "🫶" in missing_emoji[0]["message"], missing_emoji
+unspaced = check_emoji(emoji_src, "Хэллоуин Lootbox🔥\n\nРезультаты придут в бот 🫶")
+assert any("отделён" in f["message"] for f in unspaced) and "🔥" in unspaced[-1]["message"], unspaced
+assert check_emoji("I ❤️ this", "Мне это ❤️ нравится") == []  # variation-selector heart survives intact
+# check_punctuation must pick up an emoji finding on its own (not just
+# piggyback on an unrelated mixed-script hit) — a purely-emoji case with
+# no other punctuation/script issue at all proves the wiring itself.
+assert any(f["type"] == "emoji" for f in check_punctuation("Go 🔥", "Иди")), \
+    "check_punctuation must include emoji findings automatically, no separate checkbox needed"
+print("[OK] check_emoji: a missing/extra emoji between source and translation is caught (folded into "
+      "\"Оформление\" automatically, same as check_mixed_script), and an emoji glued to surrounding text "
+      "without a space is flagged separately from presence/absence")
+
+# --- three spacing false positives caught in review (2026-09-17), all
+# fixed: (1) a flag emoji (two regional-indicator code points, no ZWJ
+# between them) must never look "unspaced from itself"; (2) two or more
+# DIFFERENT emoji clustered together with no space between them ("🎉🔥💰")
+# is completely normal promo style, not a spacing mistake; (3) ordinary
+# punctuation hugging an emoji on either side ("Поздравляем!🎉",
+# "(🔥 предложение)") is fine — only an actual letter/digit glued directly
+# to the emoji is the real problem. ---
+assert check_emoji("Welcome to Brazil 🇧🇷!", "Добро пожаловать в Бразилию 🇧🇷!") == []
+assert check_emoji("Win big 🎉🔥💰", "Крупный выигрыш 🎉🔥💰") == []
+assert check_emoji("Congrats!🎉", "Поздравляем!🎉") == []
+assert check_emoji("(🔥 hot deal)", "(🔥 горячее предложение)") == []
+# ...while a letter genuinely touching the emoji is still caught.
+assert check_emoji("Lootbox 🔥 event", "Lootbox🔥 событие") != []
+print("[OK] check_emoji spacing: a flag (two joined regional-indicator letters), a cluster of several "
+      "different emoji together, and an emoji hugging ordinary punctuation on either side are all left "
+      "alone — only an emoji glued directly to a letter/digit is flagged")
+
+# --- completeness vs untranslatable: an English brand/term/event name left
+# untranslated in a Russian source (_source_lang_note's own special rule)
+# must not tell the model two contradictory things when both checks are
+# selected together (the common case, both default on) — defer to the
+# more specific "непереводимые термины" category when it's part of the
+# run, falling back to "неполнота перевода" only when it isn't. ---
+from app.claude_client import _source_lang_note
+
+assert "непереводимые термины" in _source_lang_note("ru", ["untranslatable", "completeness"])
+assert "неполнота перевода" not in _source_lang_note("ru", ["untranslatable", "completeness"])
+assert "неполнота перевода" in _source_lang_note("ru", ["completeness"])
+assert "непереводимые термины" not in _source_lang_note("ru", ["completeness"])
+assert _source_lang_note("ru", None) != "" and "неполнота перевода" in _source_lang_note("ru", None)
+assert _source_lang_note("en", ["untranslatable"]) == ""  # only applies to a Russian source at all
+print("[OK] _source_lang_note: an English term left untranslated in a Russian source is filed under "
+      "«непереводимые термины» when that check is selected (avoiding a contradiction with its own "
+      "\"unchanged is correct\" rule), and only falls back to «неполнота перевода» when it isn't")
+
 # --- placeholders check: a literal "\u00A0" escape token (some of
 # Александр's Crowdin exports write a non-breaking space out this way,
 # rather than as the actual invisible character) must be recognized as a
@@ -1625,6 +1726,35 @@ from app.claude_client import CHECK_LABELS
 
 assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
 print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки»")
+
+# --- untranslatable: Александр's real feedback (2026-09-17) — a confusing
+# self-contradicting finding ("'Grand Prix' shouldn't have been translated,
+# but it correctly stayed 'Grand Prix' — error") shows the model needs an
+# EXPLICIT instruction that leaving such a term untouched is always
+# correct, never a finding to report on its own. Also broadens the
+# category (events/promos, not just tournaments/games/brands/products) and
+# gives the model a concrete cross-check: if the source itself already
+# left the term untranslated, that's strong evidence it should stay
+# untranslated everywhere. ---
+assert "ПРАВИЛЬНО, находки быть не должно" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "САМОМ ИСХОДНИКЕ" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "акций" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+print("[OK] «непереводимые термины» now explicitly tells the model that a term left untouched in "
+      "translation is always correct on its own (never a finding), and to treat the source itself "
+      "already leaving a term untranslated as a signal it should stay that way in every language")
+
+# --- completeness: Александр's real feedback (2026-09-17) — the check was
+# missing cases where a whole sentence/chunk of the source was dropped
+# from the translation entirely (not left in the source language, just
+# GONE), while still correctly staying silent on natural, small stylistic
+# omissions (a dropped article/filler word). The label now names this
+# third case explicitly and draws the small-vs-large line in words. ---
+assert "ПРОПУЩЕН из перевода целиком" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+assert "естественное опущение одного-двух слов" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+assert "КУСОК СМЫСЛА" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+print("[OK] «неполнота перевода» now explicitly covers a whole sentence/chunk being dropped from the "
+      "translation entirely (not just left-over source-language text), while still distinguishing that "
+      "from a small, natural stylistic omission that isn't a finding")
 
 # --- a plain misspelling in the translation itself ("resulits" for
 # "results") must be in scope too, even though the meaning is still

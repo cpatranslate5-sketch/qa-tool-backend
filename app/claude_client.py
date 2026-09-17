@@ -36,15 +36,30 @@ CHECK_LABELS = {
         "(например, евро вместо доллара, или другой ISO-код) — это меняет смысл суммы, а не просто стиль"
     ),
     "untranslatable": (
-        "непереводимые термины — имена турниров/игр/брендов/продуктов. Сообщай, только если термин в переводе изменён, "
-        "переведён по смыслу или с ошибкой; транслитерация и падежные окончания — не ошибка, обычные слова не считаются. "
-        "При конфликте с «Особыми указаниями» ниже — следуй им"
+        "непереводимые термины — имена турниров/событий/игр/брендов/продуктов/акций, а также устоявшиеся "
+        "маркетинговые слова, которые обычно оставляют как есть (например «VIP», «Lootbox», название турнира вроде "
+        "«Grand Prix»). Сильный сигнал, что термин непереводимый: если он уже в САМОМ ИСХОДНИКЕ оставлен нетронутым "
+        "(написан на другом языке/латиницей внутри текста на другом языке/скрипте) — значит, почти наверняка он "
+        "должен остаться таким же нетронутым и в переводе. Сообщай находку ТОЛЬКО если термин в переводе реально "
+        "ИЗМЕНЁН — переведён по смыслу, искажён или пропущен; транслитерация и падежные/грамматические окончания — "
+        "это НЕ ошибка. Если термин в переводе остался ровно как в исходнике (в любом виде — на языке оригинала, "
+        "транслитерацией, с окончанием по грамматике целевого языка) — это ПРАВИЛЬНО, находки быть не должно, даже "
+        "если может показаться, что его \"следовало\" перевести — не сообщай о том, что и так сделано верно. При "
+        "конфликте с «Особыми указаниями» ниже — следуй им"
     ),
     "completeness": (
-        "неполнота перевода — куски исходного текста, оставшиеся непереведёнными внутри перевода, ИЛИ перевод целиком "
-        "на другом языке, чем требуемый целевой (например, вставлен не тот язык, или перевод не изменился с другого "
-        "родственного языка). Не путать с пустым переводом (отдельная проверка) или с иной длиной перевода — сама по "
-        "себе длина не проблема"
+        "неполнота перевода — ЛЮБОЙ случай, когда содержательный кусок исходного текста не дошёл до перевода: (1) "
+        "обычные слова/фраза/предложение по ОШИБКЕ остались НЕПЕРЕВЕДЁННЫМИ, просто скопированы внутри перевода как "
+        "есть, хотя должны были быть переведены (это НЕ относится к отдельным именам/брендам/терминам, которые "
+        "правильно оставлены нетронутыми намеренно — за них отвечает отдельная проверка «непереводимые термины», "
+        "и там это не находка); (2) весь перевод "
+        "сделан на другом языке, чем требуемый целевой (например, вставлен не тот язык, или перевод не изменился с "
+        "другого родственного языка); (3) целое предложение, пункт списка или значимый смысловой кусок ПРОПУЩЕН из "
+        "перевода целиком — просто отсутствует в переводе в каком бы то ни было виде. Пункт (3) — это НЕ то же самое, "
+        "что естественное опущение одного-двух слов ради благозвучия (артикль, вводное слово, лёгкая перестройка "
+        "фразы) — такое нормально и не считается находкой; флагуй именно когда пропадает целый КУСОК СМЫСЛА — целое "
+        "предложение, целый пункт правил, значимая часть информации, которую читатель перевода вообще не увидит. Не "
+        "путать с пустым переводом (отдельная проверка) или с иной длиной перевода — сама по себе длина не проблема"
     ),
 }
 
@@ -142,17 +157,29 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 ]"""
 
 
-def _source_lang_note(source_lang: str) -> str:
+def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
     """Client-specific rule: when the source is Russian, English words or
     phrases embedded in it (brand names, terms, rare exceptions aside)
     should stay in English in every target translation too — not be
-    translated into the target language."""
+    translated into the target language.
+
+    Which check-type a violation is filed under depends on what's actually
+    selected: "untranslatable" (see CHECK_LABELS) is the more specific,
+    natural home for exactly this pattern — an English brand/term/event
+    name left untranslated in a Russian source is usually the same thing
+    CHECK_LABELS["untranslatable"] already asks about — so defer to it
+    when it's part of this run, and only fall back to "неполнота перевода"
+    when "untranslatable" isn't selected at all. Without this, a run with
+    BOTH checks selected (the common case — both default on) could tell
+    the model two different, contradictory things about the identical
+    pattern in the same prompt."""
     if source_lang.strip().lower() != "ru":
         return ""
+    category = "непереводимые термины" if checks and "untranslatable" in checks else "неполнота перевода"
     return (
         "Особое правило: если в русском исходнике есть слова или фразы на английском (не считая редких "
         "исключений), они должны остаться на английском и в переводе на другой язык — не переводиться. Если такой "
-        "фрагмент всё же переведён на язык перевода, это ошибка (относи к «неполнота перевода»)."
+        f"фрагмент всё же переведён на язык перевода, это ошибка (относи к «{category}»)."
     )
 
 
@@ -712,7 +739,7 @@ async def run_ai_checks(
     prompt = SINGLE_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
         calibration=_calibration(checks),
-        source_lang_note=_source_lang_note(source_lang),
+        source_lang_note=_source_lang_note(source_lang, checks),
         source=source,
         translation=translation,
         extra_instructions=extra_instructions.strip() or "нет",
@@ -793,7 +820,7 @@ def build_batch_prompt(
     prompt = BATCH_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
         calibration=_calibration(checks),
-        source_lang_note=_source_lang_note(source_lang),
+        source_lang_note=_source_lang_note(source_lang, checks),
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
         register_instructions=register_instructions,

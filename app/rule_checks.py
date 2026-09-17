@@ -48,6 +48,68 @@ _THOUSANDS_GROUPED_RE = re.compile(r"^\d{1,3}(?:,\d{3})+$")
 # amounts/counts/percentages.
 _DOT_THOUSANDS_GROUPED_RE = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
 
+# The Indian numbering system (lakh/crore) groups thousands differently —
+# ONE group of 3 digits at the end, then every group before that is only 2
+# digits: 100000 is "1,00,000" (not "100,000"), 1500000 is "15,00,000",
+# 10000000 ("1 crore") is "1,00,00,000". Александр's concrete case
+# (2026-09-17): a rupee amount written "₹1,00,000" in an Indian-language
+# target column for the same value as "₹100,000" in the English source —
+# correctly localized, but check_numbers had no idea "1,00,000" was even
+# valid thousands grouping at all (it doesn't match the plain Western
+# comma-every-3-digits shape above), so it fell through to being treated
+# as a literal, un-normalized string and compared unequal to "100000".
+# This shape is distinctive enough (a leading 1-2 digit group, then only
+# 2-digit comma groups, ending in one final 3-digit group) that it's safe
+# to recognize unconditionally — it never collides with a genuine Western
+# thousands grouping or a date (dates use "." or "/", never ",").
+_INDIAN_THOUSANDS_GROUPED_RE = re.compile(r"^\d{1,2}(?:,\d{2})+,\d{3}$")
+
+# A short date written with a single "." and no year at all — "20.09"
+# (day.month) or "09.20" (month.day) — Александр's other concrete case
+# (2026-09-17): the existing multiset date comparison below only kicked in
+# for a date with 2+ separators (a full day.month.year), because a plain
+# 1-separator token was assumed to be an ordinary decimal number ("0.40")
+# and had to stay a single atom for THAT case to compare correctly. A
+# slash- or hyphen-separated short date ("09/20", "20-09") never had this
+# problem to begin with — "/" and "-" aren't part of NUMBER_RE's own
+# character class, so they're already split into separate digit tokens by
+# _flatten_number_matches before any of this runs. Only the dot-joined
+# form needed a fix. Gated on BOTH parts looking like plausible day/month
+# digits (1-31) AND (see _near_currency_marker below) not sitting next to
+# a currency symbol/code — a real decimal price ("45.67", or "$20.09")
+# has every reason to have both halves in that range, so this stays safe
+# for ordinary currency amounts
+# values while fixing exactly the day/month-swap case Александр described.
+def _looks_like_short_date(tok: str) -> bool:
+    parts = tok.split(".")
+    return len(parts) == 2 and all(p.isdigit() and 1 <= int(p) <= 31 for p in parts)
+
+
+# The short-date fix above is genuinely ambiguous on the token alone: a
+# real 2-decimal-place price ("$20.09", "$9.20", "$10.15" — completely
+# ordinary in these casino/promo documents) has EXACTLY the same shape as
+# a day.month date, and reviewing this live confirmed the risk was real:
+# without this guard, check_numbers("Bonus: $20.09", "Bonus: $9.20")
+# incorrectly returned no findings at all — a genuine transposition typo
+# silently passing. Disambiguated by CONTEXT instead of shape: a date
+# essentially never sits directly next to a currency marker, while a price
+# almost always does — so the short-date decomposition is suppressed only
+# when a currency symbol or code is close enough to plausibly belong to
+# this exact number, leaving it as one exact-comparison atom (the same,
+# safe, pre-fix behavior) precisely where it matters most.
+_CURRENCY_SYMBOL_RE = re.compile(r"[$€£¥₹₼₴₸₩₪₫฿₽₦₱]")
+_CURRENCY_CODE_RE = re.compile(r"\b(?:USD|EUR|RUB|USDT|GBP|INR|AZN|TRY|UZS|KZT|KGS|TJS|BRL|MXN|KRW)\b", re.IGNORECASE)
+_CURRENCY_CONTEXT_WINDOW = 6
+
+
+def _near_currency_marker(text: str, start: int, end: int) -> bool:
+    before = text[max(0, start - _CURRENCY_CONTEXT_WINDOW):start]
+    after = text[end:end + _CURRENCY_CONTEXT_WINDOW]
+    return bool(
+        _CURRENCY_SYMBOL_RE.search(before) or _CURRENCY_SYMBOL_RE.search(after)
+        or _CURRENCY_CODE_RE.search(before) or _CURRENCY_CODE_RE.search(after)
+    )
+
 # A plain space (regular, non-breaking, or thin) is ALSO a standard
 # thousands separator — it's how Russian formats a big number ("1 500 000"),
 # while the same value shows up comma-grouped in English/Spanish
@@ -92,6 +154,8 @@ def _normalize_number(tok: str) -> str:
         return tok.replace(",", "")
     if _DOT_THOUSANDS_GROUPED_RE.match(tok):
         return tok.replace(".", "")
+    if _INDIAN_THOUSANDS_GROUPED_RE.match(tok):
+        return tok.replace(",", "")
     m = _DECIMAL_COMMA_RE.match(tok)
     normalized = f"{m.group(1)}.{m.group(2)}" if m else tok
     if "." not in normalized and len(normalized) > 1:
@@ -99,7 +163,7 @@ def _normalize_number(tok: str) -> str:
     return normalized
 
 
-def _decompose_grouped(tok: str) -> list[str]:
+def _decompose_grouped(tok: str, allow_short_date: bool = True) -> list[str]:
     """A token that's unambiguously a comma- or period-grouped THOUSANDS
     number ("1,400", "1.400", "1,500,000", "1.500.000") is one single value
     — _normalize_number above already merges its separators away, so it
@@ -122,21 +186,32 @@ def _decompose_grouped(tok: str) -> list[str]:
     against its own, correctly reordered/reformatted translation.
     A token with 0-1 separators (an ordinary decimal, or a single
     thousands-grouping comma like "50,000") is left as one atom via
-    _normalize_number, so a genuinely different number is still caught."""
+    _normalize_number, so a genuinely different number is still caught —
+    EXCEPT a 1-dot, both-halves-look-like-a-day-or-month token ("20.09",
+    "09.20") that ISN'T sitting next to a currency marker, which is exactly
+    as order-sensitive a false positive as the 2+-separator case above
+    (Александр's second date example, 2026-09-17: a short day.month date
+    with no year at all, "20.09" vs "09/20" between languages) — see
+    _looks_like_short_date's and _near_currency_marker's own comments for
+    why an ordinary price is kept safely out of this."""
     normalized = _normalize_number(tok)
-    if normalized != tok or (tok.count(".") + tok.count(",")) < 2:
+    if normalized != tok:
         return [normalized]
-    return [_normalize_number(part) for part in re.split(r"[.,]", tok) if part]
+    sep_count = tok.count(".") + tok.count(",")
+    if sep_count >= 2:
+        return [_normalize_number(part) for part in re.split(r"[.,]", tok) if part]
+    if allow_short_date and _looks_like_short_date(tok):
+        return [_normalize_number(part) for part in re.split(r"[.,]", tok) if part]
+    return [normalized]
 
 
-def _extract_numbers(text: str) -> list[str]:
-    return NUMBER_RE.findall(_merge_space_thousands(text))
-
-
-def _flatten_numbers(nums: list[str]) -> list[str]:
+def _flatten_number_matches(text: str) -> list[str]:
+    merged = _merge_space_thousands(text)
     out: list[str] = []
-    for n in nums:
-        out.extend(_decompose_grouped(n))
+    for m in NUMBER_RE.finditer(merged):
+        tok = m.group(0)
+        allow_short_date = not _near_currency_marker(merged, m.start(), m.end())
+        out.extend(_decompose_grouped(tok, allow_short_date=allow_short_date))
     return out
 
 
@@ -145,10 +220,8 @@ def _extract_placeholders(text: str) -> list[str]:
 
 
 def check_numbers(source: str, translation: str) -> list[dict]:
-    src_nums = _extract_numbers(source)
-    tr_nums = _extract_numbers(translation)
-    src_flat = _flatten_numbers(src_nums)
-    tr_flat = _flatten_numbers(tr_nums)
+    src_flat = _flatten_number_matches(source)
+    tr_flat = _flatten_number_matches(translation)
     findings = []
     if sorted(src_flat) != sorted(tr_flat):
         # Point at the SPECIFIC number(s) that actually differ, not a dump
@@ -285,6 +358,102 @@ def check_mixed_script(translation: str) -> list[dict]:
     }]
 
 
+# Emoji detection — Александр's ask (2026-09-17): the platform wasn't
+# reliably catching an emoji that's present in the source but missing from
+# the translation, and didn't check that an emoji in the translation is
+# actually separated from surrounding text by a space, the way his promo
+# copy always formats it ("...Max 🔥", "...bot 🫶"). Covers the two
+# supplementary-plane blocks that hold almost every real-world emoji
+# (pictographs/emoticons/transport/supplemental/extended-A, U+1F000-1FFFF —
+# a deliberately wide net across that whole plane rather than every
+# sub-block by name, since new emoji keep landing in gaps between the
+# official sub-ranges) plus the two BMP symbol blocks that hold the rest
+# (misc symbols & dingbats like ❤️✅☀️, misc symbols & arrows like ⭐⬛).
+# A flag (two regional-indicator letters, e.g. 🇧🇷 = "BR" as two special
+# code points with NO joiner between them) is matched as its own two-
+# code-point unit FIRST, since the general branch below would otherwise
+# treat each half as its own separate "emoji" — that was a real bug caught
+# in review: without this, a flag's own two halves looked "unspaced" from
+# each other. The general branch also groups a variation selector (️
+# U+FE0F — turns a plain symbol like "❤" into its emoji-presentation form
+# "❤️"), a skin-tone modifier, or a ZWJ-joined second emoji onto the same
+# match, so a compound sequence counts as ONE emoji, not two or three.
+_EMOJI_BASE_RANGES = "\U0001F000-\U0001FFFF" "\U00002600-\U000027BF" "\U00002B00-\U00002BFF"
+_REGIONAL_INDICATOR_RANGE = "\U0001F1E6-\U0001F1FF"
+EMOJI_RE = re.compile(
+    "(?:[" + _REGIONAL_INDICATOR_RANGE + "]{2})"
+    "|(?:[" + _EMOJI_BASE_RANGES + "])"
+    "(?:[\U0001F3FB-\U0001F3FF\U0000FE0F]|\U0000200D[" + _EMOJI_BASE_RANGES + "])*"
+)
+
+
+def _extract_emoji(text: str) -> list[str]:
+    return EMOJI_RE.findall(text)
+
+
+# The real problem this check is for is an emoji glued directly to a WORD
+# ("Lootbox🔥") — punctuation of any kind hugging an emoji with no space
+# (either side — "Поздравляем!🎉", "(🔥 предложение)", "штуки🎉,") is
+# ordinary, legitimate copy, not a spacing mistake, and neither is two+
+# emoji clustered together with no space between them ("🎉🔥💰", checked
+# separately below via touches_prev/touches_next). So rather than trying
+# to enumerate every acceptable punctuation mark (and inevitably missing
+# one), this only flags an actual LETTER or DIGIT — in any script — sitting
+# directly against the emoji with nothing between them.
+
+
+def check_emoji(source: str, translation: str) -> list[dict]:
+    findings = []
+    src_emoji = _extract_emoji(source)
+    tr_emoji = _extract_emoji(translation)
+    if sorted(src_emoji) != sorted(tr_emoji):
+        src_counter = Counter(src_emoji)
+        tr_counter = Counter(tr_emoji)
+        missing = sorted((src_counter - tr_counter).elements())
+        extra = sorted((tr_counter - src_counter).elements())
+        parts = []
+        if missing:
+            parts.append(f"есть в исходнике, нет в переводе: {' '.join(missing)}")
+        if extra:
+            parts.append(f"есть в переводе, нет в исходнике: {' '.join(extra)}")
+        findings.append({
+            "type": "emoji",
+            "severity": "medium",
+            "message": "Эмодзи в исходнике и переводе не совпадают — " + "; ".join(parts) + ".",
+        })
+
+    # Every emoji in the translation should be set off from surrounding text
+    # by a space (or sit right at the very start/end of the string, next to
+    # ordinary hugging punctuation, or next to another emoji in a cluster)
+    # — a separate, purely formatting concern from whether the RIGHT emoji
+    # made it into the translation at all, so it's reported independently
+    # and doesn't care whether the presence check above also fired.
+    matches = list(EMOJI_RE.finditer(translation))
+    unspaced = []
+    for i, m in enumerate(matches):
+        touches_prev = i > 0 and matches[i - 1].end() == m.start()
+        touches_next = i + 1 < len(matches) and matches[i + 1].start() == m.end()
+        before_ok = (
+            m.start() == 0 or touches_prev or not translation[m.start() - 1].isalnum()
+        )
+        after_ok = (
+            m.end() == len(translation) or touches_next or not translation[m.end()].isalnum()
+        )
+        if not before_ok or not after_ok:
+            unspaced.append(m.group(0))
+    if unspaced:
+        shown = " ".join(sorted(set(unspaced)))
+        findings.append({
+            "type": "emoji",
+            "severity": "low",
+            "message": (
+                f"В переводе эмодзи не отделён(ы) пробелом от текста рядом (должен быть пробел до и после, "
+                f"если это не самое начало/конец строки): {shown}."
+            ),
+        })
+    return findings
+
+
 def check_punctuation(source: str, translation: str, lang_code: str = "") -> list[dict]:
     findings = []
     src = source.rstrip()
@@ -307,6 +476,7 @@ def check_punctuation(source: str, translation: str, lang_code: str = "") -> lis
         })
 
     findings += check_mixed_script(translation)
+    findings += check_emoji(source, translation)
 
     return findings
 
