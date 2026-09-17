@@ -209,15 +209,67 @@ def _checks_description(checks: list[str]) -> str | None:
 # route them to the report instead of the visible findings list.
 REGISTER_VALUE_TYPE = "register_value"
 
+# Unlike formal/informal/neutral above, "mixed" (the model reports it when
+# ONE row's translation itself switches between «ты» and «вы» instead of
+# using one consistently — Александр's ask, 2026-09-17: a single cell can
+# hold several sentences/paragraphs, and the tone can genuinely drift
+# mid-cell) IS a real problem worth the manager's attention — internal
+# inconsistency within one string, not a matter of which tone the
+# document as a whole should use. So it's never folded into
+# build_register_report's majority/exception counting (a "mixed" row is
+# neither a vote for the majority nor a counted exception) — instead
+# _register_mixed_finding() below turns it into an ordinary visible
+# finding on that exact row, synthesized entirely on our side (the model
+# only ever needs to report the plain value; it never has to also invent
+# a second, separate finding for the same thing).
+REGISTER_MIXED_TYPE = "register_mixed"
 
-def _register_instructions(checks: list[str], batch: bool) -> str:
-    """Empty string when "register" isn't selected (nothing added to the
-    prompt at all). Otherwise, a clearly separate paragraph — deliberately
-    NOT folded into the "Что проверять" problem list _checks_description
-    builds — asking the model to classify the register actually used, for
-    every pair, regardless of whether it's "correct": this is
-    information-gathering, not error-detection, so it must never be
-    described to the model as a problem to avoid or a mistake to flag.
+
+def _register_mixed_finding() -> dict:
+    return {
+        "type": REGISTER_MIXED_TYPE,
+        "severity": "medium",
+        "message": (
+            "В этой строке смешаны разные формы обращения к пользователю — где-то «вы», где-то «ты» — "
+            "внутри одного и того же текста. Проверьте, не разошёлся ли тон посреди фразы."
+        ),
+    }
+
+# Languages with no grammatical formal/informal distinction in the word
+# for "you" at all (English's single "you" being Александр's own example,
+# 2026-09-17) — for these, asking the model to classify "вы"/"ты" has
+# nothing real to go on, and would otherwise have it guessing a tone from
+# indirect style cues (word choice, "please", contractions) instead of an
+# actual grammatical marker, producing an unreliable pseudo-tone. Rather
+# than have the model try (and build_register_report show a shaky
+# result), the register instructions are skipped ENTIRELY for these
+# languages — no register_value entries are ever asked for or returned,
+# so no register report is built at all, exactly as if "register" hadn't
+# been selected for that language.
+#
+# Deliberately conservative: only a language actually confirmed to lack
+# this distinction belongs here. Many languages that might look similar at
+# a glance still do have a real marker (German du/Sie, Spanish tú/usted,
+# Turkish sen/siz, Hindi tu/tum/aap, Chinese 你/您, ...) — those are left
+# to the model, which handles them well. Add another base language code
+# here only once actually confirmed to have no such distinction at all.
+NO_REGISTER_DISTINCTION_LANGS = {"en"}
+
+
+def _lacks_register_distinction(target_lang: str) -> bool:
+    return target_lang.strip().lower().split("-")[0] in NO_REGISTER_DISTINCTION_LANGS
+
+
+def _register_instructions(checks: list[str], batch: bool, target_lang: str = "") -> str:
+    """Empty string when "register" isn't selected, or when target_lang is
+    one of NO_REGISTER_DISTINCTION_LANGS above (nothing added to the
+    prompt at all either way). Otherwise, a clearly separate paragraph —
+    deliberately NOT folded into the "Что проверять" problem list
+    _checks_description builds — asking the model to classify the
+    register actually used, for every pair, regardless of whether it's
+    "correct": this is information-gathering, not error-detection, so it
+    must never be described to the model as a problem to avoid or a
+    mistake to flag.
 
     batch=True (BATCH_PROMPT, several pairs of one language visible
     together) asks for one entry per pair, tagged by row number, matching
@@ -225,7 +277,7 @@ def _register_instructions(checks: list[str], batch: bool) -> str:
     exactly one pair — the standalone /check endpoint) asks for exactly
     one entry with no row number, since that prompt's own findings don't
     carry one either."""
-    if "register" not in checks:
+    if "register" not in checks or _lacks_register_distinction(target_lang):
         return ""
     if batch:
         return (
@@ -233,31 +285,42 @@ def _register_instructions(checks: list[str], batch: bool) -> str:
             "как переведено на самом деле: добавь в тот же JSON-массив ОДНУ дополнительную запись на КАЖДУЮ "
             "пару из списка «Пары для проверки» выше, даже если для неё нет ни одной обычной находки, "
             f'строго в форме {{"row": <номер пары>, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", '
-            '"value": "formal|informal|neutral", "message": ""} — value: "formal", если в ПЕРЕВОДЕ этой пары '
-            'использовано обращение на «вы» (или аналог для этого языка); "informal", если на «ты»; '
-            '"neutral", если в переводе этой конкретной пары нет прямого обращения к пользователю вообще '
-            '(например, только название, число, техническая метка) — тогда не угадывай по смыслу, отвечай '
-            '"neutral". Это НЕ находка об ошибке — не описывай её как проблему, не оценивай, правильная это '
-            "форма или нет, просто зафиксируй, что реально написано в переводе.\n"
+            '"value": "formal|informal|neutral|mixed", "message": ""} — value: "formal", если в ПЕРЕВОДЕ этой '
+            'пары использовано обращение на «вы» (или аналог для этого языка); "informal", если на «ты»; '
+            '"mixed", если В ПРЕДЕЛАХ ЭТОЙ ОДНОЙ пары (перевод может состоять из нескольких предложений или '
+            'абзацев в одной ячейке) обращение к пользователю НЕПОСЛЕДОВАТЕЛЬНО — где-то встречается «вы», а '
+            'где-то «ты», а не одна форма единообразно на протяжении всего текста пары; "neutral", если в '
+            'переводе этой конкретной пары нет прямого обращения к пользователю вообще (например, только '
+            'название, число, техническая метка) — тогда не угадывай по смыслу, отвечай "neutral". Это НЕ '
+            "находка об ошибке — не описывай её как проблему, не оценивай, правильная это форма или нет, "
+            "просто зафиксируй, что реально написано в переводе (кроме значения \"mixed\" — это описание "
+            "реального факта смешения форм внутри одной ячейки, а не оценка).\n"
         )
     return (
         "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, как "
         "переведено на самом деле: добавь в тот же JSON-массив ОДНУ дополнительную запись, строго в форме "
-        f'{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal|informal|neutral", '
+        f'{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal|informal|neutral|mixed", '
         '"message": ""} — value: "formal", если в переводе использовано обращение на «вы» (или аналог для '
-        'этого языка); "informal", если на «ты»; "neutral", если в переводе нет прямого обращения к '
-        'пользователю вообще — тогда не угадывай по смыслу, отвечай "neutral". Это НЕ находка об ошибке — не '
-        "описывай её как проблему, не оценивай, правильная это форма или нет, просто зафиксируй, что реально "
-        "написано в переводе.\n"
+        'этого языка); "informal", если на «ты»; "mixed", если в пределах ЭТОГО ОДНОГО перевода (он может '
+        'состоять из нескольких предложений или абзацев) обращение к пользователю непоследовательно — где-то '
+        'встречается «вы», а где-то «ты», а не одна форма единообразно на протяжении всего текста; "neutral", '
+        'если в переводе нет прямого обращения к пользователю вообще — тогда не угадывай по смыслу, отвечай '
+        '"neutral". Это НЕ находка об ошибке — не описывай её как проблему, не оценивай, правильная это форма '
+        "или нет, просто зафиксируй, что реально написано в переводе (кроме значения \"mixed\" — это описание "
+        "реального факта смешения форм внутри одного текста, а не оценка).\n"
     )
 
 
-def _register_array_note(checks: list[str]) -> str:
+def _register_array_note(checks: list[str], target_lang: str = "") -> str:
     """Appended to the "(пустой массив [] ...)" output-format line so it
     stays true once _register_instructions adds its own mandatory entries
     — without this, "пустой массив, если проблем нет" would directly
-    contradict "add one entry per pair regardless" a few lines above it."""
-    if "register" not in checks:
+    contradict "add one entry per pair regardless" a few lines above it.
+    Mirrors _register_instructions' own no-distinction-language skip (see
+    NO_REGISTER_DISTINCTION_LANGS) — when no register instructions were
+    actually added to the prompt, this note has nothing to justify and
+    must stay empty too."""
+    if "register" not in checks or _lacks_register_distinction(target_lang):
         return ""
     return " — но если выбран регистр обращения, эти дополнительные записи всё равно обязательны"
 
@@ -596,7 +659,7 @@ async def run_ai_checks(
     against below by checking checks_description OR "register" in checks,
     not just checks_description alone."""
     checks_description = _checks_description(checks)
-    register_instructions = _register_instructions(checks, batch=False)
+    register_instructions = _register_instructions(checks, batch=False, target_lang=target_lang)
     if not checks_description and not register_instructions:
         return [], 0.0
 
@@ -609,7 +672,7 @@ async def run_ai_checks(
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
         register_instructions=register_instructions,
-        register_array_note=_register_array_note(checks),
+        register_array_note=_register_array_note(checks, target_lang=target_lang),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
     )
     model = _model_for_lang(target_lang)
@@ -622,14 +685,22 @@ async def run_ai_checks(
         register_findings = [f for f in findings if f.get("type") == REGISTER_VALUE_TYPE]
         findings = [f for f in findings if f.get("type") != REGISTER_VALUE_TYPE]
         value = register_findings[0].get("value") if register_findings else None
-        report = build_register_report({0: value} if value else {}, single=True)
-        if report is not None:
-            findings.append({
-                "type": "register_summary",
-                "severity": "low",
-                "message": f"Тон обращения: {report['text']}.",
-                "register_majority": report["majority"],
-            })
+        if value == "mixed":
+            # This one pair's own translation switches tone mid-text — a
+            # real problem on its own, unrelated to any "majority tone"
+            # question (there's nothing else to compare a single pair
+            # against anyway), so it's shown as a plain finding instead of
+            # going through build_register_report at all.
+            findings.append(_register_mixed_finding())
+        else:
+            report = build_register_report({0: value} if value else {}, single=True)
+            if report is not None:
+                findings.append({
+                    "type": "register_summary",
+                    "severity": "low",
+                    "message": f"Тон обращения: {report['text']}.",
+                    "register_majority": report["majority"],
+                })
 
     return findings, _usage_cost(model, usage)
 
@@ -659,7 +730,7 @@ def build_batch_prompt(
     group_batch_findings once you have the model's response.
     """
     checks_description = _checks_description(checks)
-    register_instructions = _register_instructions(checks, batch=True)
+    register_instructions = _register_instructions(checks, batch=True, target_lang=target_lang)
     if not checks_description and not register_instructions:
         return None, {}
 
@@ -680,7 +751,7 @@ def build_batch_prompt(
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
         register_instructions=register_instructions,
-        register_array_note=_register_array_note(checks),
+        register_array_note=_register_array_note(checks, target_lang=target_lang),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
         pairs_block=pairs_block,
     )

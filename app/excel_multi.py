@@ -15,6 +15,7 @@ from app.claude_client import (
     _ai_failure_warning,
     _filter_findings_by_checks,
     _model_for_lang,
+    _register_mixed_finding,
     _truncation_warning,
     _usage_cost,
     build_batch_prompt,
@@ -592,7 +593,17 @@ def _extract_register_values(grouped: dict[int, list[dict]]) -> tuple[dict[int, 
     Must run BEFORE either caller's "if findings: show this row" check —
     a register_value entry exists for every checked row regardless of
     whether there's a real problem, so leaving it in would make every
-    single row look like it has a finding."""
+    single row look like it has a finding.
+
+    A "mixed" value — this ONE row's own translation switches between
+    «ты» and «вы» within itself, rather than using one consistently
+    (Александр's ask, 2026-09-17: a single Excel cell can hold several
+    sentences/paragraphs, and the tone can genuinely drift mid-cell) — is
+    deliberately NOT put into the returned values dict at all: it's not a
+    vote for the document's majority tone or a counted exception, it's a
+    real problem on this specific row, so it's turned into an ordinary
+    visible finding right here instead (via _register_mixed_finding) and
+    kept in the row's own findings list, same as any other real finding."""
     cleaned: dict[int, list[dict]] = {}
     values: dict[int, str] = {}
     for idx, findings in grouped.items():
@@ -600,7 +611,9 @@ def _extract_register_values(grouped: dict[int, list[dict]]) -> tuple[dict[int, 
         for f in findings:
             if f.get("type") == REGISTER_VALUE_TYPE:
                 v = f.get("value")
-                if v in ("formal", "informal", "neutral"):
+                if v == "mixed":
+                    kept.append(_register_mixed_finding())
+                elif v in ("formal", "informal", "neutral"):
                     values[idx] = v
             else:
                 kept.append(f)

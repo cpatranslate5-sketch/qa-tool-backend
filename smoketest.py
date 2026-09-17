@@ -1807,8 +1807,10 @@ print("[OK] parse_workbook: per-channel character-limit columns (\"label: number
 # that). Replaced with a plain factual report of what's actually there,
 # which the manager reads and judges for themselves. ---
 from app.claude_client import (
+    NO_REGISTER_DISTINCTION_LANGS,
     REGISTER_VALUE_TYPE,
     _checks_description,
+    _lacks_register_distinction,
     _register_array_note,
     _register_instructions,
     build_register_report,
@@ -1837,6 +1839,29 @@ assert _register_array_note(["register"]) != ""
 print("[OK] _register_instructions carries the entire register task now (empty when not selected, "
       "explicitly framed as information-gathering rather than error-detection), and only the batch "
       "(multi-row) prompt tags entries by row number")
+
+# For a language with no grammatical formal/informal distinction at all
+# (English's single "you" — Александр's own example, 2026-09-17), the
+# register instructions/array-note are skipped ENTIRELY regardless of
+# region ("en-us"/"en-gb"), so no register_value entries are ever asked
+# for, and no register report is ever built for that language — not even
+# the old "couldn't determine" fallback line, since the model is never
+# asked in the first place. A language with a real distinction (Russian,
+# German, ...) is completely unaffected.
+assert _lacks_register_distinction("en") and _lacks_register_distinction("en-US") and _lacks_register_distinction("EN-gb")
+assert not _lacks_register_distinction("ru") and not _lacks_register_distinction("de")
+assert _register_instructions(["register"], batch=True, target_lang="en") == ""
+assert _register_instructions(["register"], batch=False, target_lang="en-us") == ""
+assert _register_array_note(["register"], target_lang="en") == ""
+# ...but still fully asked for when no target_lang is given at all (the
+# language-blind call shape every pre-existing test above already uses),
+# and for any language not in the deliberately small NO_REGISTER_DISTINCTION_LANGS set.
+assert _register_instructions(["register"], batch=True) != ""
+assert _register_instructions(["register"], batch=True, target_lang="de") != ""
+assert NO_REGISTER_DISTINCTION_LANGS == {"en"}, NO_REGISTER_DISTINCTION_LANGS
+print("[OK] register instructions are skipped entirely for a language with no formal/informal "
+      "distinction at all (English) — no register_value entries are ever requested for it, so no "
+      "register report (not even a \"couldn't determine\" fallback) is ever built for that language")
 
 # build_register_report: the actual Russian summary the manager reads,
 # now a structured dict (not a plain string) so a caller can colorize
@@ -1926,6 +1951,28 @@ settings.ANTHROPIC_API_KEY = ""
 print("[OK] standalone /check with only \"register\" selected turns a mocked AI response into a "
       "single register_summary finding — the raw register_value entry never reaches the visible "
       "findings list")
+
+# --- for a language with no formal/informal distinction (English), a
+# register-only /check must not call the AI AT ALL — a poison mock that
+# raises if invoked proves it, rather than just checking the output looks
+# right (which a lucky no-op response could also produce). ---
+async def _poison_call_claude(prompt, model=None):
+    raise AssertionError("the AI must never be called for a register-only check on a language with "
+                          "no formal/informal distinction (English) — nothing to ask it")
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _poison_call_claude
+r = check("register-only /check on English (no ты/вы distinction) never calls the AI at all", client.post(
+    "/check", json={"source": "Play now.", "translation": "Play now.", "checks": ["register"], "target_lang": "en"},
+))
+assert r.json()["findings"] == [], r.json()
+assert r.json()["cost_usd"] == 0.0, r.json()
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+print("[OK] a register-only check against English (no formal/informal distinction) skips the AI call "
+      "entirely — no register report is built (not even a \"couldn't determine\" fallback), and no "
+      "cost is incurred for asking a question the language has no real answer to")
 
 # --- same wiring, but for a multi-check FILE upload's live (synchronous)
 # path — _check_language_for_sheet, the one place that actually knows the
@@ -2019,6 +2066,72 @@ print("[OK] multi-check Message-Batches path (finalize_batch_results): the same 
       "response produces the identical register_summary, with the same excel_row exception and its "
       "actual translated text, and no raw register_value finding reaching the visible list")
 
+# --- "mixed": a row whose OWN translation switches between «ты» and «вы»
+# within itself (a cell holding several sentences/paragraphs where the tone
+# drifts mid-cell — Александр's ask, 2026-09-17) is a real problem on that
+# specific row, not a document-wide majority question — it must show up as
+# an ordinary visible finding (REGISTER_MIXED_TYPE), and must NOT be folded
+# into build_register_report's majority/exception counting at all. ---
+from app.claude_client import REGISTER_MIXED_TYPE
+
+
+async def _fake_call_claude_register_mixed_single(prompt, model=None):
+    return (
+        f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
+        {"input_tokens": 10, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_register_mixed_single
+r = check("standalone /check turns a mocked \"mixed\" register_value into a register_mixed finding", client.post(
+    "/check", json={"source": "Please confirm. Ты не против?", "translation": "Please confirm. Ты не против?", "checks": ["register"]},
+))
+mixed_findings = r.json()["findings"]
+assert len(mixed_findings) == 1, mixed_findings
+assert mixed_findings[0]["type"] == REGISTER_MIXED_TYPE, mixed_findings
+assert "mixed" not in mixed_findings[0]["message"], mixed_findings  # a real Russian message, not a raw code
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+print("[OK] standalone /check: a single pair the model reports as internally mixed produces one plain "
+      "register_mixed finding instead of a register_summary — never a raw register_value leaking through")
+
+# Same thing on the multi-check live path, alongside two ordinary rows —
+# proves the mixed row (excel_row 3) both surfaces its own finding AND is
+# excluded entirely from the OTHER rows' majority/exception calculation
+# (both remaining rows are "formal", so the summary must read plainly
+# "везде на «вы»" with no exceptions at all, as if row 3 didn't exist for
+# that purpose).
+async def _fake_call_claude_register_mixed_batch(prompt, model=None):
+    return (
+        '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
+        '{"row": 2, "type": "register_value", "severity": "low", "value": "mixed", "message": ""},'
+        '{"row": 3, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]',
+        {"input_tokens": 30, "output_tokens": 30},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_register_mixed_batch
+_mixed_out, _mixed_cost = asyncio.get_event_loop().run_until_complete(
+    _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+_mixed_rows_by_excel_row = {row["excel_row"]: row for row in _mixed_out}
+assert 3 in _mixed_rows_by_excel_row, _mixed_out  # the mixed row itself must show up with its own finding
+assert _mixed_rows_by_excel_row[3]["findings"][0]["type"] == REGISTER_MIXED_TYPE, _mixed_rows_by_excel_row[3]
+_mixed_summary = next(row for row in _mixed_out if row["findings"][0]["type"] == "register_summary")
+assert _mixed_summary["findings"][0]["message"] == "Тон обращения: везде на «вы».", _mixed_summary
+assert _mixed_summary["findings"][0]["register_majority"] == "formal", _mixed_summary
+assert "register_exceptions" not in _mixed_summary["findings"][0], _mixed_summary
+assert "register_exception_labels" not in _mixed_summary["findings"][0], _mixed_summary
+print("[OK] multi-check live path: a row the model reports as internally mixed gets its own "
+      "register_mixed finding, and is excluded entirely from the other rows' majority/exception "
+      "calculation — not counted as a vote for the majority and not counted as an exception either")
+
 # _count_real_findings: the "N проблем"/"N найдено" number shown across the
 # UI must never count the register_summary report as a problem — a check
 # that only ran "register" on an otherwise-clean document should say 0
@@ -2041,7 +2154,11 @@ assert _count_real_findings([
 # truncation/AI-failure warnings ("system") are deliberately still counted
 # — those genuinely are something to notice, unlike the register report
 assert _count_real_findings([{"findings": [{"type": "system", "message": "..."}]}]) == 1
+# register_mixed (a row internally switching «ты»/«вы») is a genuine
+# problem, unlike register_summary — it must count normally.
+assert _count_real_findings([{"findings": [{"type": REGISTER_MIXED_TYPE, "message": "..."}]}]) == 1
 print("[OK] _count_real_findings excludes the synthetic register_summary report from the \"N problems\" "
-      "count everywhere it's used, while still counting real findings and system warnings")
+      "count everywhere it's used, while still counting real findings, system warnings, and "
+      "register_mixed findings")
 
 print("\nALL SMOKETEST CHECKS PASSED")
