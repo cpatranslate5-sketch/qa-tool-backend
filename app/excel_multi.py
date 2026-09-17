@@ -59,6 +59,38 @@ def _is_do_not_translate(text: str) -> bool:
 # track record of actual costs and turnaround times.
 BATCH_THRESHOLD_CHARS = 10_000
 
+# How many (context, source, translation) triples go into ONE AI call, for
+# either processing path. Александр noticed (2026-09-17) that a document
+# check on a large language could report "всё чисто" while pasting the very
+# same problem row into the single-pair fields DID find something — the
+# most likely cause: a single AI call covering hundreds of rows of one
+# language at once has to split its attention across all of them, and a
+# finding that needs actual reading comprehension (a subtle mistranslation,
+# a dropped grammatical particle) is exactly the kind that can get missed
+# under that load, unlike a mechanical rule check (numbers, placeholders),
+# which is never done by the AI at all and so never suffers from this.
+# Splitting one language's rows into smaller chunks — each its own separate
+# AI call — keeps that per-row attention high regardless of how big the
+# whole document is. Kept deliberately small, per Александр's explicit
+# choice, to prioritize per-row attentiveness over cost/latency.
+#
+# Trade-off this comes with: the "Повторяется по всему документу" repeat
+# dedup (see BATCH_PROMPT/group_batch_findings/_resolve_repeated_findings)
+# can only ever recognize a repeat within rows that land in the SAME chunk —
+# the model literally never sees rows from a different chunk in the same
+# call. A term mistranslated identically across, say, 60 rows of one
+# language will now come back as a handful of "Повторяется..." findings
+# (one per chunk it shows up in) rather than exactly one for the whole
+# document. Still far better than one finding per row, just not perfect
+# document-wide dedup any more.
+MAX_ROWS_PER_AI_CALL = 15
+
+
+def _chunk_list(items: list, size: int) -> list[list]:
+    """Splits items into consecutive chunks of at most `size`, preserving
+    order — the empty list yields no chunks at all (not one empty chunk)."""
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
 # Known non-language metadata column names seen in Crowdin-style exports.
 # Anything NOT in this list and not Context/Max length is treated as a
 # language column — real client files have non-standard codes (a 4-letter
@@ -732,10 +764,39 @@ async def _check_language_for_sheet(
     if not relevant_rows:
         return [], 0.0
 
-    async with semaphore:
-        ai_findings_by_idx, cost_usd, truncated = await run_ai_checks_batch(
-            ai_items, checks, extra_instructions, lang, source_lang
-        )
+    # See MAX_ROWS_PER_AI_CALL above — one big AI call covering the whole
+    # language is split into several smaller ones instead, each still
+    # bounded by the same shared semaphore (so the total number of AI calls
+    # in flight at once across the whole upload is unaffected by chunking,
+    # only how many rows any single call has to hold at once).
+    item_chunks = _chunk_list(ai_items, MAX_ROWS_PER_AI_CALL)
+
+    async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool]:
+        async with semaphore:
+            return await run_ai_checks_batch(chunk_items, checks, extra_instructions, lang, source_lang)
+
+    chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
+
+    ai_findings_by_idx: dict[int, list[dict]] = {}
+    cost_usd = 0.0
+    truncated = False
+    offset = 0
+    for (chunk_findings, chunk_cost, chunk_truncated), chunk_items in zip(chunk_results, item_chunks):
+        for local_idx, findings in chunk_findings.items():
+            # "_also_idx" (see group_batch_findings) still holds indices
+            # local to THIS chunk at this point — shift those too, or
+            # _resolve_repeated_findings below would resolve them against
+            # the wrong rows entirely.
+            remapped = []
+            for f in findings:
+                if "_also_idx" in f:
+                    f = {**f, "_also_idx": [offset + i for i in f["_also_idx"]]}
+                remapped.append(f)
+            ai_findings_by_idx[offset + local_idx] = remapped
+        cost_usd += chunk_cost
+        truncated = truncated or chunk_truncated
+        offset += len(chunk_items)
+
     ai_findings_by_idx = _resolve_repeated_findings(ai_findings_by_idx, relevant_rows)
     ai_findings_by_idx, register_values_by_idx = _extract_register_values(ai_findings_by_idx)
 
@@ -838,10 +899,12 @@ async def run_multi_check(
 # See BATCH_THRESHOLD_CHARS above. Instead of awaiting every language's AI
 # call directly (run_multi_check), a large job is prepared as a "skeleton"
 # (rule-based findings, computed instantly and for free) plus one Anthropic
-# Message Batch request per language; once that batch finishes — polled from
-# app.main — finalize_batch_results merges the AI findings back in to
-# produce the exact same {"sheets": [...], "summary": {...}} shape as
-# run_multi_check, so the frontend doesn't need to know which path ran.
+# Message Batch request per CHUNK of each language's rows (see
+# MAX_ROWS_PER_AI_CALL — same chunking as the live path, same reason); once
+# that batch finishes — polled from app.main — finalize_batch_results merges
+# the AI findings back in to produce the exact same {"sheets": [...],
+# "summary": {...}} shape as run_multi_check, so the frontend doesn't need
+# to know which path ran.
 
 def estimate_check_volume(
     sheets: list[dict], source_lang: str, target_langs_filter: set[str] | None = None
@@ -877,9 +940,10 @@ def build_batch_plan(
     target_langs_filter: set[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """Prepares everything needed to submit one Anthropic Message Batch
-    covering every (sheet, target language) pair in this upload, plus a
-    JSON-serializable "skeleton" — already-computed rule-based findings —
-    to merge the AI results into later via finalize_batch_results.
+    covering every (sheet, target language, row chunk) triple in this
+    upload, plus a JSON-serializable "skeleton" — already-computed
+    rule-based findings — to merge the AI results into later via
+    finalize_batch_results.
 
     Returns (batch_requests, skeleton). batch_requests is a list of
     {"custom_id": str, "prompt": str} ready for
@@ -924,30 +988,46 @@ def build_batch_plan(
                     "findings": findings,
                 })
 
-            # Built from the sheet/position index only, never from `lang`
-            # itself — Anthropic's Batches API requires custom_id to match
-            # ^[a-zA-Z0-9_-]{1,64}$, but a language code comes straight from
-            # a column header in whatever file gets uploaded and can't be
-            # trusted to satisfy that (e.g. a Cyrillic character that looks
-            # identical to a Latin one, from a copy-pasted "fr-CI" header,
-            # is enough to make Anthropic reject the WHOLE batch — every
-            # language in it, not just the bad one — with a 400). Rebuilt
-            # this way, custom_id is always safe regardless of what's in
-            # the file.
-            custom_id = f"s{s_idx}-t{lang_idx}"
+            # Built from the sheet/position/chunk index only, never from
+            # `lang` itself — Anthropic's Batches API requires custom_id to
+            # match ^[a-zA-Z0-9_-]{1,64}$, but a language code comes
+            # straight from a column header in whatever file gets uploaded
+            # and can't be trusted to satisfy that (e.g. a Cyrillic
+            # character that looks identical to a Latin one, from a
+            # copy-pasted "fr-CI" header, is enough to make Anthropic
+            # reject the WHOLE batch — every language in it, not just the
+            # bad one — with a 400). Rebuilt this way, custom_id is always
+            # safe regardless of what's in the file.
             model = _model_for_lang(lang)
-            prompt, number_to_index = build_batch_prompt(
-                ai_items, checks, extra_instructions, lang, source_lang,
-            )
-            if prompt is not None:
-                requests.append({"custom_id": custom_id, "prompt": prompt, "model": model})
+            # See MAX_ROWS_PER_AI_CALL — one Message Batch REQUEST per
+            # chunk of this language's rows, not one for the whole
+            # language, for the same per-row-attention reason as the live
+            # path (_check_language_for_sheet).
+            chunks_skeleton = []
+            offset = 0
+            for chunk_idx, chunk_items in enumerate(_chunk_list(ai_items, MAX_ROWS_PER_AI_CALL)):
+                custom_id = f"s{s_idx}-t{lang_idx}-c{chunk_idx}"
+                prompt, number_to_index = build_batch_prompt(
+                    chunk_items, checks, extra_instructions, lang, source_lang,
+                )
+                if prompt is not None:
+                    requests.append({"custom_id": custom_id, "prompt": prompt, "model": model})
+                chunks_skeleton.append({
+                    "custom_id": custom_id if prompt is not None else None,
+                    "number_to_index": {str(k): v for k, v in number_to_index.items()},
+                    # Where this chunk's local item indices (0-based, reset
+                    # per chunk) land in the language's own `rows` list —
+                    # finalize_batch_results adds this back before doing
+                    # anything else with the model's response.
+                    "row_offset": offset,
+                })
+                offset += len(chunk_items)
 
             languages_skeleton[lang] = {
-                "custom_id": custom_id if prompt is not None else None,
                 # Needed later by finalize_batch_results to price this
                 # language's usage at the right per-token rate.
                 "model": model,
-                "number_to_index": {str(k): v for k, v in number_to_index.items()},
+                "chunks": chunks_skeleton,
                 "rows": base_rows,
             }
 
@@ -972,6 +1052,11 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
     rule-based skeleton from build_batch_plan, producing the same
     {"sheets": [...], "summary": {...}} shape run_multi_check returns.
 
+    Each language may have several chunks (see MAX_ROWS_PER_AI_CALL) —
+    every chunk's custom_id is looked up and merged independently, with its
+    own local item indices shifted back by its "row_offset" before doing
+    anything else with them.
+
     ai_results_by_custom_id: {custom_id: {"text": str | None, "usage": dict}}
     — see claude_client.get_batch_results. Missing/empty entries (e.g. no
     batch was actually submitted) simply contribute no findings and no cost."""
@@ -983,38 +1068,96 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
     for sheet in skeleton["sheets"]:
         languages_out = {}
         for lang, lang_skel in sheet["languages"].items():
+            # One chunk's problem (missing/errored/truncated — see below)
+            # never throws away another chunk's perfectly good findings;
+            # each chunk is its own independent AI call (see
+            # MAX_ROWS_PER_AI_CALL/build_batch_plan). At most one warning is
+            # still shown per language, worst-first, so the manager isn't
+            # confused by a wall of near-identical warnings on a language
+            # that got split into many chunks.
             ai_grouped: dict[int, list[dict]] = {}
-            warning_finding = None
-            custom_id = lang_skel["custom_id"]
-            if custom_id is not None:
+            missing_any = False
+            errored_reason = None
+            truncated_any = False
+            chunks = lang_skel.get("chunks")
+            if chunks is None:
+                # Backward compatibility: a Message Batch submitted BEFORE
+                # this chunking change (2026-09-17) was persisted to the
+                # database at submission time (see multi_check in
+                # app.main) with the OLD skeleton shape — one custom_id/
+                # number_to_index pair directly on the language, no
+                # "chunks" list at all. Any such upload still "processing"
+                # across this deploy must still resolve correctly once
+                # its batch ends — without this, `lang_skel.get("chunks",
+                # [])` would silently return [], and that language would
+                # come back looking completely clean, discarding every
+                # real AI finding it already paid for. Wrapping the old
+                # shape as a single one-chunk list re-uses the exact same
+                # merge logic below for it.
+                old_custom_id = lang_skel.get("custom_id")
+                chunks = (
+                    [{
+                        "custom_id": old_custom_id,
+                        "number_to_index": lang_skel.get("number_to_index", {}),
+                        "row_offset": 0,
+                    }]
+                    if old_custom_id is not None else []
+                )
+            for chunk in chunks:
+                custom_id = chunk["custom_id"]
+                if custom_id is None:
+                    continue
+                offset = chunk["row_offset"]
                 ai_result = ai_results_by_custom_id.get(custom_id)
                 if ai_result is None:
                     # Expected result never showed up in the batch's .jsonl
                     # at all — same class of silent data loss as an
                     # errored/expired request, so it gets the same warning
                     # rather than quietly counting as "nothing found".
-                    warning_finding = _ai_failure_warning("результат не получен")
-                elif ai_result.get("result_type") != "succeeded":
-                    warning_finding = _ai_failure_warning(ai_result.get("result_type") or "неизвестная ошибка")
+                    missing_any = True
+                    continue
+                if ai_result.get("result_type") != "succeeded":
+                    errored_reason = errored_reason or (ai_result.get("result_type") or "неизвестная ошибка")
                 else:
                     raw = parse_json_array(ai_result.get("text"))
                     # JSON round-trips dict keys as strings — restore int keys.
-                    number_to_index = {int(k): v for k, v in lang_skel["number_to_index"].items()}
-                    ai_grouped = group_batch_findings(raw, number_to_index)
+                    number_to_index = {int(k): v for k, v in chunk["number_to_index"].items()}
+                    chunk_grouped = group_batch_findings(raw, number_to_index)
                     # Guarantees the model's response never smuggles in a check
                     # type the manager didn't ask for, even if it ignored the
                     # prompt's instruction to stick to the requested list.
-                    ai_grouped = {
+                    chunk_grouped = {
                         idx: _filter_findings_by_checks(fs, skeleton.get("checks", []))
-                        for idx, fs in ai_grouped.items()
+                        for idx, fs in chunk_grouped.items()
                     }
+                    for idx, fs in chunk_grouped.items():
+                        # "_also_idx" (see group_batch_findings) is still
+                        # local to this chunk here — shift it the same way
+                        # as the top-level index, or _resolve_repeated_
+                        # findings below resolves it against the wrong rows.
+                        remapped_fs = []
+                        for f in fs:
+                            if "_also_idx" in f:
+                                f = {**f, "_also_idx": [offset + i for i in f["_also_idx"]]}
+                            remapped_fs.append(f)
+                        ai_grouped[offset + idx] = remapped_fs
                     if ai_result.get("stop_reason") == "max_tokens":
-                        # Response got cut off mid-array — some rows may
-                        # never have been checked by the AI at all (see
-                        # Александр's "incomplete Spanish report").
-                        warning_finding = _truncation_warning()
-                if ai_result is not None:
-                    total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
+                        # Response got cut off mid-array — some rows in
+                        # THIS chunk may never have been checked by the AI
+                        # at all (see Александр's "incomplete Spanish
+                        # report") — the chunk's own findings up to the cut
+                        # point are still kept, just flagged.
+                        truncated_any = True
+                total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
+
+            if missing_any:
+                warning_finding = _ai_failure_warning("результат не получен")
+            elif errored_reason:
+                warning_finding = _ai_failure_warning(errored_reason)
+            elif truncated_any:
+                warning_finding = _truncation_warning()
+            else:
+                warning_finding = None
 
             ai_grouped = _resolve_repeated_findings(ai_grouped, lang_skel["rows"])
             ai_grouped, register_values_by_idx = _extract_register_values(ai_grouped)

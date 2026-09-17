@@ -1802,6 +1802,19 @@ print("[OK] the calibration text explicitly tells the model a single pair can ho
       "problems at once and it must keep checking every selected criterion instead of stopping after "
       "the first finding in that pair")
 
+# --- Александр's ask, 2026-09-17: a single Excel cell can hold a long,
+# multi-sentence paragraph, with the SAME problem occurring in several
+# different sentences of that one cell — that must come back as one
+# separate finding PER occurrence, not one blended finding for the whole
+# cell, and not silently deduplicated the way a repeat ACROSS rows is
+# (that's a completely different mechanism — see BATCH_PROMPT's "rows"
+# tests below). ---
+assert "повторов ВНУТРИ одной и той же пары" in CALIBRATION_BASE, CALIBRATION_BASE
+assert "даже если их 10, 20 или больше" in CALIBRATION_BASE, CALIBRATION_BASE
+print("[OK] the calibration text also explicitly covers the SAME problem occurring several times inside "
+      "one long, multi-sentence pair (e.g. one Excel cell with a whole paragraph) — every occurrence must "
+      "be its own separate finding, quoting which sentence/fragment it's in, never blended into one")
+
 # --- the prompt also tells the model not to squeeze an out-of-scope
 # finding into whichever type happens to be the only one allowed —
 # Александр hit exactly this with the (now-removed) glossary check, but
@@ -1831,6 +1844,13 @@ assert '"rows"' in BATCH_PROMPT, BATCH_PROMPT
 # both were "plausible" prompt-ambiguity risks, not confirmed model failures, but cheap to close off)
 assert "НЕ противоречит" in BATCH_PROMPT, BATCH_PROMPT
 assert "остаётся только ОДНА пара" in BATCH_PROMPT, BATCH_PROMPT
+# and the cross-row "rows" repeat mechanism explicitly disclaims the OTHER
+# kind of repeat (Александр's ask, 2026-09-17) — several occurrences of the
+# same problem INSIDE one pair's own text — so the model doesn't try to
+# jam the same pair number into "rows" several times, or merge them,
+# instead of just reporting each occurrence as its own ordinary "row" finding.
+assert "ВНУТРИ одной и той же пары" in BATCH_PROMPT, BATCH_PROMPT
+assert "не объединяй их в одну находку" in BATCH_PROMPT, BATCH_PROMPT
 
 from app.claude_client import group_batch_findings
 
@@ -1880,6 +1900,28 @@ print("[OK] group_batch_findings: a \"rows\"-tagged entry (the same repeated pro
       "resolution — never duplicated across each row it lists, a single-row \"rows\" list behaves exactly "
       "like an ordinary \"row\" finding, a non-list \"rows\" value is dropped rather than crashing, and an "
       "ordinary single-\"row\" finding is completely unaffected")
+
+# --- several SEPARATE occurrences of the same problem type, all reported
+# against the SAME pair (Александр's ask, 2026-09-17: one long cell with
+# 30 sentences, the same broken element in several of them) must all
+# survive as distinct findings on that one row, not collapse into one —
+# group_batch_findings just appends, so this is really locking in that no
+# later step accidentally deduplicates same-type findings on one row. ---
+_multi_in_row_raw = [
+    {"row": 2, "type": "untranslatable", "severity": "medium", "message": "предложение 3: «Grand Prix» переведено"},
+    {"row": 2, "type": "untranslatable", "severity": "medium", "message": "предложение 11: «Grand Prix» переведено"},
+    {"row": 2, "type": "untranslatable", "severity": "medium", "message": "предложение 24: «Grand Prix» переведено"},
+]
+_multi_in_row_grouped = group_batch_findings(_multi_in_row_raw, _gbf_map)
+assert len(_multi_in_row_grouped[11]) == 3, _multi_in_row_grouped
+assert {f["message"] for f in _multi_in_row_grouped[11]} == {
+    "предложение 3: «Grand Prix» переведено",
+    "предложение 11: «Grand Prix» переведено",
+    "предложение 24: «Grand Prix» переведено",
+}, _multi_in_row_grouped
+print("[OK] group_batch_findings: several separate same-type findings reported against the SAME pair "
+      "(e.g. the same broken element repeating in several sentences of one long cell) all survive intact "
+      "as distinct findings, never collapsed into one")
 
 # --- app.excel_multi._resolve_repeated_findings is what turns that
 # internal "_also_idx" into the ACTUAL Excel row numbers the manager reads
@@ -1982,9 +2024,8 @@ _fbr_skeleton = {
         "target_langs": ["ru"],
         "languages": {
             "ru": {
-                "custom_id": "s0-t0",
                 "model": "claude-sonnet-4-5-20250929",
-                "number_to_index": {"1": 0, "2": 1, "3": 2},
+                "chunks": [{"custom_id": "s0-t0-c0", "number_to_index": {"1": 0, "2": 1, "3": 2}, "row_offset": 0}],
                 "rows": [
                     {"excel_row": 2, "context": "title 1", "source": "Fly & Win", "translation": "Лети и выигрывай", "findings": []},
                     {"excel_row": 3, "context": "body", "source": "Terms apply", "translation": "Условия дейстуют", "findings": []},
@@ -1999,7 +2040,7 @@ _fbr_skeleton = {
     "checks": ["typo", "untranslatable"],
 }
 _fbr_results = {
-    "s0-t0": {
+    "s0-t0-c0": {
         "text": (
             '[{"row": 2, "type": "typo", "severity": "low", "message": "мелкая опечатка только здесь"},'
             '{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
@@ -2021,6 +2062,194 @@ assert _fbr_repeated[0]["message"] == "Повторяется по всему д
 print("[OK] finalize_batch_results (Message Batches / large-file path): a \"rows\"-tagged repeated "
       "finding is resolved exactly the same way as on the live synchronous path — once, at its first "
       "occurrence, naming the other Excel row(s) in its own message")
+
+# --- MAX_ROWS_PER_AI_CALL / _chunk_list: splitting one language's rows into
+# smaller AI calls instead of one giant one (Александр's ask, 2026-09-17: a
+# document check on a large language missed a subtle, meaning-based
+# problem that pasting the very same text into the single-pair fields DID
+# catch — most likely cause, a single AI call covering hundreds of rows at
+# once has to split its attention across all of them). ---
+from app.excel_multi import MAX_ROWS_PER_AI_CALL, _chunk_list
+
+assert _chunk_list([], 5) == []
+assert _chunk_list([1, 2, 3], 5) == [[1, 2, 3]]
+assert _chunk_list(list(range(7)), 3) == [[0, 1, 2], [3, 4, 5], [6]]
+print(f"[OK] _chunk_list: splits into consecutive chunks of at most the given size, an empty list "
+      f"yields no chunks at all (MAX_ROWS_PER_AI_CALL is currently {MAX_ROWS_PER_AI_CALL})")
+
+# Live path: a language with MORE rows than MAX_ROWS_PER_AI_CALL must result
+# in more than one AI call (one per chunk), and every chunk's findings must
+# land on the CORRECT excel_row once its local, per-chunk item indices are
+# shifted back by that chunk's own offset — including a "rows"-tagged
+# repeat WITHIN one chunk (still merged there, offset correctly), while a
+# look-alike problem sitting in a DIFFERENT chunk is deliberately NOT
+# merged with it, because that chunk's own AI call never saw the first
+# chunk's rows at all (the trade-off documented on MAX_ROWS_PER_AI_CALL).
+_chunk_call_prompts: list[str] = []
+
+
+async def _fake_call_claude_chunked(prompt, model=None):
+    _chunk_call_prompts.append(prompt)
+    if len(_chunk_call_prompts) == 1:
+        # first chunk: local rows 1 and 3 share the same repeated problem
+        return (
+            '[{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
+            '"message": "Повторяется по всему документу: «Fly & Win» переведено"}]',
+            {"input_tokens": 20, "output_tokens": 20},
+            "end_turn",
+        )
+    # second chunk: the exact same wording, but on an isolated single row —
+    # must NOT get merged with the first chunk's repeat
+    return (
+        '[{"row": 1, "type": "untranslatable", "severity": "medium", '
+        '"message": "Повторяется по всему документу: «Fly & Win» переведено"}]',
+        {"input_tokens": 20, "output_tokens": 20},
+        "end_turn",
+    )
+
+
+_chunk_rows = [
+    {"excel_row": 100 + i, "context": f"row {i}", "max_length": None,
+     "values": {"en": "Fly & Win", "ru": "Лети и выигрывай"}}
+    for i in range(MAX_ROWS_PER_AI_CALL + 3)  # spills into a second, smaller chunk
+]
+_chunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _chunk_rows}
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_chunked
+_chunk_out, _chunk_cost = asyncio.get_event_loop().run_until_complete(
+    _check_language_for_sheet(_chunk_sheet, "ru", "en", ["untranslatable"], "", asyncio.Semaphore(5))
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert len(_chunk_call_prompts) == 2, "expected exactly 2 AI calls — one per chunk"
+_chunk_by_row = {r["excel_row"]: r["findings"] for r in _chunk_out}
+# first chunk's repeat: local rows 1 and 3 -> global indices 0 and 2 -> excel_row 100 and 102
+assert _chunk_by_row[100][0]["message"] == (
+    "Повторяется по всему документу: «Fly & Win» переведено (также в строках: 102)"
+), _chunk_by_row.get(100)
+assert 102 not in _chunk_by_row, "the repeat's OTHER occurrence must not show its own separate finding"
+# second chunk's finding: local row 1 of chunk 2 -> its own global index -> its own excel_row
+_second_chunk_excel_row = _chunk_rows[MAX_ROWS_PER_AI_CALL]["excel_row"]
+assert _chunk_by_row[_second_chunk_excel_row][0]["message"] == (
+    "Повторяется по всему документу: «Fly & Win» переведено"
+), _chunk_by_row.get(_second_chunk_excel_row)
+print(f"[OK] live multi-check path: a language with more rows than MAX_ROWS_PER_AI_CALL "
+      f"({MAX_ROWS_PER_AI_CALL}) is split into several smaller AI calls instead of one giant one, every "
+      f"chunk's findings land on the correct excel_row once local indices are shifted back by that chunk's "
+      f"own offset, and a repeat within one chunk is still merged there — but a look-alike problem in a "
+      f"DIFFERENT chunk is correctly left unmerged, since that chunk's AI call never saw the first chunk's "
+      f"rows")
+
+# Message Batches (large-file) path: the same chunking, but through
+# build_batch_plan/finalize_batch_results — one custom_id per chunk, and a
+# chunk that never came back (missing) must not swallow another chunk's
+# perfectly good findings, while still surfacing exactly one warning.
+from app.excel_multi import build_batch_plan
+
+_bpc_rows = [
+    {"excel_row": 200 + i, "context": f"row {i}", "max_length": None,
+     "values": {"en": "Fly & Win", "ru": "Лети и выигрывай"}}
+    for i in range(MAX_ROWS_PER_AI_CALL + 2)
+]
+_bpc_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _bpc_rows}
+_bpc_requests, _bpc_skeleton = build_batch_plan([_bpc_sheet], "en", ["untranslatable"], "", None)
+assert len(_bpc_requests) == 2, "expected one request per chunk — 17 rows over a 15-row cap is 2 chunks"
+_bpc_chunks = _bpc_skeleton["sheets"][0]["languages"]["ru"]["chunks"]
+assert len(_bpc_chunks) == 2, _bpc_chunks
+_bpc_id0, _bpc_id1 = _bpc_chunks[0]["custom_id"], _bpc_chunks[1]["custom_id"]
+_bpc_results = {
+    _bpc_id0: {
+        "text": '[{"row": 1, "type": "untranslatable", "severity": "medium", "message": "проблема в первом чанке"}]',
+        "usage": {"input_tokens": 20, "output_tokens": 20}, "stop_reason": "end_turn", "result_type": "succeeded",
+    },
+    # _bpc_id1 deliberately absent — dropped between submit and poll
+}
+_bpc_out = finalize_batch_results(_bpc_skeleton, _bpc_results)
+_bpc_lang = _bpc_out["sheets"][0]["languages"]["ru"]
+_bpc_by_row = {r["excel_row"]: r["findings"] for r in _bpc_lang}
+# the first chunk's real finding must still show up, even though the second chunk's result never arrived
+assert any(f["message"] == "проблема в первом чанке" for f in _bpc_by_row.get(200, [])), _bpc_by_row
+# exactly one system warning for the whole language, not one per chunk
+_bpc_warnings = [f for row in _bpc_lang for f in row["findings"] if f.get("type") == "system"]
+assert len(_bpc_warnings) == 1, _bpc_lang
+print("[OK] finalize_batch_results: a language split into several chunks merges every chunk's own custom_id "
+      "independently — one missing/errored/truncated chunk doesn't discard another chunk's good findings, "
+      "and only a single system warning is shown for the whole language rather than one per chunk")
+
+# Same idea, but proving the "_also_idx" (repeated-finding) offset remap is
+# correct on the BATCH path specifically, not just the live path above —
+# the review pass that caught the earlier self-reference bug flagged this
+# exact combination (chunking + "rows") as untested on this path.
+_bpr_rows = [
+    {"excel_row": 300 + i, "context": f"row {i}", "max_length": None,
+     "values": {"en": "Fly & Win", "ru": "Лети и выигрывай"}}
+    for i in range(MAX_ROWS_PER_AI_CALL + 2)
+]
+_bpr_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _bpr_rows}
+_bpr_requests, _bpr_skeleton = build_batch_plan([_bpr_sheet], "en", ["untranslatable"], "", None)
+_bpr_chunks = _bpr_skeleton["sheets"][0]["languages"]["ru"]["chunks"]
+assert len(_bpr_chunks) == 2, _bpr_chunks
+_bpr_results = {
+    # first chunk: local rows 1 and 3 repeat the same problem
+    _bpr_chunks[0]["custom_id"]: {
+        "text": (
+            '[{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
+            '"message": "Повторяется по всему документу: «Fly & Win» переведено"}]'
+        ),
+        "usage": {"input_tokens": 20, "output_tokens": 20}, "stop_reason": "end_turn", "result_type": "succeeded",
+    },
+    _bpr_chunks[1]["custom_id"]: {
+        "text": "[]", "usage": {"input_tokens": 10, "output_tokens": 5}, "stop_reason": "end_turn", "result_type": "succeeded",
+    },
+}
+_bpr_out = finalize_batch_results(_bpr_skeleton, _bpr_results)
+_bpr_by_row = {r["excel_row"]: r["findings"] for r in _bpr_out["sheets"][0]["languages"]["ru"]}
+# local rows 1 and 3 of chunk 0 -> global indices 0 and 2 -> excel_row 300 and 302
+assert _bpr_by_row[300][0]["message"] == (
+    "Повторяется по всему документу: «Fly & Win» переведено (также в строках: 302)"
+), _bpr_by_row.get(300)
+assert 302 not in _bpr_by_row, "the repeat's OTHER occurrence must not show its own separate finding"
+print("[OK] finalize_batch_results: a \"rows\"-tagged repeat's internal \"_also_idx\" is correctly shifted "
+      "by the chunk's own row_offset on the Message Batches path too, not just the live path")
+
+# Backward compatibility: a Message Batch submitted BEFORE this chunking
+# change existed was persisted with the OLD skeleton shape (a bare
+# "custom_id"/"number_to_index" pair directly on the language, no "chunks"
+# list at all — see build_batch_plan's history). Any such upload still
+# "processing" across a deploy of this change must still resolve correctly
+# once its batch ends, rather than silently coming back "clean" because the
+# new code went looking for a "chunks" key the old skeleton never had.
+_oldshape_skeleton = {
+    "sheets": [{
+        "sheet_name": "Sheet1",
+        "target_langs": ["ru"],
+        "languages": {
+            "ru": {
+                "custom_id": "s0-t0",  # OLD shape: no "chunks" list
+                "model": "claude-sonnet-4-5-20250929",
+                "number_to_index": {"1": 0},
+                "rows": [{"excel_row": 9, "context": "", "source": "Fly & Win", "translation": "Лети", "findings": []}],
+            },
+        },
+        "unrecognized_columns": [],
+        "row_count": 1,
+    }],
+    "source_lang": "en",
+    "checks": ["untranslatable"],
+}
+_oldshape_results = {
+    "s0-t0": {
+        "text": '[{"row": 1, "type": "untranslatable", "severity": "medium", "message": "старый формат ещё работает"}]',
+        "usage": {"input_tokens": 15, "output_tokens": 15}, "stop_reason": "end_turn", "result_type": "succeeded",
+    },
+}
+_oldshape_out = finalize_batch_results(_oldshape_skeleton, _oldshape_results)
+_oldshape_lang = _oldshape_out["sheets"][0]["languages"]["ru"]
+assert any(
+    f["message"] == "старый формат ещё работает" for row in _oldshape_lang for f in row["findings"]
+), _oldshape_lang
+print("[OK] finalize_batch_results: a batch submitted before chunking existed (old skeleton shape, no "
+      "\"chunks\" key) still resolves its real AI findings correctly instead of silently coming back clean")
 
 # --- AI findings are hard-filtered to only the checks actually requested,
 # even if the model ignores the prompt's instruction and reports something
@@ -2119,25 +2348,28 @@ fake_skeleton = {
         "row_count": 1,
         "languages": {
             "es-mx": {
-                "custom_id": "s0-es-mx", "model": "claude-haiku-4-5-20251001",
-                "number_to_index": {}, "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
+                "model": "claude-haiku-4-5-20251001",
+                "chunks": [{"custom_id": "s0-es-mx-c0", "number_to_index": {}, "row_offset": 0}],
+                "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
             },
             "fr": {
-                "custom_id": "s0-fr", "model": "claude-haiku-4-5-20251001",
-                "number_to_index": {}, "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
+                "model": "claude-haiku-4-5-20251001",
+                "chunks": [{"custom_id": "s0-fr-c0", "number_to_index": {}, "row_offset": 0}],
+                "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
             },
             "de": {
                 # never made it into the results at all (e.g. dropped between submit and poll)
-                "custom_id": "s0-de", "model": "claude-haiku-4-5-20251001",
-                "number_to_index": {}, "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
+                "model": "claude-haiku-4-5-20251001",
+                "chunks": [{"custom_id": "s0-de-c0", "number_to_index": {}, "row_offset": 0}],
+                "rows": [{"excel_row": 2, "context": "", "source": "a", "translation": "b", "findings": []}],
             },
         },
     }],
 }
 fake_batch_results = {
-    "s0-es-mx": {"text": "[", "usage": {"input_tokens": 10, "output_tokens": 8000}, "stop_reason": "max_tokens", "result_type": "succeeded"},
-    "s0-fr": {"text": None, "usage": {}, "stop_reason": None, "result_type": "errored"},
-    # "s0-de" deliberately absent
+    "s0-es-mx-c0": {"text": "[", "usage": {"input_tokens": 10, "output_tokens": 8000}, "stop_reason": "max_tokens", "result_type": "succeeded"},
+    "s0-fr-c0": {"text": None, "usage": {}, "stop_reason": None, "result_type": "errored"},
+    # "s0-de-c0" deliberately absent
 }
 merged = finalize_batch_results(fake_skeleton, fake_batch_results)
 by_lang = merged["sheets"][0]["languages"]
