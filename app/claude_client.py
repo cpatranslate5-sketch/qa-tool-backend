@@ -260,6 +260,47 @@ def _lacks_register_distinction(target_lang: str) -> bool:
     return target_lang.strip().lower().split("-")[0] in NO_REGISTER_DISTINCTION_LANGS
 
 
+# Per-language corrections for a specific way the model can misjudge the
+# formal/informal call above — NOT a "no distinction" case (register
+# instructions still run in full), just a nudge on ONE surface trap that's
+# confirmed to trip the model up for that exact language variant.
+#
+# Александр's concrete case (2026-09-17, pt-BR promo/bot text): Brazilian
+# Portuguese "você" grammatically conjugates like a third-person pronoun —
+# superficially the same shape as Spanish "usted" or French "vous", which
+# really ARE the formal register in those languages — but in everyday
+# Brazilian usage "você" is the ORDINARY, default address, the equivalent
+# of «ты», not «вы». The genuinely formal Portuguese address is "o
+# senhor"/"a senhora". Without a nudge, the model leaned on that surface
+# resemblance and called a "você" text "formal". Deliberately scoped to
+# "pt-br" alone (the exact normalized code from parse_workbook, always
+# lowercase "xx-yy") — European Portuguese (pt-PT) leans the other way
+# (there "você" reads more formal, "tu" is the informal one) and must NOT
+# get this same hint.
+REGISTER_LANGUAGE_HINTS: dict[str, str] = {
+    "pt-br": (
+        'Важное уточнение для бразильского португальского (pt-BR): местоимение "você" — это '
+        'ОБЫЧНОЕ, нейтральное обращение уровня «ты», а НЕ форма на «вы», даже хотя глагол при нём '
+        'формально спрягается как в третьем лице (это может визуально напомнить испанское "usted" '
+        'или французское "vous" — но в Бразилии на практике "você" используется в быту, рекламе и '
+        'обращениях к клиенту точно так же часто и просто, как «ты» по-русски). Настоящее формальное '
+        'обращение на «вы» в португальском — это "o senhor"/"a senhora". Не считай сам факт '
+        'использования "você" признаком формального регистра.\n'
+    ),
+}
+
+
+def _register_language_hint(target_lang: str) -> str:
+    # "_" -> "-" defensively: parse_workbook's own normalization always
+    # produces a hyphen, but this same target_lang also reaches here raw
+    # (never normalized at all) from the standalone /check endpoint, and a
+    # manager-taught language alias isn't required to use a hyphen either
+    # — so a stray underscore spelling of "pt-br" shouldn't silently miss
+    # this lookup and let the original misjudgment back in.
+    key = target_lang.strip().lower().replace("_", "-")
+    return REGISTER_LANGUAGE_HINTS.get(key, "")
+
+
 def _register_instructions(checks: list[str], batch: bool, target_lang: str = "") -> str:
     """Empty string when "register" isn't selected, or when target_lang is
     one of NO_REGISTER_DISTINCTION_LANGS above (nothing added to the
@@ -276,7 +317,12 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
     that prompt's existing "row" numbering. batch=False (SINGLE_PROMPT,
     exactly one pair — the standalone /check endpoint) asks for exactly
     one entry with no row number, since that prompt's own findings don't
-    carry one either."""
+    carry one either.
+
+    Also appends _register_language_hint(target_lang) — normally empty,
+    but a short language-specific correction for the rare case where the
+    model tends to misjudge THIS particular language's own formal marker
+    (see REGISTER_LANGUAGE_HINTS)."""
     if "register" not in checks or _lacks_register_distinction(target_lang):
         return ""
     if batch:
@@ -295,7 +341,7 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
             "находка об ошибке — не описывай её как проблему, не оценивай, правильная это форма или нет, "
             "просто зафиксируй, что реально написано в переводе (кроме значения \"mixed\" — это описание "
             "реального факта смешения форм внутри одной ячейки, а не оценка).\n"
-        )
+        ) + _register_language_hint(target_lang)
     return (
         "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, как "
         "переведено на самом деле: добавь в тот же JSON-массив ОДНУ дополнительную запись, строго в форме "
@@ -308,7 +354,7 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
         '"neutral". Это НЕ находка об ошибке — не описывай её как проблему, не оценивай, правильная это форма '
         "или нет, просто зафиксируй, что реально написано в переводе (кроме значения \"mixed\" — это описание "
         "реального факта смешения форм внутри одного текста, а не оценка).\n"
-    )
+    ) + _register_language_hint(target_lang)
 
 
 def _register_array_note(checks: list[str], target_lang: str = "") -> str:

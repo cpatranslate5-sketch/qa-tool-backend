@@ -1904,6 +1904,32 @@ print("[OK] register instructions are skipped entirely for a language with no fo
       "distinction at all (English) — no register_value entries are ever requested for it, so no "
       "register report (not even a \"couldn't determine\" fallback) is ever built for that language")
 
+# Александр's case, 2026-09-17: a real pt-BR check reported "everywhere on
+# «вы»" for a document that actually used "você" throughout — the standard,
+# default INFORMAL address in Brazilian Portuguese despite its
+# third-person-looking conjugation (a mistake the model made by pattern-
+# matching it against Spanish "usted"/French "vous", where that shape
+# really is formal). _register_instructions now appends a short correcting
+# hint for pt-BR specifically, in both batch and single mode; every other
+# language (including plain "pt" with no region, and hypothetically "pt-pt"
+# even though European Portuguese isn't in the map) is untouched.
+pt_br_batch = _register_instructions(["register"], batch=True, target_lang="pt-br")
+assert "você" in pt_br_batch and "o senhor" in pt_br_batch, pt_br_batch
+pt_br_single = _register_instructions(["register"], batch=False, target_lang="pt-br")
+assert "você" in pt_br_single and "o senhor" in pt_br_single, pt_br_single
+assert "você" not in _register_instructions(["register"], batch=True, target_lang="ru")
+assert "você" not in _register_instructions(["register"], batch=True, target_lang="pt")
+assert "você" not in _register_instructions(["register"], batch=True, target_lang="pt-pt")
+assert "você" not in _register_instructions(["register"], batch=True)
+# The standalone /check endpoint passes target_lang through raw (never
+# normalized to hyphen form), and a manager-taught alias isn't required to
+# use a hyphen either — an underscore spelling must still match.
+assert "você" in _register_instructions(["register"], batch=True, target_lang="PT_BR")
+print("[OK] register instructions carry a correcting hint for Brazilian Portuguese (pt-BR) specifically "
+      "— \"você\" is the ordinary informal address there despite its third-person-shaped verb, not a "
+      "formal marker — while every other language/region (plain \"pt\", \"pt-pt\", or no language at all) "
+      "is completely unaffected")
+
 # build_register_report: the actual Russian summary the manager reads,
 # now a structured dict (not a plain string) so a caller can colorize
 # «вы»/«ты» and, for a handful of exceptions, show the actual wrongly-toned
