@@ -1435,6 +1435,37 @@ for normal in ["ru", "es-mx", "en", "de-DE", "fr"]:
 print("[OK] _model_for_lang: confirmed hard-language list (kk/ky/tg/uz/sw/te/mr/az) "
       "routes to CLAUDE_MODEL_HARD by base subtag, everything else to CLAUDE_MODEL")
 
+# --- MODEL_PRICING_PER_TOKEN / _usage_cost: Александр's real bug
+# (2026-09-17) — CLAUDE_MODEL on Railway had already moved on to
+# "claude-sonnet-5", but this table only listed the two older model ids,
+# so _usage_cost's deliberate "can't price it, show $0 rather than guess"
+# fallback (see its own docstring) kicked in for EVERY real check, and a
+# check that actually cost roughly $0.50 showed "Стоимость: 0 $" instead.
+# Added "claude-sonnet-5" and "claude-opus-5" at their own current prices
+# (confirmed live against platform.claude.com/docs/en/about-claude/pricing
+# the same day) — this locks in that a check billed under either of those
+# model ids now gets a real, non-zero cost instead of silently zeroing
+# out, while an actually-unlisted model id still safely falls back to 0.0
+# rather than guessing at a stale price. ---
+from app.claude_client import _usage_cost, MODEL_PRICING_PER_TOKEN
+
+assert "claude-sonnet-5" in MODEL_PRICING_PER_TOKEN and "claude-opus-5" in MODEL_PRICING_PER_TOKEN
+sonnet5_cost = _usage_cost("claude-sonnet-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000})
+assert abs(sonnet5_cost - 12.00) < 1e-9, sonnet5_cost  # $2 in + $10 out per Mtok
+opus5_cost = _usage_cost("claude-opus-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000})
+assert abs(opus5_cost - 30.00) < 1e-9, opus5_cost  # $5 in + $25 out per Mtok
+# the batch (Message Batches API) discount still applies to these too
+sonnet5_batch_cost = _usage_cost("claude-sonnet-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000}, batch=True)
+assert abs(sonnet5_batch_cost - 6.00) < 1e-9, sonnet5_batch_cost
+# an actually-unpriced model id still safely falls back to 0.0 rather than
+# guessing at a stale/wrong price — the exact safe behavior that made this
+# bug visible as "$0" instead of a silently wrong non-zero number
+assert _usage_cost("claude-some-future-model", {"input_tokens": 1000, "output_tokens": 1000}) == 0.0
+print("[OK] MODEL_PRICING_PER_TOKEN now also covers claude-sonnet-5 and claude-opus-5 at their own "
+      "current prices, so a check billed under either no longer silently shows \"Стоимость: 0 $\" while "
+      "actually costing real money — while a genuinely unpriced/unknown model id still safely falls back "
+      "to $0 rather than guessing at a stale price")
+
 # --- "my" is ISO-639's code for Burmese, but Александр's files use it for
 # Malay — left unclarified, the model assumes Burmese and reports correct
 # Malay text as being in the wrong language. The prompt must explicitly

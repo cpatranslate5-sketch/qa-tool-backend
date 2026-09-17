@@ -594,9 +594,23 @@ def _model_for_lang(target_lang: str) -> str:
 # can't be computed for those calls (see _usage_cost) rather than guessing
 # at a price that may no longer be current — update this table when that
 # happens, or when Anthropic's prices change.
+#
+# Real bug Александр hit (2026-09-17): CLAUDE_MODEL on Railway had moved on
+# to "claude-sonnet-5" (and this table only listed the two OLDER model ids
+# above), so every check's own "Стоимость: ..." line correctly fell back to
+# showing $0 — exactly the safe behavior _usage_cost's comment describes —
+# while the real Anthropic bill for that same call was very much not zero
+# (~$0.50 for the check he flagged). Added the two current-generation
+# models below (their own prices, confirmed live against Anthropic's
+# pricing page the same day) so this table covers whichever generation is
+# actually configured; kept the two older entries too, since an in-flight
+# Message Batch submitted before a model switch can still resolve under
+# its own, older model id.
 MODEL_PRICING_PER_TOKEN = {
     "claude-haiku-4-5-20251001": {"input": 1.00 / 1_000_000, "output": 5.00 / 1_000_000},
     "claude-sonnet-4-5-20250929": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
+    "claude-sonnet-5": {"input": 2.00 / 1_000_000, "output": 10.00 / 1_000_000},
+    "claude-opus-5": {"input": 5.00 / 1_000_000, "output": 25.00 / 1_000_000},
 }
 # The Message Batches API (used for large multi-checks — see
 # excel_multi.BATCH_THRESHOLD_CHARS) is half price on both input and output.
