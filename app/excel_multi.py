@@ -709,23 +709,27 @@ def _register_summary_block(report: dict | None) -> dict | None:
     """The synthetic "row" a per-language register report rides in as —
     same pattern already used for _truncation_warning/_ai_failure_warning
     (excel_row=0, a recognizable pseudo-context instead of a real row).
-    None when there's nothing to report (register wasn't selected, or no
-    register_value entries came back at all).
+    None when there's nothing to report — register wasn't selected, no
+    register_value entries came back at all, or none of the ones that did
+    were classifiable as formal/informal (build_register_report itself
+    returns None for that last case now too, 2026-09-18 — no more "не
+    удалось определить" placeholder finding).
 
     report is build_register_report's structured return value — its
     "majority"/"exceptions"/"exception_labels" keys ride along on the
     finding itself (register_majority/register_exceptions/
     register_exception_labels) so the frontend can colorize «вы»/«ты» and
     highlight each exception's actual text (Александр's ask, 2026-09-17)
-    without having to re-parse the plain-text message. "message" itself is
-    unchanged from before — still the plain-text fallback for the Excel
-    export or any other plain-text-only reader."""
+    without having to re-parse the plain-text message. "message" is still
+    the plain-text fallback for the Excel export or any other plain-text-
+    only reader — shortened 2026-09-18 to "Тон: <Вы|ты>[, кроме: ...]",
+    down from a full "Тон обращения: везде на «вы»..." sentence."""
     if report is None:
         return None
     finding = {
         "type": "register_summary",
         "severity": "low",
-        "message": f"Тон обращения: {report['text']}.",
+        "message": f"Тон: {report['text']}.",
         "register_majority": report["majority"],
     }
     if report.get("exceptions") is not None:

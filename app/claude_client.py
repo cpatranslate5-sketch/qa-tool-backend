@@ -92,6 +92,24 @@ CALIBRATION_BASE = (
     "— чтобы находки не выглядели одинаковыми и не терялись друг в друге."
 )
 
+# Александр's ask, 2026-09-18 (part of moving to Opus everywhere on the
+# hard-language list, and wanting to afford it): the model's OWN written
+# answer costs several times more per token than what we send it, so a
+# shorter "message" directly cuts the bill — purely a writing-style
+# instruction, doesn't change what counts as a real finding or how
+# carefully it's judged. Asks for a compact "суть — короткая цитата
+# исходник/перевод" shape instead of a full explanation of why it matters.
+_CONCISENESS_INSTRUCTION = (
+    "Пиши поле \"message\" МАКСИМАЛЬНО КОРОТКО, но так, чтобы было понятно, к какому месту в тексте это "
+    "относится и в чём разница — называй суть проблемы в двух-трёх словах, затем сразу короткую цитату "
+    "исходника и перевода в кавычках, без развёрнутых объяснений, почему это ошибка или как её поймёт "
+    "пользователь. Например, вместо длинного варианта: \"Искажён смысл: «Secure position» — это призыв к "
+    "действию («закрепите/обеспечьте своё место в рейтинге»), а перевод «안정적인 위치» означает "
+    "«стабильное/надёжное местоположение», то есть описание, а не действие пользователя.\" — пиши коротко: "
+    "\"Искажение: «Secure position» — «закрепите место», а «안정적인 위치» — «стабильное положение».\" "
+    "Сокращай только форму, а не суть — конкретная фраза и разница должны остаться понятны."
+)
+
 # When "numbers" is also running (a free, 100%-reliable rule check — see
 # app.rule_checks.check_numbers — auto-included whenever "Оформление" is
 # selected), it already catches every plain digit/date mismatch on its own.
@@ -117,7 +135,7 @@ _CALIBRATION_WITHOUT_NUMBERS_CHECK = (
 
 def _calibration(checks: list[str]) -> str:
     tail = _CALIBRATION_WITH_NUMBERS_CHECK if "numbers" in checks else _CALIBRATION_WITHOUT_NUMBERS_CHECK
-    return f"{CALIBRATION_BASE} {tail}"
+    return f"{CALIBRATION_BASE} {tail} {_CONCISENESS_INSTRUCTION}"
 
 
 SINGLE_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
@@ -384,17 +402,28 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
     prompt at all either way). Otherwise, a clearly separate paragraph —
     deliberately NOT folded into the "Что проверять" problem list
     _checks_description builds — asking the model to classify the
-    register actually used, for every pair, regardless of whether it's
-    "correct": this is information-gathering, not error-detection, so it
-    must never be described to the model as a problem to avoid or a
-    mistake to flag.
+    register actually used, for every pair that actually has one,
+    regardless of whether it's "correct": this is information-gathering,
+    not error-detection, so it must never be described to the model as a
+    problem to avoid or a mistake to flag.
+
+    A pair with no direct address at all (a title, a number, a technical
+    label) gets NO entry at all now, rather than one tagged "neutral" —
+    changed 2026-09-18 (Александр's ask): the model's own written answer
+    is the expensive side of the bill, so a row with nothing to say about
+    tone shouldn't still cost a full JSON entry just to say so.
+    build_register_report already only ever counted "formal"/"informal"
+    entries toward the majority anyway (a "neutral" entry was silently
+    excluded, never a third camp) — so skipping it outright changes
+    nothing about the report itself, only how many tokens it costs to get
+    there.
 
     batch=True (BATCH_PROMPT, several pairs of one language visible
-    together) asks for one entry per pair, tagged by row number, matching
-    that prompt's existing "row" numbering. batch=False (SINGLE_PROMPT,
-    exactly one pair — the standalone /check endpoint) asks for exactly
-    one entry with no row number, since that prompt's own findings don't
-    carry one either.
+    together) asks for one entry per applicable pair, tagged by row
+    number, matching that prompt's existing "row" numbering. batch=False
+    (SINGLE_PROMPT, exactly one pair — the standalone /check endpoint)
+    asks for exactly one entry (or none) with no row number, since that
+    prompt's own findings don't carry one either.
 
     Also appends _register_language_hint(target_lang) — normally empty,
     but a short language-specific correction for the rare case where the
@@ -406,29 +435,32 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
         return (
             "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, "
             "как переведено на самом деле: добавь в тот же JSON-массив ОДНУ дополнительную запись на КАЖДУЮ "
-            "пару из списка «Пары для проверки» выше, даже если для неё нет ни одной обычной находки, "
-            f'строго в форме {{"row": <номер пары>, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", '
-            '"value": "formal|informal|neutral|mixed", "message": ""} — value: "formal", если в ПЕРЕВОДЕ этой '
+            "пару из списка «Пары для проверки» выше, В КОТОРОЙ в переводе есть прямое обращение к "
+            "пользователю (даже если для неё нет ни одной обычной находки), строго в форме "
+            f'{{"row": <номер пары>, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", '
+            '"value": "formal|informal|mixed", "message": ""} — value: "formal", если в ПЕРЕВОДЕ этой '
             'пары использовано обращение на «вы» (или аналог для этого языка); "informal", если на «ты»; '
             '"mixed", если В ПРЕДЕЛАХ ЭТОЙ ОДНОЙ пары (перевод может состоять из нескольких предложений или '
             'абзацев в одной ячейке) обращение к пользователю НЕПОСЛЕДОВАТЕЛЬНО — где-то встречается «вы», а '
-            'где-то «ты», а не одна форма единообразно на протяжении всего текста пары; "neutral", если в '
-            'переводе этой конкретной пары нет прямого обращения к пользователю вообще (например, только '
-            'название, число, техническая метка) — тогда не угадывай по смыслу, отвечай "neutral". Это НЕ '
-            "находка об ошибке — не описывай её как проблему, не оценивай, правильная это форма или нет, "
-            "просто зафиксируй, что реально написано в переводе (кроме значения \"mixed\" — это описание "
-            "реального факта смешения форм внутри одной ячейки, а не оценка).\n"
+            'где-то «ты», а не одна форма единообразно на протяжении всего текста пары. Если в переводе этой '
+            'конкретной пары НЕТ прямого обращения к пользователю вообще (например, только название, число, '
+            'техническая метка) — НЕ добавляй по ней запись вообще, просто пропусти эту пару, не угадывай по '
+            'смыслу и не пиши для неё никакого значения. Это НЕ находка об ошибке — не описывай её как '
+            "проблему, не оценивай, правильная это форма или нет, просто зафиксируй, что реально написано в "
+            "переводе (кроме значения \"mixed\" — это описание реального факта смешения форм внутри одной "
+            "ячейки, а не оценка).\n"
         ) + _register_language_hint(target_lang)
     return (
         "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, как "
-        "переведено на самом деле: добавь в тот же JSON-массив ОДНУ дополнительную запись, строго в форме "
-        f'{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal|informal|neutral|mixed", '
-        '"message": ""} — value: "formal", если в переводе использовано обращение на «вы» (или аналог для '
-        'этого языка); "informal", если на «ты»; "mixed", если в пределах ЭТОГО ОДНОГО перевода (он может '
-        'состоять из нескольких предложений или абзацев) обращение к пользователю непоследовательно — где-то '
-        'встречается «вы», а где-то «ты», а не одна форма единообразно на протяжении всего текста; "neutral", '
-        'если в переводе нет прямого обращения к пользователю вообще — тогда не угадывай по смыслу, отвечай '
-        '"neutral". Это НЕ находка об ошибке — не описывай её как проблему, не оценивай, правильная это форма '
+        "переведено на самом деле: если в переводе есть прямое обращение к пользователю, добавь в тот же "
+        f'JSON-массив ОДНУ дополнительную запись, строго в форме {{"type": "{REGISTER_VALUE_TYPE}", '
+        '"severity": "low", "value": "formal|informal|mixed", "message": ""} — value: "formal", если в '
+        'переводе использовано обращение на «вы» (или аналог для этого языка); "informal", если на «ты»; '
+        '"mixed", если в пределах ЭТОГО ОДНОГО перевода (он может состоять из нескольких предложений или '
+        'абзацев) обращение к пользователю непоследовательно — где-то встречается «вы», а где-то «ты», а не '
+        'одна форма единообразно на протяжении всего текста. Если в переводе нет прямого обращения к '
+        'пользователю вообще — НЕ добавляй эту запись вообще, не угадывай по смыслу и не пиши никакого '
+        "значения. Это НЕ находка об ошибке — не описывай её как проблему, не оценивай, правильная это форма "
         "или нет, просто зафиксируй, что реально написано в переводе (кроме значения \"mixed\" — это описание "
         "реального факта смешения форм внутри одного текста, а не оценка).\n"
     ) + _register_language_hint(target_lang)
@@ -436,16 +468,25 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
 
 def _register_array_note(checks: list[str], target_lang: str = "") -> str:
     """Appended to the "(пустой массив [] ...)" output-format line so it
-    stays true once _register_instructions adds its own mandatory entries
-    — without this, "пустой массив, если проблем нет" would directly
-    contradict "add one entry per pair regardless" a few lines above it.
+    stays true once _register_instructions adds its own entries —
+    without this, "пустой массив, если проблем нет" would directly
+    contradict "add one entry per applicable pair" a few lines above it.
     Mirrors _register_instructions' own no-distinction-language skip (see
     NO_REGISTER_DISTINCTION_LANGS) — when no register instructions were
     actually added to the prompt, this note has nothing to justify and
-    must stay empty too."""
+    must stay empty too.
+
+    Wording softened 2026-09-18 alongside _register_instructions' own
+    skip-when-neutral change: these entries are no longer unconditionally
+    mandatory for every pair, only for ones that actually have a direct
+    address to report — so a run where NONE do can legitimately still
+    return a genuinely empty array."""
     if "register" not in checks or _lacks_register_distinction(target_lang):
         return ""
-    return " — но если выбран регистр обращения, эти дополнительные записи всё равно обязательны"
+    return (
+        " — но если выбран регистр обращения, для пар с прямым обращением к пользователю такие "
+        "дополнительные записи всё равно обязательны"
+    )
 
 
 # Александр's own cutoff for when showing each exception row's actual text
@@ -468,19 +509,22 @@ def build_register_report(values: dict, texts: dict | None = None, single: bool 
     2026-09-17). Ignored entirely in single mode (a lone pair has no
     "exceptions" to begin with) or once there are too many to usefully quote.
 
-    Returns None if there's nothing to report at all (no register_value
-    entries came back — e.g. "register" wasn't selected, or the AI call
-    itself failed and _extract_register_values in app.excel_multi never got
-    anything to extract). Otherwise a dict:
+    Returns None if there's nothing to report at all — no register_value
+    entries came back at all (e.g. "register" wasn't selected, or the AI
+    call itself failed and _extract_register_values in app.excel_multi
+    never got anything to extract), OR every entry that did come back was
+    something other than "formal"/"informal" (a row-by-row "mixed" is
+    handled separately by the caller and never reaches here; anything
+    else has nothing classifiable to report a tone for at all). Changed
+    2026-09-18 (Александр's ask): this used to return a "не удалось
+    определить" placeholder dict for the second case — now it's simply
+    nothing to show, same as if register hadn't been asked for on that
+    language at all. Otherwise a dict:
       {
         "text": <the plain-text clause this function used to return
                  directly, unprefixed/unpunctuated — still what the Excel
                  export and any other plain-text-only reader uses>,
-        "majority": "formal" | "informal" | None,   # None only for the
-                     "couldn't determine" case — lets a caller colorize
-                     "вы" (formal) and "ты" (informal) differently
-                     (Александр asked for blue/orange) without re-parsing
-                     the Russian text back out of `text`.
+        "majority": "formal" | "informal",
         "exceptions": [{"label": ..., "text": ...}, ...] | None,  # set only
                      when there ARE exceptions AND there are few enough of
                      them AND texts was given — the caller highlights each
@@ -493,9 +537,16 @@ def build_register_report(values: dict, texts: dict | None = None, single: bool 
                      for a caller that wants the raw labels on their own.
       }
 
-    single=True drops the "везде"/"кроме" multi-row framing in favour of a
-    plain "на «вы»"/"на «ты»" clause — "everywhere" reads oddly to
-    describe a single pair.
+    `text` itself was shortened 2026-09-18 (Александр's ask) from a full
+    "везде на «вы»"/"на «вы»" clause down to the bare word — "Вы"
+    (capitalized, matching how the formal address is conventionally
+    written on its own) or "ты" — so callers now show a terse "Тон: Вы"
+    rather than a full sentence; any exceptions still ride along as a
+    short "..., кроме: строка N" suffix.
+
+    single=True drops the "везде"/"кроме" multi-row framing entirely — a
+    lone pair has nothing to compare itself against, so `text` is just
+    the bare word above.
 
     A tie between formal and informal counts (equally split, no real
     majority) resolves to whichever value happened to appear first in
@@ -507,29 +558,24 @@ def build_register_report(values: dict, texts: dict | None = None, single: bool 
         return None
     classified = {k: v for k, v in values.items() if v in ("formal", "informal")}
     if not classified:
-        return {
-            "text": "не удалось определить — в переведённых строках нет прямых обращений к пользователю",
-            "majority": None,
-            "exceptions": None,
-            "exception_labels": None,
-        }
+        return None
     if single:
         only_value = next(iter(classified.values()))
-        word = "вы" if only_value == "formal" else "ты"
-        return {"text": f"на «{word}»", "majority": only_value, "exceptions": None, "exception_labels": None}
+        word = "Вы" if only_value == "formal" else "ты"
+        return {"text": word, "majority": only_value, "exceptions": None, "exception_labels": None}
 
     counts: dict[str, int] = {}
     for v in classified.values():
         counts[v] = counts.get(v, 0) + 1
     majority_value = max(counts, key=lambda v: counts[v])
-    majority_word = "вы" if majority_value == "formal" else "ты"
+    majority_word = "Вы" if majority_value == "formal" else "ты"
     exception_labels = sorted(k for k, v in classified.items() if v != majority_value)
     if not exception_labels:
-        return {"text": f"везде на «{majority_word}»", "majority": majority_value, "exceptions": None, "exception_labels": None}
+        return {"text": majority_word, "majority": majority_value, "exceptions": None, "exception_labels": None}
 
     exceptions_str = ", ".join(str(e) for e in exception_labels)
     row_word = "строка" if len(exception_labels) == 1 else "строки"
-    text = f"везде на «{majority_word}», кроме: {row_word} {exceptions_str}"
+    text = f"{majority_word}, кроме: {row_word} {exceptions_str}"
 
     # Show the actual (wrongly-toned) text for up to MAX_EXCEPTIONS_WITH_TEXT
     # exceptions, so the manager sees what was written differently without
@@ -573,13 +619,21 @@ def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[
 
 
 # Languages that get the stronger CLAUDE_MODEL_HARD instead of the default
-# CLAUDE_MODEL — agreed with Александр after costing out the difference
-# (Sonnet 4.5 is 3x Haiku 4.5 per token, both input and output, but only
-# these languages' calls use it, so the total impact is modest). Matched
-# against the BASE language subtag of whatever target_lang a check actually
-# runs with, so "kk-KZ", "kk", or any other region variant of Kazakh all
-# get it alike.
-HARD_LANGUAGE_BASES = {"kk", "ky", "tg", "uz", "sw", "te", "mr", "az"}
+# CLAUDE_MODEL. Replaced wholesale on 2026-09-18 (Александр's ask, after
+# comparing real Opus vs Sonnet reports for several languages side by
+# side): arabic/bengali/greek/hindi/hinglish/indonesian/kyrgyz/korean/
+# marathi/malay/romanian/telugu/thai/tajik/urdu now get the stronger model;
+# kazakh/uzbek/swahili/azerbaijani (on the OLD list) are deliberately
+# dropped from it — Sonnet is good enough for those, so they now get
+# CLAUDE_MODEL like every other "normal" language. Matched against the
+# BASE language subtag of whatever target_lang a check actually runs with,
+# so "ko-KR", "ko", or any other region variant of Korean all get it alike.
+# "hing" (Hinglish) isn't a real ISO code at all — it's this platform's own
+# code for Hindi-English code-mixed text (see parse_workbook) — but the
+# base-subtag match doesn't care, an exact "hing" simply matches itself.
+HARD_LANGUAGE_BASES = {
+    "ar", "bn", "el", "hi", "hing", "id", "ky", "ko", "mr", "ms", "ro", "te", "th", "tg", "ur",
+}
 
 
 def _model_for_lang(target_lang: str) -> str:
@@ -835,7 +889,7 @@ async def run_ai_checks(
                 findings.append({
                     "type": "register_summary",
                     "severity": "low",
-                    "message": f"Тон обращения: {report['text']}.",
+                    "message": f"Тон: {report['text']}.",
                     "register_majority": report["majority"],
                 })
 

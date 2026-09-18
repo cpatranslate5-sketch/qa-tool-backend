@@ -1424,16 +1424,25 @@ print("[OK] pick_source_lang: resolves the manager's chosen source language agai
       "silently falling back to English")
 
 # --- model tiering: confirmed "hard" languages get the stronger model,
-# matched by base subtag so any region variant of them qualifies too ---
+# matched by base subtag so any region variant of them qualifies too.
+# List replaced wholesale 2026-09-18 (Александр's ask, after comparing
+# real Opus vs Sonnet reports): kk/uz/sw/az moved OFF the hard list (they
+# now get CLAUDE_MODEL like everything else), replaced by a new set of
+# 15 languages including the non-ISO "hing" (Hinglish) code. ---
 from app.claude_client import _model_for_lang
 from app.config import settings
 
-for hard in ["kk", "kk-KZ", "ky-KG", "tg-TJ", "uz", "sw-KE", "te-IN", "mr-IN", "az-AZ"]:
+for hard in [
+    "ar", "ar-SA", "bn", "bn-BD", "el", "el-GR", "hi", "hi-IN", "hing", "id", "id-ID",
+    "ky-KG", "ko", "ko-KR", "mr-IN", "ms", "ms-MY", "ro", "ro-RO", "te-IN", "th", "th-TH",
+    "tg-TJ", "ur", "ur-PK",
+]:
     assert _model_for_lang(hard) == settings.CLAUDE_MODEL_HARD, hard
-for normal in ["ru", "es-mx", "en", "de-DE", "fr"]:
+for normal in ["ru", "es-mx", "en", "de-DE", "fr", "kk", "kk-KZ", "uz", "sw-KE", "az-AZ"]:
     assert _model_for_lang(normal) == settings.CLAUDE_MODEL, normal
-print("[OK] _model_for_lang: confirmed hard-language list (kk/ky/tg/uz/sw/te/mr/az) "
-      "routes to CLAUDE_MODEL_HARD by base subtag, everything else to CLAUDE_MODEL")
+print("[OK] _model_for_lang: confirmed the current hard-language list (ar/bn/el/hi/hing/id/ky/ko/mr/ms/"
+      "ro/te/th/tg/ur) routes to CLAUDE_MODEL_HARD by base subtag, and that kk/uz/sw/az — on the OLD list "
+      "— now route to CLAUDE_MODEL like every other 'normal' language")
 
 # --- MODEL_PRICING_PER_TOKEN / _usage_cost: Александр's real bug
 # (2026-09-17) — CLAUDE_MODEL on Railway had already moved on to
@@ -1944,6 +1953,21 @@ assert "даже если их 10, 20 или больше" in CALIBRATION_BASE, 
 print("[OK] the calibration text also explicitly covers the SAME problem occurring several times inside "
       "one long, multi-sentence pair (e.g. one Excel cell with a whole paragraph) — every occurrence must "
       "be its own separate finding, quoting which sentence/fragment it's in, never blended into one")
+
+# --- Александр's ask, 2026-09-18: shorten the AI's own written findings —
+# the model's output is the pricier side of the token bill (several times
+# the input rate), so a terser "message" cuts cost without touching what
+# counts as a real finding. _calibration (folded into both prompts via
+# {calibration}) now carries an explicit brevity instruction with a worked
+# before/after example matching Александр's own wording. ---
+calib_any = _calibration(["typo"])
+assert "МАКСИМАЛЬНО КОРОТКО" in calib_any, calib_any
+assert "«Secure position» — «закрепите место»" in calib_any, calib_any
+assert "Сокращай только форму, а не суть" in calib_any, calib_any
+print("[OK] the calibration text now explicitly asks the model to keep \"message\" as short as possible "
+      "while staying clear about which exact phrase and what difference it's about, with a worked "
+      "before/after example — output tokens are the expensive side of the bill, so this is a pure "
+      "writing-style instruction that doesn't loosen or change what counts as a real finding")
 
 # --- the prompt also tells the model not to squeeze an out-of-scope
 # finding into whichever type happens to be the only one allowed —
@@ -2612,6 +2636,18 @@ print("[OK] _register_instructions carries the entire register task now (empty w
       "explicitly framed as information-gathering rather than error-detection), and only the batch "
       "(multi-row) prompt tags entries by row number")
 
+# Changed 2026-09-18 (Александр's ask, cutting cost on the pricier output
+# side): a pair with no direct address at all no longer gets tagged
+# "neutral" — it's skipped entirely, no entry at all. "neutral" must no
+# longer be offered as a value option in either prompt variant, and both
+# must instead tell the model to just omit the entry.
+assert "neutral" not in batch_instr, batch_instr
+assert "neutral" not in single_instr, single_instr
+assert "не добавляй" in batch_instr.lower(), batch_instr
+assert "не добавляй" in single_instr.lower(), single_instr
+print("[OK] register instructions no longer offer \"neutral\" as a value — a pair/row with no direct "
+      "address is skipped entirely (no entry at all) instead of costing a full JSON entry to say so")
+
 # For a language with no grammatical formal/informal distinction at all
 # (English's single "you" — Александр's own example, 2026-09-17), the
 # register instructions/array-note are skipped ENTIRELY regardless of
@@ -2670,14 +2706,14 @@ print("[OK] register instructions carry a correcting hint for Brazilian Portugue
 # the "everywhere, no exceptions" case below.
 assert build_register_report({}) is None
 everywhere_formal = build_register_report({5: "formal", 12: "formal"})
-assert everywhere_formal == {"text": "везде на «вы»", "majority": "formal", "exceptions": None, "exception_labels": None}, everywhere_formal
+assert everywhere_formal == {"text": "Вы", "majority": "formal", "exceptions": None, "exception_labels": None}, everywhere_formal
 everywhere_informal = build_register_report({1: "informal", 2: "informal", 3: "informal"})
-assert everywhere_informal["text"] == "везде на «ты»" and everywhere_informal["majority"] == "informal"
+assert everywhere_informal["text"] == "ты" and everywhere_informal["majority"] == "informal"
 # a genuine minority gets called out by row number in `text` either way —
 # and, when `texts` is given and there are few enough exceptions (<=3),
 # ALSO gets each exception's actual text in `exceptions` instead of `exception_labels`
 mixed = build_register_report({1: "formal", 2: "formal", 3: "formal", 5: "informal", 12: "informal"})
-assert mixed["text"] == "везде на «вы», кроме: строки 5, 12", mixed
+assert mixed["text"] == "Вы, кроме: строки 5, 12", mixed
 assert mixed["majority"] == "formal"
 assert mixed["exceptions"] is None and mixed["exception_labels"] == [5, 12], mixed  # no `texts` given here
 mixed_with_texts = build_register_report(
@@ -2702,24 +2738,24 @@ assert many_exceptions["exception_labels"] == [6, 7, 8, 9], many_exceptions
 # a SINGLE exception uses the singular "строка", not "строки" ("кроме:
 # строки 3" reads as a grammar mistake to a Russian speaker)
 single_exc = build_register_report({1: "formal", 2: "formal", 3: "informal"})
-assert single_exc["text"] == "везде на «вы», кроме: строка 3", single_exc
+assert single_exc["text"] == "Вы, кроме: строка 3", single_exc
 # "neutral" rows (no direct address at all — a title, a number) are excluded
 # from the count entirely, not treated as a third camp
-assert build_register_report({1: "formal", 2: "neutral", 3: "formal"})["text"] == "везде на «вы»"
-# nothing classifiable at all -> an honest "couldn't tell", not a guess, and
-# `majority` is None so a caller never tries to color a non-existent value
-undetermined = build_register_report({1: "neutral", 2: "neutral"})
-assert undetermined["majority"] is None, undetermined
-assert undetermined["text"] == "не удалось определить — в переведённых строках нет прямых обращений к пользователю"
-# single-pair mode drops the "везде"/"кроме" framing (nothing to compare
-# a lone pair against) and never has exceptions
+assert build_register_report({1: "formal", 2: "neutral", 3: "formal"})["text"] == "Вы"
+# nothing classifiable at all -> nothing to report at all any more (changed
+# 2026-09-18 — used to be an explicit "не удалось определить" placeholder,
+# now simply None, same as if register hadn't been asked for)
+assert build_register_report({1: "neutral", 2: "neutral"}) is None
+# single-pair mode drops the "везде"/"кроме" framing entirely (nothing to
+# compare a lone pair against) and never has exceptions — just the bare word
 single_formal = build_register_report({0: "formal"}, single=True)
-assert single_formal == {"text": "на «вы»", "majority": "formal", "exceptions": None, "exception_labels": None}
-assert build_register_report({0: "informal"}, single=True)["text"] == "на «ты»"
-print("[OK] build_register_report: everywhere-the-same reports plainly, a genuine minority is called "
-      "out by row number (or, for <=3 exceptions with texts given, by the actual wrongly-toned text), "
-      "rows with no direct address are excluded from the count rather than treated as a third camp, and "
-      "single-pair mode drops the \"везде\"/\"кроме\" framing")
+assert single_formal == {"text": "Вы", "majority": "formal", "exceptions": None, "exception_labels": None}
+assert build_register_report({0: "informal"}, single=True)["text"] == "ты"
+print("[OK] build_register_report: everywhere-the-same reports just the bare word (\"Вы\"/\"ты\"), a "
+      "genuine minority is called out by row number (or, for <=3 exceptions with texts given, by the "
+      "actual wrongly-toned text), rows with no direct address are excluded from the count rather than "
+      "treated as a third camp, nothing classifiable at all now means no report at all (not a placeholder "
+      "sentence), and single-pair mode drops the \"везде\"/\"кроме\" framing")
 
 # --- end-to-end: the standalone /check endpoint actually produces a
 # "register_summary" finding from a mocked AI response, and — critically —
@@ -2742,7 +2778,7 @@ r = check("register-only /check produces a register_summary, not a raw register_
 reg_findings = r.json()["findings"]
 assert len(reg_findings) == 1, reg_findings
 assert reg_findings[0]["type"] == "register_summary", reg_findings
-assert reg_findings[0]["message"] == "Тон обращения: на «вы».", reg_findings
+assert reg_findings[0]["message"] == "Тон: Вы.", reg_findings
 assert reg_findings[0]["register_majority"] == "formal", reg_findings
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
@@ -2812,7 +2848,7 @@ settings.ANTHROPIC_API_KEY = ""
 assert len(_reg_out) == 1, _reg_out  # nothing else had a real finding — just the one summary row
 _reg_finding = _reg_out[0]["findings"][0]
 assert _reg_finding["type"] == "register_summary", _reg_out
-assert _reg_finding["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_out
+assert _reg_finding["message"] == "Тон: Вы, кроме: строка 3.", _reg_out
 assert _reg_finding["register_majority"] == "formal", _reg_finding
 # 1 exception (<=3) and the row's own translated text was available, so the
 # structured fields carry the actual wrongly-toned text, not just the row
@@ -2853,7 +2889,7 @@ _reg_lang_findings = _reg_finalized["sheets"][0]["languages"]["ru"]
 assert len(_reg_lang_findings) == 1, _reg_lang_findings
 _reg_batch_finding = _reg_lang_findings[0]["findings"][0]
 assert _reg_batch_finding["type"] == "register_summary", _reg_lang_findings
-assert _reg_batch_finding["message"] == "Тон обращения: везде на «вы», кроме: строка 3.", _reg_lang_findings
+assert _reg_batch_finding["message"] == "Тон: Вы, кроме: строка 3.", _reg_lang_findings
 assert _reg_batch_finding["register_majority"] == "formal", _reg_batch_finding
 assert _reg_batch_finding["register_exceptions"] == [{"label": 3, "text": "Здарова, пока"}], _reg_batch_finding
 assert "register_exception_labels" not in _reg_batch_finding, _reg_batch_finding
@@ -2922,7 +2958,7 @@ _mixed_rows_by_excel_row = {row["excel_row"]: row for row in _mixed_out}
 assert 3 in _mixed_rows_by_excel_row, _mixed_out  # the mixed row itself must show up with its own finding
 assert _mixed_rows_by_excel_row[3]["findings"][0]["type"] == REGISTER_MIXED_TYPE, _mixed_rows_by_excel_row[3]
 _mixed_summary = next(row for row in _mixed_out if row["findings"][0]["type"] == "register_summary")
-assert _mixed_summary["findings"][0]["message"] == "Тон обращения: везде на «вы».", _mixed_summary
+assert _mixed_summary["findings"][0]["message"] == "Тон: Вы.", _mixed_summary
 assert _mixed_summary["findings"][0]["register_majority"] == "formal", _mixed_summary
 assert "register_exceptions" not in _mixed_summary["findings"][0], _mixed_summary
 assert "register_exception_labels" not in _mixed_summary["findings"][0], _mixed_summary
