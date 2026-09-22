@@ -75,28 +75,25 @@ CHECK_LABELS = {
     ),
 }
 
-# Split into an "opening" (the part that actually sets the confidence bar)
-# and a "shared" tail (everything else — currency/date formatting notes,
-# multi-finding-per-pair rules) that stays identical in both calibration
-# modes below. This split exists ONLY so _calibration_debug's relaxed pass
-# (see CALIBRATION_RELAXED_OPENING) can swap out the ONE sentence that
-# controls confidence without touching anything else the prompt asks for —
-# see _calibration's "relaxed" parameter and app.excel_multi's
-# calibration_debug feature (Александр's ask, 2026-09-22: find out whether
-# real-world misses on hard-language/subtle findings come from the model's
-# own knowledge gap or from this confidence bar filtering out a correct-
-# but-uncertain finding).
+# CALIBRATION_STRICT_OPENING (the confidence-bar sentence) and
+# _CALIBRATION_SHARED_TAIL (everything else — currency/date formatting
+# notes, multi-finding-per-pair rules) are kept as separate constants only
+# so smoketest can check the confidence wording actually landed in a
+# prompt without re-parsing the whole calibration text.
+#
+# There used to be a second, "relaxed" opening here too (a lowered-
+# confidence test mode, wired into a "🔬 Тест калибровки" checkbox on the
+# upload form) — added 2026-09-22 to find out whether real-world misses on
+# hard-language findings came from the model's own knowledge gap or from
+# this confidence bar filtering out a correct-but-uncertain finding.
+# Removed 2026-09-23 after the real Marathi test settled the question: the
+# relaxed opening made ZERO difference to Sonnet's result (still missed the
+# same error), so the confidence bar was never the cause — the actual fix
+# was BATCH_PROMPT_SINGLE_ITEM below. See the translation-QA catalog doc
+# (section 2) for the full writeup Александр reviewed before this removal.
 CALIBRATION_STRICT_OPENING = (
-    "Общее правило: сообщай, только если уверен(а), что это настоящая ошибка. Сомневаешься или это может быть "
-    "допустимым вариантом — не включай. Лучше меньше, но точных находок."
-)
-CALIBRATION_RELAXED_OPENING = (
-    "ТЕСТОВЫЙ РЕЖИМ пониженного порога уверенности (используется только для отладки чувствительности проверки, "
-    "не для обычной работы): сообщай о находке, даже если не до конца уверен(а) в ней — если это выглядит как "
-    "правдоподобный, реальный признак ошибки смысла или грамматики, а не просто другая, тоже корректная "
-    "формулировка. Смягчается ТОЛЬКО порог уверенности в том, что предполагаемая проблема настоящая — то, ЧТО "
-    "вообще считается проблемой, не меняется: другой синоним/порядок слов с тем же смыслом по-прежнему не "
-    "ошибка, и об этом по-прежнему не нужно сообщать."
+    "Общее правило: сообщай о находке, если после проверки уверен(а), что это настоящая ошибка, а не другой, "
+    "тоже допустимый вариант перевода."
 )
 _CALIBRATION_SHARED_TAIL = (
     "Порядок символа валюты относительно числа, "
@@ -159,10 +156,9 @@ _CALIBRATION_WITHOUT_NUMBERS_CHECK = (
 )
 
 
-def _calibration(checks: list[str], relaxed: bool = False) -> str:
-    opening = CALIBRATION_RELAXED_OPENING if relaxed else CALIBRATION_STRICT_OPENING
+def _calibration(checks: list[str]) -> str:
     tail = _CALIBRATION_WITH_NUMBERS_CHECK if "numbers" in checks else _CALIBRATION_WITHOUT_NUMBERS_CHECK
-    return f"{opening} {_CALIBRATION_SHARED_TAIL} {tail} {_CONCISENESS_INSTRUCTION}"
+    return f"{CALIBRATION_STRICT_OPENING} {_CALIBRATION_SHARED_TAIL} {tail} {_CONCISENESS_INSTRUCTION}"
 
 
 SINGLE_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
@@ -184,10 +180,7 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 {extra_instructions}
 
 Что проверять: {checks_description}
-Даже если заметишь другую проблему вне этого списка (в т.ч. очевидную и серьёзную) — не включай её в ответ вообще,
-ни под каким из перечисленных типов; для неё есть отдельная проверка, которую нужно включить отдельно. Не подгоняй
-такую находку под ближайший по смыслу разрешённый тип только потому, что это единственный доступный вариант —
-если находка не является настоящим примером именно этого критерия, её не должно быть в ответе.
+{other_type_instruction}
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
@@ -209,10 +202,7 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 {extra_instructions}
 
 Что проверять: {checks_description}
-Даже если заметишь другую проблему вне этого списка (в т.ч. очевидную и серьёзную) — не включай её в ответ вообще,
-ни под каким из перечисленных типов; для неё есть отдельная проверка, которую нужно включить отдельно. Не подгоняй
-такую находку под ближайший по смыслу разрешённый тип только потому, что это единственный доступный вариант —
-если находка не является настоящим примером именно этого критерия, её не должно быть в ответе.
+{other_type_instruction}
 
 Отдельно — про повторяющиеся ошибки (это НЕ противоречит правилу "оценивай каждую пару отдельно" выше: ты всё равно
 оцениваешь и находишь проблему в каждой паре независимо, а правило ниже только про то, как ОФОРМИТЬ ответ, если
@@ -289,10 +279,7 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 \"\"\"{translation}\"\"\"
 
 Что проверять: {checks_description}
-Даже если заметишь другую проблему вне этого списка (в т.ч. очевидную и серьёзную) — не включай её в ответ вообще,
-ни под каким из перечисленных типов; для неё есть отдельная проверка, которую нужно включить отдельно. Не подгоняй
-такую находку под ближайший по смыслу разрешённый тип только потому, что это единственный доступный вариант —
-если находка не является настоящим примером именно этого критерия, её не должно быть в ответе.
+{other_type_instruction}
 
 Важно про сам текст "message": НИКОГДА не упоминай в нём номер пары/строки — ни словом ("пара 1", "строка 1"), ни
 просто числом в скобках. Если нужно различить конкретные места (например, при нескольких предложениях в одном
@@ -373,6 +360,38 @@ def _checks_description(checks: list[str]) -> str | None:
     if not ai_checks:
         return None
     return "; ".join(CHECK_LABELS[c] for c in ai_checks) or None
+
+
+# "other" — a genuinely serious problem the model notices OUTSIDE the
+# selected checks. Added 2026-09-23 (Александр's ask, reviewing the
+# translation-QA prompt catalog): the previous rule told the model to drop
+# such a finding silently rather than force it under the wrong check type
+# — good for keeping each type's own stats trustworthy, but risked a real,
+# serious problem never reaching the manager at all just because it didn't
+# match one of the checks ticked for that run. This keeps the "don't force
+# it under the wrong type" half (a mismatched type would corrupt that
+# type's own numbers) while giving a genuinely serious out-of-scope finding
+# somewhere safe to land — OTHER_TYPE, kept OUT of the main checks/stats,
+# clearly separate, but visible to the manager instead of silently dropped.
+# Not added to CHECK_LABELS itself (that dict is what the manager opts
+# INTO via checkboxes — "other" isn't opt-in, it rides along automatically
+# whenever at least one real check is running, see _allowed_ai_types).
+OTHER_TYPE = "other"
+_OTHER_TYPE_INSTRUCTION = (
+    "Если увидишь другую, явно серьёзную проблему вне этого списка (например очевидную ошибку смысла, не "
+    "относящуюся ни к одному из перечисленных типов) — не подгоняй её под ближайший по смыслу разрешённый тип "
+    "выше только потому, что это единственный доступный вариант: если находка не является настоящим примером "
+    'именно этого критерия, её не должно быть под этим типом. Вместо этого добавь её в ответ отдельной записью '
+    'с "type": "other" — так она не потеряется, но и не исказит статистику по основным критериям. Мелкие или '
+    "сомнительные наблюдения вне списка проверок пропускай — не сообщай о них вообще."
+)
+
+
+def _other_type_instruction(checks_description: str | None) -> str:
+    """Empty when there's no real "Что проверять" list to be outside of in
+    the first place (e.g. a register-only run) — see _checks_description's
+    own None case."""
+    return _OTHER_TYPE_INSTRUCTION if checks_description else ""
 
 
 # The "register" (tone of address) response entries are never a "problem" —
@@ -714,8 +733,16 @@ def _allowed_ai_types(checks: list[str]) -> set[str]:
 
     REGISTER_VALUE_TYPE is added on top of CHECK_LABELS' own keys (rather
     than living in CHECK_LABELS itself) because it isn't a problem type at
-    all — see that dict's comment — so it needs its own opt-in here."""
+    all — see that dict's comment — so it needs its own opt-in here.
+
+    OTHER_TYPE is added whenever at least one real CHECK_LABELS check is
+    selected (mirrors _OTHER_TYPE_INSTRUCTION's own condition for being
+    added to the prompt at all — see there) — a genuinely serious problem
+    the model notices outside the selected checks still needs somewhere
+    safe to land, see that constant's own comment."""
     allowed = {c for c in checks if c in CHECK_LABELS}
+    if allowed:
+        allowed.add(OTHER_TYPE)
     if "register" in checks:
         allowed.add(REGISTER_VALUE_TYPE)
     return allowed
@@ -980,6 +1007,7 @@ async def run_ai_checks(
         translation=translation,
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
+        other_type_instruction=_other_type_instruction(checks_description),
         register_instructions=register_instructions,
         register_array_note=_register_array_note(checks, target_lang=target_lang),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
@@ -1020,7 +1048,6 @@ def build_batch_prompt(
     extra_instructions: str = "",
     target_lang: str = "",
     source_lang: str = "",
-    relaxed: bool = False,
 ) -> tuple[str | None, dict[int, int]]:
     """
     Builds the prompt for one language's batch of (context, source,
@@ -1032,11 +1059,6 @@ def build_batch_prompt(
     items: list of {"context": str, "source": str, "translation": str}, all
     in the same target language. Items with an empty translation are
     skipped (handled by rule checks as "missing translation" instead).
-
-    relaxed: see _calibration's own "relaxed" parameter — swaps in
-    CALIBRATION_RELAXED_OPENING instead of the normal production confidence
-    bar. Only app.excel_multi's calibration_debug feature ever passes True;
-    every regular check (single or multi) leaves this at the default.
 
     Returns (prompt, number_to_index) — prompt is None when there's nothing
     to ask the AI (no AI check types selected, or nothing checkable).
@@ -1062,10 +1084,11 @@ def build_batch_prompt(
     )
     common_kwargs = dict(
         target_lang_line=_target_lang_line(target_lang),
-        calibration=_calibration(checks, relaxed=relaxed),
+        calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang, checks),
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
+        other_type_instruction=_other_type_instruction(checks_description),
         register_instructions=register_instructions,
         register_array_note=_register_array_note(checks, target_lang=target_lang),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
@@ -1136,7 +1159,6 @@ async def run_ai_checks_batch(
     extra_instructions: str = "",
     target_lang: str = "",
     source_lang: str = "",
-    relaxed: bool = False,
     model_override: str | None = None,
 ) -> tuple[dict[int, list[dict]], float, bool]:
     """Synchronous path: builds the prompt, calls Claude right away, and
@@ -1144,9 +1166,6 @@ async def run_ai_checks_batch(
     whether the response was truncated by the max_tokens ceiling — the
     caller adds a visible warning for that rather than presenting a
     partial result as a complete one).
-
-    relaxed: forwarded to build_batch_prompt/_calibration — see there.
-    Only app.excel_multi's calibration_debug pass ever sets this True.
 
     model_override: bypass the normal _model_for_lang(target_lang)
     selection and force a specific model id instead. Added 2026-09-22
@@ -1159,7 +1178,7 @@ async def run_ai_checks_batch(
     summarizes those itself (it's the one with the excel_row numbers to
     label them with), not this function."""
     prompt, number_to_index = build_batch_prompt(
-        items, checks, extra_instructions, target_lang, source_lang, relaxed=relaxed,
+        items, checks, extra_instructions, target_lang, source_lang,
     )
     if prompt is None:
         return {}, 0.0, False

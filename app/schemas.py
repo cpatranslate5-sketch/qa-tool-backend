@@ -175,11 +175,11 @@ class ModelComparisonIn(BaseModel):
     checks: list[str] = ["typo"]
     runs_per_model: int = 5
     # See app.model_comparison.run_model_comparison's own docstring on
-    # "relaxed" — set true to test with the loosened confidence bar
-    # instead of the normal strict one.
-    relaxed: bool = False
-    # See app.model_comparison.run_model_comparison's own docstring on
     # "bare" — set true to bypass our whole normal prompt in favor of a
     # minimal, direct question (no calibration wording, no JSON schema).
-    # When true, "relaxed" is ignored.
     bare: bool = False
+    # Which models to compare, by name ("opus"/"sonnet"/"haiku") — see
+    # app.model_comparison.DEFAULT_COMPARISON_MODELS. Defaults to sonnet +
+    # haiku only (Александр's ask, 2026-09-23 — no Opus spend for a routine
+    # comparison); pass ["opus", "sonnet", "haiku"] to include Opus too.
+    models: list[str] = ["sonnet", "haiku"]

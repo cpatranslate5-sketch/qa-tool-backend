@@ -2004,12 +2004,53 @@ print("[OK] the calibration text now explicitly asks the model to keep \"message
 # finding into whichever type happens to be the only one allowed —
 # Александр hit exactly this with the (now-removed) glossary check, but
 # the instruction itself is generic, not glossary-specific, so it stays
-# relevant for any single-check-type run. ---
-from app.claude_client import SINGLE_PROMPT, BATCH_PROMPT
+# relevant for any single-check-type run. As of 2026-09-23 this text isn't
+# hard-coded into the templates any more — it's the dynamic
+# {other_type_instruction} placeholder (see OTHER_TYPE above), so it's
+# absent whenever there's no real check list to be outside of (a
+# register-only run) instead of always present. ---
+from app.claude_client import SINGLE_PROMPT, BATCH_PROMPT, BATCH_PROMPT_SINGLE_ITEM, run_ai_checks
 
-assert "Не подгоняй" in SINGLE_PROMPT and "Не подгоняй" in BATCH_PROMPT
-print("[OK] the prompt explicitly forbids squeezing an out-of-scope finding into whichever "
-      "type happens to be the only one allowed")
+assert "{other_type_instruction}" in SINGLE_PROMPT and "{other_type_instruction}" in BATCH_PROMPT, (
+    "both templates must carry the dynamic placeholder rather than a hard-coded copy of the instruction"
+)
+assert "{other_type_instruction}" in BATCH_PROMPT_SINGLE_ITEM
+
+_squeeze_test_prompts = {"typo": [], "register": []}
+
+
+async def _fake_call_claude_records_prompt_typo(prompt, model=None):
+    _squeeze_test_prompts["typo"].append(prompt)
+    return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
+
+
+async def _fake_call_claude_records_prompt_register(prompt, model=None):
+    _squeeze_test_prompts["register"].append(prompt)
+    return '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]', {"input_tokens": 10, "output_tokens": 5}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_records_prompt_typo
+asyncio.get_event_loop().run_until_complete(
+    run_ai_checks("source", "translation", ["typo"], target_lang="ru")
+)
+claude_client_mod._call_claude = _fake_call_claude_records_prompt_register
+asyncio.get_event_loop().run_until_complete(
+    run_ai_checks("source", "translation", ["register"], target_lang="ru")
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert "не подгоняй" in _squeeze_test_prompts["typo"][0], (
+    "with a real check selected, the formatted prompt must actually carry the out-of-scope instruction"
+)
+assert "не подгоняй" not in _squeeze_test_prompts["register"][0], (
+    "a register-only run has no real \"Что проверять\" list to be outside of, so the out-of-scope "
+    "instruction must be absent entirely, not just unused"
+)
+print("[OK] the prompt explicitly forbids squeezing an out-of-scope finding into whichever type happens to "
+      "be the only one allowed, via the dynamic {other_type_instruction} placeholder rather than a "
+      "hard-coded copy in every template — and it's correctly absent for a register-only run")
 
 # --- BATCH_PROMPT explicitly tells the model how to report the SAME exact
 # problem repeating identically across several pairs (Александр's ask,
@@ -2195,7 +2236,7 @@ _rep_sheet = {
 }
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_repeated_batch
-_rep_out, _rep_cost, _rep_debug_cost, _rep_gemini_cost = asyncio.get_event_loop().run_until_complete(
+_rep_out, _rep_cost, _rep_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_rep_sheet, "ru", "en", ["typo", "untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2317,7 +2358,7 @@ _chunk_rows = [
 _chunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _chunk_rows}
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_chunked
-_chunk_out, _chunk_cost, _chunk_debug_cost, _chunk_gemini_cost = asyncio.get_event_loop().run_until_complete(
+_chunk_out, _chunk_cost, _chunk_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_chunk_sheet, "ru", "en", ["untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2568,8 +2609,8 @@ print("[OK] finalize_batch_results: a batch submitted before chunking existed (o
 from app.claude_client import _allowed_ai_types, _filter_findings_by_checks, run_ai_checks
 import app.claude_client as claude_client_mod
 
-assert _allowed_ai_types(["typo"]) == {"typo"}
-assert _allowed_ai_types(["typo", "punctuation", "max_length"]) == {"typo"}  # rule checks aren't AI types
+assert _allowed_ai_types(["typo"]) == {"typo", "other"}
+assert _allowed_ai_types(["typo", "punctuation", "max_length"]) == {"typo", "other"}  # rule checks aren't AI types
 
 raw_findings = [
     {"type": "typo", "severity": "medium", "message": "неверная валюта в переводе"},
@@ -2602,10 +2643,65 @@ assert findings == [raw_findings[0]], findings
 assert ai_cost > 0, ai_cost
 # The JSON schema shown to the model is also scoped down to just the
 # requested check(s), not a fixed always-all list.
-type_enum_line = next(line for line in captured_prompts[0].splitlines() if '"type":' in line)
+type_enum_line = next(
+    line for line in captured_prompts[0].splitlines() if '"type":' in line and '"severity":' in line
+)
 assert "typo" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
 print("[OK] AI findings hard-filtered to requested checks even when the model reports "
       "an out-of-scope finding anyway (prompt's type list is also scoped down, in addition)")
+
+# --- "other" (OTHER_TYPE) — Александр's ask, 2026-09-23: a genuinely
+# serious out-of-scope finding must not be silently dropped, nor forced
+# under the nearest wrong check type — it should land as its own,
+# separately-tagged "other" finding instead. See app.claude_client's own
+# comment above OTHER_TYPE. ---
+from app.claude_client import OTHER_TYPE, _other_type_instruction, _checks_description
+
+assert _allowed_ai_types(["register"]) == {"register_value"}, (
+    "a register-only run has no real \"Что проверять\" list to be outside of, so OTHER_TYPE must NOT be added"
+)
+assert _other_type_instruction(_checks_description(["typo"])) != "", (
+    "with a real check selected, the other-type instruction must actually be included"
+)
+assert _other_type_instruction(_checks_description(["register"])) == "", (
+    "with only \"register\" selected (no real checks/description), the other-type instruction must be empty"
+)
+
+_other_raw_findings = [
+    {"type": "typo", "severity": "medium", "message": "обычная опечатка"},
+    {"type": OTHER_TYPE, "severity": "high", "message": "серьёзная проблема вне списка проверок"},
+    {"type": "untranslatable", "severity": "high", "message": "не входит в выбранные проверки"},
+]
+assert _filter_findings_by_checks(_other_raw_findings, ["typo"]) == _other_raw_findings[:2], (
+    "an \"other\" finding must survive the hard filter alongside a real requested-check finding, while a "
+    "finding of a type that was never requested at all (untranslatable) is still dropped"
+)
+
+
+async def _fake_call_claude_other_type(prompt, model=None):
+    return (
+        '[{"type": "typo", "severity": "medium", "message": "обычная опечатка"},'
+        '{"type": "other", "severity": "high", "message": "явная ошибка смысла вне списка проверок"}]',
+        {"input_tokens": 40, "output_tokens": 20}, "end_turn",
+    )
+
+
+claude_client_mod._call_claude = _fake_call_claude_other_type
+_other_findings, _ = asyncio.get_event_loop().run_until_complete(
+    run_ai_checks("source", "translation", ["typo"], target_lang="az-az")
+)
+claude_client_mod._call_claude = _fake_call_claude
+assert any(f["type"] == "other" for f in _other_findings), (
+    f"an \"other\"-typed finding from the model must reach run_ai_checks's own output, not be filtered out — "
+    f"got {_other_findings}"
+)
+assert len(_other_findings) == 2, (
+    f"both the normal typo finding and the other-typed one must come through — got {_other_findings}"
+)
+print("[OK] \"other\": a genuinely out-of-scope finding survives the hard checks-filter and reaches the "
+      "report tagged type=\"other\" instead of being silently dropped or forced under a wrong check type — "
+      "and the instruction that makes this possible is only sent to the model when there's a real "
+      "\"Что проверять\" list to be outside of in the first place (never for a register-only run)")
 
 # --- a truncated JSON response (the model hit the max_tokens ceiling
 # mid-array) must not lose every finding that came before the cut — only
@@ -2981,7 +3077,7 @@ async def _fake_call_claude_register_batch(prompt, model=None):
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_batch
-_reg_out, _reg_cost, _reg_debug_cost, _reg_gemini_cost = asyncio.get_event_loop().run_until_complete(
+_reg_out, _reg_cost, _reg_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -3090,7 +3186,7 @@ async def _fake_call_claude_register_mixed_batch(prompt, model=None):
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_mixed_batch
-_mixed_out, _mixed_cost, _mixed_debug_cost, _mixed_gemini_cost = asyncio.get_event_loop().run_until_complete(
+_mixed_out, _mixed_cost, _mixed_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -3879,173 +3975,12 @@ print("[OK] parse_workbook: 3+ duplicate columns resolve correctly in every blan
       "whitespace-only duplicate column is treated as blank for arbitration without breaking the "
       "all-blank-row skip")
 
-# --- calibration_debug ("🔬 Тест калибровки") — Александр's ask, 2026-09-22:
-# find out whether real-world misses (found by GPT/Gemini, not by us) come
-# from the model's own knowledge gap or from CALIBRATION_BASE's "only if
-# confident" bar filtering out a correct-but-uncertain finding, by running
-# the SAME rows through the SAME model a second time with only that one bar
-# loosened (CALIBRATION_RELAXED_OPENING) and surfacing whatever it
-# additionally catches as clearly marked findings alongside the normal
-# result, instead of guessing. ---
-from app.claude_client import CALIBRATION_RELAXED_OPENING, CALIBRATION_STRICT_OPENING
-
-_cal_dbg_wb = openpyxl.Workbook()
-_cal_dbg_ws = _cal_dbg_wb.active
-_cal_dbg_ws.append(["Context", "en", "fr"])
-_cal_dbg_ws.append(["banner", "Available to users from {{country}}.", "Disponible dans les pays suivants : {{country}}."])
-_cal_dbg_buf = io.BytesIO()
-_cal_dbg_wb.save(_cal_dbg_buf)
-_cal_dbg_buf.seek(0)
-_cal_dbg_sheets = _parse_workbook_direct(_cal_dbg_buf.read())
-
-_cal_dbg_call_count = {"strict": 0, "relaxed": 0}
-
-
-async def _fake_call_claude_calibration_debug(prompt, model=None):
-    # Distinguishes the two passes purely by which calibration opening
-    # actually landed in the prompt text — proves build_batch_prompt really
-    # is swapping the confidence-bar sentence, not just being told to by
-    # the test's own bookkeeping.
-    if CALIBRATION_RELAXED_OPENING in prompt:
-        _cal_dbg_call_count["relaxed"] += 1
-        return (
-            '[{"row": 1, "type": "typo", "severity": "medium", '
-            '"message": "Похоже на искажение множественного числа с {{country}}, но не уверен(а) до конца"}]',
-            {"input_tokens": 40, "output_tokens": 20},
-            "end_turn",
-        )
-    assert CALIBRATION_STRICT_OPENING in prompt, "every non-debug prompt must still carry the normal strict opening"
-    _cal_dbg_call_count["strict"] += 1
-    return "[]", {"input_tokens": 40, "output_tokens": 5}, "end_turn"
-
-
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_calibration_debug
-_cal_dbg_result = asyncio.run(
-    _run_multi_check_direct(_cal_dbg_sheets, "en", ["typo"], calibration_debug=True)
-)
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-
-assert _cal_dbg_call_count == {"strict": 1, "relaxed": 1}, (
-    f"calibration_debug=True must call the AI exactly once with the strict opening and once with the relaxed "
-    f"one per language — got {_cal_dbg_call_count}"
-)
-_cal_dbg_fr_findings = _cal_dbg_result["sheets"][0]["languages"]["fr"]
-_cal_dbg_all = [f for row in _cal_dbg_fr_findings for f in row["findings"]]
-assert len(_cal_dbg_all) == 1, f"expected exactly the one relaxed-pass finding (strict pass found nothing) — got {_cal_dbg_all}"
-assert _cal_dbg_all[0]["calibration_debug"] is True, "the relaxed-pass finding must be tagged calibration_debug=True"
-assert _cal_dbg_all[0]["message"].startswith("🔬 "), "the relaxed-pass finding's message must be visibly prefixed"
-assert _cal_dbg_result["summary"]["total_findings"] == 0, (
-    "calibration_debug findings must NOT be counted in the headline total_findings — otherwise merely ticking "
-    "the debug checkbox would make an unchanged file look like it suddenly has more problems"
-)
-assert _cal_dbg_result["summary"]["calibration_debug_findings"] == 1, (
-    "the debug-only findings must still be counted separately, in their own summary field"
-)
-assert _cal_dbg_result["summary"]["calibration_debug_cost_usd"] > 0, (
-    "the extra relaxed-pass API call must show up as its own, separately reported cost"
-)
-assert _cal_dbg_result["summary"]["cost_usd"] >= _cal_dbg_result["summary"]["calibration_debug_cost_usd"], (
-    "the debug pass's cost must still be folded into the run's real total cost_usd, not hidden from it"
-)
-
-# Control: with calibration_debug left at its default (False), only the
-# strict pass ever runs — no second call, no debug fields at all in the
-# summary, and the behavior is byte-for-byte what it was before this
-# feature existed.
-_cal_dbg_call_count["strict"] = 0
-_cal_dbg_call_count["relaxed"] = 0
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_calibration_debug
-_cal_dbg_off_result = asyncio.run(_run_multi_check_direct(_cal_dbg_sheets, "en", ["typo"]))
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-assert _cal_dbg_call_count == {"strict": 1, "relaxed": 0}, (
-    "without calibration_debug, the relaxed pass must never run at all — no extra cost, no extra calls"
-)
-assert "calibration_debug_cost_usd" not in _cal_dbg_off_result["summary"], (
-    "the debug-only summary fields must be entirely absent (not just zero) when the feature wasn't used"
-)
-assert "calibration_debug_findings" not in _cal_dbg_off_result["summary"]
-print("[OK] calibration_debug (\"🔬 Тест калибровки\"): a second AI pass with only the confidence-bar sentence "
-      "swapped (CALIBRATION_RELAXED_OPENING) runs alongside the normal strict pass, its extra findings are "
-      "clearly tagged and message-prefixed, excluded from the headline 'N проблем' count but reported in their "
-      "own separate finding/cost totals that still fold into the run's real total cost — and none of this runs "
-      "at all (zero extra calls, zero extra summary fields) unless the feature is explicitly turned on")
-
-# Subagent review (2026-09-22) caught a real contamination bug: "register"
-# reporting isn't confidence-gated by CALIBRATION_BASE at all (it's "report
-# what's there", not "only if sure"), so a "mixed" register value the
-# RELAXED pass happens to report has no business showing up as a 🔬
-# calibration-comparison finding — it would falsely look like "the relaxed
-# pass caught an extra problem" when it's really just AI response
-# variance on a completely unrelated, non-confidence-gated question.
-from app.claude_client import REGISTER_MIXED_TYPE as _REG_MIXED_TYPE
-
-_cal_reg_wb = openpyxl.Workbook()
-_cal_reg_ws = _cal_reg_wb.active
-_cal_reg_ws.append(["Context", "en", "ru"])
-_cal_reg_ws.append(["greeting", "Hello", "Здравствуйте"])
-_cal_reg_buf = io.BytesIO()
-_cal_reg_wb.save(_cal_reg_buf)
-_cal_reg_buf.seek(0)
-_cal_reg_sheets = _parse_workbook_direct(_cal_reg_buf.read())
-
-
-async def _fake_call_claude_calibration_debug_register(prompt, model=None):
-    # Strict pass reports an ordinary, single-value tone ("formal") — no
-    # register_mixed finding should come from it. Relaxed pass reports
-    # "mixed" for the same row — this must NOT surface as a 🔬 finding.
-    if CALIBRATION_RELAXED_OPENING in prompt:
-        return (
-            f'[{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
-            {"input_tokens": 20, "output_tokens": 10},
-            "end_turn",
-        )
-    return (
-        f'[{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal", "message": ""}}]',
-        {"input_tokens": 20, "output_tokens": 10},
-        "end_turn",
-    )
-
-
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_calibration_debug_register
-_cal_reg_result = asyncio.run(
-    _run_multi_check_direct(_cal_reg_sheets, "en", ["register"], calibration_debug=True)
-)
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-
-_cal_reg_ru_findings = _cal_reg_result["sheets"][0]["languages"]["ru"]
-_cal_reg_all = [f for row in _cal_reg_ru_findings for f in row["findings"]]
-assert not any(f.get("calibration_debug") for f in _cal_reg_all), (
-    f"a register value from the relaxed pass must never surface as a 🔬 calibration_debug finding — register "
-    f"reporting isn't confidence-gated, so it's not part of what this feature compares — got {_cal_reg_all}"
-)
-assert not any(f.get("type") == _REG_MIXED_TYPE and f.get("calibration_debug") for f in _cal_reg_all), (
-    "specifically: a 'mixed' value from the relaxed pass must be dropped, not turned into a tagged "
-    "register_mixed finding"
-)
-# The strict pass's own real "formal" value must still work normally —
-# producing the ordinary register_summary block, unaffected by any of this.
-_cal_reg_summary_findings = [f for row in _cal_reg_ru_findings if row["excel_row"] == 0 for f in row["findings"]]
-assert any(f.get("type") == "register_summary" for f in _cal_reg_summary_findings), (
-    f"the strict pass's own register value must still produce a normal register_summary — got {_cal_reg_ru_findings}"
-)
-print("[OK] calibration_debug + register: a 'mixed' register value reported ONLY by the relaxed pass is "
-      "correctly discarded rather than surfaced as a 🔬 finding (register reporting isn't confidence-gated, "
-      "so it's outside what this feature is meant to compare), while the strict pass's own register_summary "
-      "is completely unaffected")
-
 # --- gemini_check ("🌐 Проверить также через Gemini") — Александр's ask,
 # 2026-09-22, after a blind test showed Gemini independently caught a real
-# Marathi meaning error our own model (even with a loosened confidence bar)
-# completely missed, while correctly staying silent on a genuinely-fine
-# control example. Unlike calibration_debug, Gemini's findings are meant to
-# be real/actionable, so they're counted in the headline total_findings —
-# only their SOURCE is tagged, not their standing. ---
+# Marathi meaning error our own model completely missed, while correctly
+# staying silent on a genuinely-fine control example. Gemini's findings are
+# meant to be real/actionable, so they're counted in the headline
+# total_findings — only their SOURCE is tagged, not their standing. ---
 import app.gemini_client as gemini_client_mod
 
 # _gemini_error_detail: turns whatever went wrong into a short, actionable
@@ -4194,9 +4129,8 @@ assert len(_gem_all) == 1, f"expected exactly the one Gemini finding (Claude fou
 assert _gem_all[0]["gemini_check"] is True, "a Gemini finding must be tagged gemini_check=True"
 assert _gem_all[0]["message"].startswith("🌐 [Gemini] "), "a Gemini finding's message must be visibly prefixed"
 assert _gem_result["summary"]["total_findings"] == 1, (
-    "unlike calibration_debug, a Gemini finding IS a real, actionable finding and must be counted in the "
-    "headline total_findings — Александр explicitly chose this (not the 'separate, uncounted' treatment "
-    "calibration_debug gets)"
+    "a Gemini finding IS a real, actionable finding and must be counted in the headline total_findings — "
+    "Александр explicitly chose this treatment"
 )
 assert _gem_result["summary"]["gemini_findings"] == 1
 assert _gem_result["summary"]["gemini_cost_usd"] > 0, "the Gemini API call's own cost must be reported separately"
@@ -4265,14 +4199,13 @@ assert any("ключ отклонён" in f.get("message", "") for f in _gem_err
 )
 assert _gem_err_result["summary"]["gemini_cost_usd"] == 0.0, "a failed Gemini call must cost nothing"
 print("[OK] gemini_check (\"🌐 Проверить также через Gemini\"): runs the SAME prompt through Gemini alongside "
-      "the normal Claude pass, its findings are tagged/prefixed but counted as real findings (unlike "
-      "calibration_debug's test-only ones) with their own separately-reported cost that still folds into the "
-      "run's total — none of it runs unless explicitly turned on, and a failed Gemini call surfaces a visible "
-      "warning without ever suppressing the normal Claude result for that language")
+      "the normal Claude pass, its findings are tagged/prefixed and counted as real findings, with their own "
+      "separately-reported cost that still folds into the run's total — none of it runs unless explicitly "
+      "turned on, and a failed Gemini call surfaces a visible warning without ever suppressing the normal "
+      "Claude result for that language")
 
-# Same register-contamination check as calibration_debug got, but for the
-# Gemini pass — register reporting isn't part of what this feature is
-# meant to compare either.
+# Register-contamination check for the Gemini pass — register reporting
+# isn't part of what this feature is meant to compare.
 _gem_reg_wb = openpyxl.Workbook()
 _gem_reg_ws = _gem_reg_wb.active
 _gem_reg_ws.append(["Context", "en", "ru"])
@@ -4319,7 +4252,7 @@ assert any(f.get("type") == "register_summary" for f in _gem_reg_all), (
     "the normal Claude-side register_summary must still work, completely unaffected"
 )
 print("[OK] gemini_check + register: a 'mixed' register value returned by Gemini is correctly discarded "
-      "rather than surfaced as a 🌐 finding, exactly like the calibration_debug fix above")
+      "rather than surfaced as a 🌐 finding")
 
 # Partial-chunk-failure isolation for _run_gemini_chunks: a language split
 # across 2+ chunks (MAX_ROWS_PER_AI_CALL) where ONE chunk's Gemini call
@@ -4365,7 +4298,7 @@ settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 settings.GEMINI_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_no_findings
 gemini_client_mod._call_gemini = _fake_call_gemini_partial_failure
-_gchunk_out, _gchunk_cost, _gchunk_debug_cost, _gchunk_gemini_cost = asyncio.run(
+_gchunk_out, _gchunk_cost, _gchunk_gemini_cost = asyncio.run(
     _check_language_for_sheet(_gchunk_sheet, "es", "en", ["typo"], "", asyncio.Semaphore(5), gemini_check=True)
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -4393,91 +4326,6 @@ print("[OK] gemini_check + chunking: when a language spans several chunks (MAX_R
       "ONE chunk's Gemini call fails outright, that chunk's rows simply have no Gemini coverage while every "
       "OTHER chunk's genuine findings still come through untouched, and the run-wide 🌐 warning still fires "
       "so the gap is visible rather than silently swallowed")
-
-# Combined calibration_debug=True + gemini_check=True in the same run: both
-# optional extra passes must coexist without interfering with each other —
-# each tagged with its own marker/prefix, each counted (or not) exactly as
-# it would be on its own, and their costs both folding into the same total
-# independently.
-_combo_wb = openpyxl.Workbook()
-_combo_ws = _combo_wb.active
-_combo_ws.append(["Context", "ru", "mr"])
-_combo_ws.append(["freebet", "Фрибет без отыгрыша", "पैज न लावता फ्री बेट"])
-_combo_buf = io.BytesIO()
-_combo_wb.save(_combo_buf)
-_combo_buf.seek(0)
-_combo_sheets = _parse_workbook_direct(_combo_buf.read())
-
-_combo_calls = {"claude_strict": 0, "claude_relaxed": 0, "gemini": 0}
-
-
-async def _fake_call_claude_combo(prompt, model=None):
-    # Called twice per language when calibration_debug=True (strict pass,
-    # then relaxed) — same fake answer both times is fine here, since this
-    # test only needs ONE Claude-side finding to check it isn't duplicated
-    # or miscounted against the relaxed pass or Gemini's own finding below.
-    _combo_calls["claude_strict"] += 1
-    return (
-        '[{"row": 1, "type": "typo", "severity": "low", "message": "обычная находка Claude"}]',
-        {"input_tokens": 30, "output_tokens": 10},
-        "end_turn",
-    )
-
-
-async def _fake_call_gemini_combo(prompt, model=None):
-    _combo_calls["gemini"] += 1
-    return (
-        '[{"row": 1, "type": "typo", "severity": "medium", "message": "находка Gemini"}]',
-        {"input_tokens": 30, "output_tokens": 10},
-        "end_turn",
-        None,
-    )
-
-
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-settings.GEMINI_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_combo
-gemini_client_mod._call_gemini = _fake_call_gemini_combo
-_combo_result = asyncio.run(
-    _run_multi_check_direct(_combo_sheets, "ru", ["typo"], calibration_debug=True, gemini_check=True)
-)
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-settings.GEMINI_API_KEY = ""
-
-assert _combo_calls == {"claude_strict": 2, "claude_relaxed": 0, "gemini": 1}, (
-    f"expected 2 Claude calls (strict pass + relaxed calibration_debug pass) and 1 Gemini call for this single "
-    f"target language — got {_combo_calls}"
-)
-_combo_mr = _combo_result["sheets"][0]["languages"]["mr"]
-_combo_all = [f for row in _combo_mr for f in row["findings"]]
-_combo_normal = [f for f in _combo_all if not f.get("calibration_debug") and not f.get("gemini_check")]
-_combo_debug = [f for f in _combo_all if f.get("calibration_debug")]
-_combo_gemini = [f for f in _combo_all if f.get("gemini_check")]
-assert len(_combo_normal) == 1 and len(_combo_debug) == 1 and len(_combo_gemini) == 1, (
-    f"expected exactly one finding from each of the three passes (normal Claude, relaxed calibration_debug, "
-    f"Gemini), each distinctly tagged, with none of them bleeding into another — got {_combo_all}"
-)
-assert _combo_debug[0]["message"].startswith("🔬 "), _combo_debug
-assert _combo_gemini[0]["message"].startswith("🌐 [Gemini] "), _combo_gemini
-# calibration_debug's finding stays test-only (excluded); Gemini's finding
-# is real/actionable (included) — total_findings must reflect exactly that
-# split, not double-count or drop either one.
-assert _combo_result["summary"]["total_findings"] == 2, (
-    f"total_findings must count the normal Claude finding + the Gemini finding (both real), but NOT the "
-    f"calibration_debug one (test-only) — got {_combo_result['summary']}"
-)
-assert _combo_result["summary"]["calibration_debug_findings"] == 1
-assert _combo_result["summary"]["gemini_findings"] == 1
-assert _combo_result["summary"]["calibration_debug_cost_usd"] > 0
-assert _combo_result["summary"]["gemini_cost_usd"] > 0
-assert _combo_result["summary"]["cost_usd"] >= (
-    _combo_result["summary"]["calibration_debug_cost_usd"] + _combo_result["summary"]["gemini_cost_usd"]
-), "both extra passes' costs must independently fold into the same run-wide total cost_usd"
-print("[OK] calibration_debug + gemini_check together: both optional extra passes can run in the same "
-      "check without interfering with each other — each produces its own distinctly-tagged finding, "
-      "calibration_debug's stays test-only/excluded from total_findings while Gemini's is counted as real, "
-      "and both extra costs fold independently into the same run-wide total")
 
 # --- run_ai_checks_batch: model_override bypasses _model_for_lang -------
 # app.model_comparison (2026-09-22, Александр's "run a cheaper model
@@ -4564,6 +4412,7 @@ claude_client_mod._call_claude = _fake_call_claude_for_comparison
 _cmp_report = asyncio.run(_run_model_comparison_direct(
     context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
     target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=5,
+    models=["opus", "sonnet", "haiku"],
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
@@ -4593,40 +4442,75 @@ print("[OK] run_model_comparison: runs the same real row through Opus/Sonnet/Hai
       "correctly tallies a per-model hit rate/cost/example findings from real (here, faked) per-model "
       "responses, including a ready-to-read Russian summary")
 
-# relaxed=True must actually swap in CALIBRATION_RELAXED_OPENING for every
-# candidate model's prompt — added 2026-09-22 after Александр got a
-# correct answer from a bare, unstructured Sonnet question (no confidence
-# bar at all) on a row our strict-calibration pipeline missed 5/5 times,
-# raising the real possibility that our OWN prompt's confidence bar (not a
-# Sonnet knowledge gap) explains at least part of the miss.
-from app.claude_client import CALIBRATION_RELAXED_OPENING, CALIBRATION_STRICT_OPENING
+# models= subset selection — Александр's ask, 2026-09-23: a routine
+# comparison should default to Sonnet + Haiku only (no Opus spend), while
+# an explicit models=[...] can still include Opus when actually needed.
+# See app.model_comparison.DEFAULT_COMPARISON_MODELS.
+from app.model_comparison import DEFAULT_COMPARISON_MODELS as _DEFAULT_COMPARISON_MODELS
 
-_cmp_seen_prompts = []
+assert _DEFAULT_COMPARISON_MODELS == ["sonnet", "haiku"], (
+    f"the default comparison set must be exactly sonnet+haiku, no Opus — got {_DEFAULT_COMPARISON_MODELS}"
+)
+
+_models_counts = {"opus": 0, "sonnet": 0, "haiku": 0}
 
 
-async def _fake_call_claude_records_prompt(prompt, model=None):
-    _cmp_seen_prompts.append(prompt)
+async def _fake_call_claude_records_model_name(prompt, model=None):
+    _models_counts[_cmp_name_for(model)] += 1
     return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
 
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_records_prompt
-asyncio.run(_run_model_comparison_direct(
+claude_client_mod._call_claude = _fake_call_claude_records_model_name
+_models_default_report = asyncio.run(_run_model_comparison_direct(
     context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
-    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=1, relaxed=True,
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=1,
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_cmp_seen_prompts) == 3, f"expected exactly 3 prompts (one per candidate model) — got {len(_cmp_seen_prompts)}"
-assert all(CALIBRATION_RELAXED_OPENING in p for p in _cmp_seen_prompts), (
-    "relaxed=True must swap CALIBRATION_RELAXED_OPENING into EVERY candidate model's prompt, not just some"
+assert _models_counts == {"opus": 0, "sonnet": 1, "haiku": 1}, (
+    f"with no models= given, only sonnet and haiku must be called — Opus must NOT be called at all — "
+    f"got {_models_counts}"
 )
-assert all(CALIBRATION_STRICT_OPENING not in p for p in _cmp_seen_prompts), (
-    "relaxed=True must fully replace the strict opening, not send both"
+assert set(_models_default_report["results"].keys()) == {"sonnet", "haiku"}, (
+    f"the report itself must only contain the models actually run — got {_models_default_report['results'].keys()}"
 )
-print("[OK] run_model_comparison: relaxed=True correctly swaps CALIBRATION_RELAXED_OPENING into every "
-      "candidate model's prompt (Opus/Sonnet/Haiku alike), letting the confidence-bar-vs-knowledge-gap "
-      "question be tested with real data instead of assumed")
+assert _models_default_report["models"] == ["sonnet", "haiku"]
+
+# An unknown model name is silently dropped rather than raising or crashing.
+_models_counts = {"opus": 0, "sonnet": 0, "haiku": 0}
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_records_model_name
+_models_filtered_report = asyncio.run(_run_model_comparison_direct(
+    context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=1,
+    models=["haiku", "gpt5"],
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _models_counts == {"opus": 0, "sonnet": 0, "haiku": 1}, (
+    f"an unknown model name must be silently dropped, leaving only the recognized ones — got {_models_counts}"
+)
+assert _models_filtered_report["models"] == ["haiku"]
+
+# An empty/all-unknown models= list falls back to the default set rather
+# than comparing against nothing.
+_models_counts = {"opus": 0, "sonnet": 0, "haiku": 0}
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_records_model_name
+asyncio.run(_run_model_comparison_direct(
+    context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=1,
+    models=["gpt5"],
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _models_counts == {"opus": 0, "sonnet": 1, "haiku": 1}, (
+    f"an all-unknown models= list must fall back to the default sonnet+haiku set — got {_models_counts}"
+)
+print("[OK] run_model_comparison: models= defaults to sonnet+haiku only (no Opus spend on a routine "
+      "comparison), an explicit list can still narrow further or include Opus, unknown model names are "
+      "silently dropped, and an all-unknown list falls back to the default set")
 
 # --- run_model_comparison: bare mode (minimal prompt, no calibration) ---
 # Added 2026-09-22 after relaxed=True made ZERO difference to Sonnet's 0/5
@@ -4693,18 +4577,18 @@ settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_bare
 _bare_report = asyncio.run(_run_model_comparison_direct(
     context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
-    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=3, bare=True, relaxed=True,
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=3, bare=True,
+    models=["opus", "sonnet", "haiku"],
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
 
 assert _bare_report["bare"] is True
-assert _bare_report["relaxed"] is False, "relaxed must be forced False in the report when bare=True, even if passed True"
 assert not any(
-    ("Общее правило" in p) or ("ТЕСТОВЫЙ РЕЖИМ" in p) or ('"row"' in p) for p in _bare_seen_prompts
+    ("Общее правило" in p) or ('"row"' in p) for p in _bare_seen_prompts
 ), (
-    "bare mode's prompt must contain NONE of the normal pipeline's machinery (no calibration wording of "
-    "either kind, no JSON row-numbered schema) — it must be the minimal BARE_COMPARISON_PROMPT only"
+    "bare mode's prompt must contain NONE of the normal pipeline's machinery (no calibration wording, no "
+    "JSON row-numbered schema) — it must be the minimal BARE_COMPARISON_PROMPT only"
 )
 assert _bare_report["results"]["sonnet"]["catches"] == 3 and _bare_report["results"]["sonnet"]["hit_rate"] == 1.0, (
     f"a bare, minimal prompt must let the fake Sonnet catch it every time, mirroring the real result "
@@ -4713,8 +4597,7 @@ assert _bare_report["results"]["sonnet"]["catches"] == 3 and _bare_report["resul
 assert _bare_report["results"]["opus"]["catches"] == 0 and _bare_report["results"]["haiku"]["catches"] == 0
 assert "🧪" in _bare_report["summary_ru"]
 print("[OK] run_model_comparison: bare=True sends a genuinely minimal prompt (no calibration wording, no "
-      "JSON schema) instead of the normal pipeline's, correctly parses free-text 'ПРОБЛЕМА: да/нет' answers, "
-      "and forces relaxed=False in the report since it's not applicable in this mode")
+      "JSON schema) instead of the normal pipeline's, correctly parses free-text 'ПРОБЛЕМА: да/нет' answers")
 
 # runs_per_model must be capped at MAX_RUNS_PER_MODEL — this hits the real,
 # billed Anthropic API on every call, reachable without any of the usual
@@ -4732,7 +4615,7 @@ settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_counts_only
 asyncio.run(_run_model_comparison_direct(
     context="a", source="b", translation="c", target_lang="mr", source_lang="ru",
-    checks=["typo"], runs_per_model=999,
+    checks=["typo"], runs_per_model=999, models=["opus", "sonnet", "haiku"],
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
@@ -4762,6 +4645,7 @@ claude_client_mod._call_claude = _fake_call_claude_register_only
 _cmp_register_report = asyncio.run(_run_model_comparison_direct(
     context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
     target_lang="mr", source_lang="ru", checks=["typo", "register"], runs_per_model=2,
+    models=["opus", "sonnet", "haiku"],
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
@@ -4796,15 +4680,31 @@ print("[OK] run_model_comparison: gracefully returns {} and makes zero calls whe
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_for_comparison
 _cmp_counts["opus"] = _cmp_counts["sonnet"] = _cmp_counts["haiku"] = 0
-r = check("POST /debug/model-comparison (defaults = the real Marathi row)", client.post(
+r = check("POST /debug/model-comparison (defaults = the real Marathi row, models omitted)", client.post(
     "/debug/model-comparison", json={"runs_per_model": 3},
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
 _ep_body = r.json()
 assert _ep_body["target_lang"] == "mr", _ep_body
-assert set(_ep_body["results"].keys()) == {"opus", "sonnet", "haiku"}, _ep_body
-assert "summary_ru" in _ep_body and "Opus" in _ep_body["summary_ru"], _ep_body
+# ModelComparisonIn.models defaults to ["sonnet", "haiku"] (Александр's
+# ask, 2026-09-23 — no Opus spend on a routine comparison) — so leaving
+# "models" out of the request body must NOT pull Opus in.
+assert set(_ep_body["results"].keys()) == {"sonnet", "haiku"}, _ep_body
+assert "summary_ru" in _ep_body and "Opus" not in _ep_body["summary_ru"], _ep_body
+assert _cmp_counts["opus"] == 0, "Opus must not be called at all when the request omits \"models\""
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_for_comparison
+_cmp_counts["opus"] = _cmp_counts["sonnet"] = _cmp_counts["haiku"] = 0
+r = check("POST /debug/model-comparison with models=[opus, sonnet, haiku] explicitly", client.post(
+    "/debug/model-comparison", json={"runs_per_model": 3, "models": ["opus", "sonnet", "haiku"]},
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+_ep_body_all = r.json()
+assert set(_ep_body_all["results"].keys()) == {"opus", "sonnet", "haiku"}, _ep_body_all
+assert "Opus" in _ep_body_all["summary_ru"], _ep_body_all
 
 r = check(
     "POST /debug/model-comparison without ANTHROPIC_API_KEY -> 503, not a silent empty success",
@@ -4812,7 +4712,9 @@ r = check(
 )
 print("[OK] POST /debug/model-comparison: the diagnostic endpoint returns a real per-model comparison "
       "(defaulting to the actual Marathi 'отыгрыш' row that started this investigation) when an API key is "
-      "configured, and a clear 503 instead of a silently empty/misleading success when it isn't")
+      "configured, defaults to sonnet+haiku only (no Opus spend) when \"models\" is omitted, still supports "
+      "an explicit Opus request, and returns a clear 503 instead of a silently empty/misleading success "
+      "when no API key is configured")
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_bare

@@ -853,18 +853,12 @@ def _count_real_findings(findings_list: list[dict]) -> int:
     not 1 per language — counting it here would contradict the whole point
     of dropping the old pass/fail tone-of-address judgment. Truncation/
     AI-failure warnings (type "system") are deliberately still counted —
-    those genuinely are something the manager needs to notice.
-
-    Also excludes calibration_debug findings (see
-    _mark_calibration_debug_findings) — those are a separate, opt-in test
-    signal shown alongside the real result, not part of it; counting them
-    here would make turning on "🔬 Тест калибровки" alone inflate "N
-    проблем" and look like the file got worse, which it didn't."""
+    those genuinely are something the manager needs to notice."""
     return sum(
         1
         for row in findings_list
         for f in row["findings"]
-        if f.get("type") != "register_summary" and not f.get("calibration_debug")
+        if f.get("type") != "register_summary"
     )
 
 
@@ -915,19 +909,16 @@ async def _run_ai_chunks(
     lang: str,
     source_lang: str,
     semaphore: asyncio.Semaphore,
-    relaxed: bool = False,
 ) -> tuple[dict[int, list[dict]], float, bool]:
     """Runs every chunk of one language's items through the AI (bounded by
     the shared semaphore) and merges the per-chunk results back into a
     single {item index: findings} dict, with "_also_idx" indices shifted to
-    match. Factored out of _check_language_for_sheet so the calibration
-    debug pass (relaxed=True — see claude_client._calibration) can reuse
-    the exact same chunking/merging logic as the normal, production pass
-    instead of a second hand-rolled copy of it."""
+    match. Factored out of _check_language_for_sheet purely to share this
+    chunking/merging logic between the live and batch code paths."""
     async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool]:
         async with semaphore:
             return await run_ai_checks_batch(
-                chunk_items, checks, extra_instructions, lang, source_lang, relaxed=relaxed,
+                chunk_items, checks, extra_instructions, lang, source_lang,
             )
 
     chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
@@ -953,23 +944,6 @@ async def _run_ai_chunks(
         offset += len(chunk_items)
 
     return ai_findings_by_idx, cost_usd, truncated
-
-
-def _mark_calibration_debug_findings(findings: list[dict]) -> list[dict]:
-    """Tags each finding from the relaxed-calibration debug pass (see
-    calibration_debug below) so it's visibly distinct from a normal,
-    production finding wherever findings get rendered — both a
-    machine-readable "calibration_debug": True field (for the frontend, if
-    it wants to style these differently) and a plain-text prefix on the
-    message itself (so it's unmistakable even in the .xlsx report export,
-    which just prints "message" as-is)."""
-    out = []
-    for f in findings:
-        f = dict(f)
-        f["calibration_debug"] = True
-        f["message"] = "🔬 [Тест: мягкая калибровка, не обычный результат] " + str(f.get("message", ""))
-        out.append(f)
-    return out
 
 
 async def _run_gemini_chunks(
@@ -1025,13 +999,11 @@ async def _run_gemini_chunks(
 def _mark_gemini_findings(findings: list[dict]) -> list[dict]:
     """Tags each finding from the optional "🌐 Проверить также через
     Gemini" pass (see gemini_check below) — a machine-readable
-    "gemini_check": True field plus a "🌐 [Gemini] " message prefix,
-    mirroring _mark_calibration_debug_findings's pattern. Unlike a
-    calibration_debug finding, these ARE meant to be real, actionable
-    findings — Александр explicitly chose to keep them counted in the
-    headline "N проблем" (see run_multi_check/_count_real_findings, which
-    only excludes calibration_debug and register_summary, not this). The
-    tag says WHICH engine found it, not "ignore this, it's just a test"."""
+    "gemini_check": True field plus a "🌐 [Gemini] " message prefix. These
+    ARE meant to be real, actionable findings — Александр explicitly chose
+    to keep them counted in the headline "N проблем" (see
+    run_multi_check/_count_real_findings, which only excludes
+    register_summary, not this). The tag says WHICH engine found it."""
     out = []
     for f in findings:
         f = dict(f)
@@ -1048,12 +1020,10 @@ async def _check_language_for_sheet(
     checks: list[str],
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
-    calibration_debug: bool = False,
     gemini_check: bool = False,
-) -> tuple[list[dict], float, float, float]:
+) -> tuple[list[dict], float, float]:
     """Returns (rows-with-findings, production cost_usd, extra cost_usd
-    spent on the calibration_debug pass, extra cost_usd spent on the
-    gemini_check pass — the last two always 0.0 when that feature is off)."""
+    spent on the gemini_check pass — always 0.0 when that feature is off)."""
     relevant_rows = []
     ai_items = []
     for row in sheet["rows"]:
@@ -1081,55 +1051,19 @@ async def _check_language_for_sheet(
     item_chunks = _chunk_list(ai_items, _chunk_size_for_lang(lang))
 
     ai_findings_by_idx, cost_usd, truncated = await _run_ai_chunks(
-        item_chunks, checks, extra_instructions, lang, source_lang, semaphore, relaxed=False,
+        item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
     )
     ai_findings_by_idx = _resolve_repeated_findings(ai_findings_by_idx, relevant_rows)
     ai_findings_by_idx, register_values_by_idx = _extract_register_values(ai_findings_by_idx)
 
-    # Александр's ask, 2026-09-22: find out whether real-world misses (found
-    # by GPT/Gemini, not by us) come from the model's own knowledge gap or
-    # from CALIBRATION_BASE's "only if confident" bar filtering out a
-    # correct-but-uncertain finding — by running the SAME model, on the SAME
-    # rows, a second time with only that one confidence bar loosened (see
-    # claude_client.CALIBRATION_RELAXED_OPENING), and showing whatever it
-    # additionally catches right alongside the normal result instead of
-    # guessing. Deliberately NOT scoped to "hard" languages only — the
-    # French {{country}} miss he wants covered too is on the ordinary model.
-    debug_cost_usd = 0.0
-    ai_findings_by_idx_relaxed: dict[int, list[dict]] = {}
-    debug_truncated = False
-    if calibration_debug:
-        ai_findings_by_idx_relaxed, debug_cost_usd, debug_truncated = await _run_ai_chunks(
-            item_chunks, checks, extra_instructions, lang, source_lang, semaphore, relaxed=True,
-        )
-        ai_findings_by_idx_relaxed = _resolve_repeated_findings(ai_findings_by_idx_relaxed, relevant_rows)
-        ai_findings_by_idx_relaxed, _ = _extract_register_values(ai_findings_by_idx_relaxed)
-        # _extract_register_values already strips raw REGISTER_VALUE_TYPE
-        # entries, but a "mixed" value is turned INTO a visible
-        # REGISTER_MIXED_TYPE finding right inside that same function (see
-        # its own docstring) — register reporting isn't confidence-gated by
-        # CALIBRATION_BASE at all (it's "report what's there", not "only if
-        # sure"), so it has no business in a calibration comparison. Left
-        # in, it would either falsely look like "the relaxed pass caught an
-        # extra problem" (subagent review, 2026-09-22) or show as a
-        # confusing duplicate 🔬 copy right next to the strict pass's own,
-        # identical register_mixed finding for the same row.
-        ai_findings_by_idx_relaxed = {
-            idx: [f for f in findings if f.get("type") != REGISTER_MIXED_TYPE]
-            for idx, findings in ai_findings_by_idx_relaxed.items()
-        }
-        ai_findings_by_idx_relaxed = {idx: fs for idx, fs in ai_findings_by_idx_relaxed.items() if fs}
-
     # "🌐 Проверить также через Gemini" — Александр's ask, 2026-09-22, after
     # a blind test (same prompt, no hints) showed Gemini independently
-    # caught a real Marathi meaning error that Opus missed even with the
-    # confidence bar loosened above, while correctly staying silent on a
-    # genuinely-fine control example. Runs for EVERY checked language when
-    # on (his own choice — not scoped to "hard" languages only), and its
-    # findings are shown as real, actionable findings (not a debug-only
-    # curiosity like calibration_debug above) — just clearly tagged with
-    # which engine found them, since trust in a second provider is still
-    # being built.
+    # caught a real Marathi meaning error that Opus missed, while correctly
+    # staying silent on a genuinely-fine control example. Runs for EVERY
+    # checked language when on (his own choice — not scoped to "hard"
+    # languages only), and its findings are shown as real, actionable
+    # findings, just clearly tagged with which engine found them, since
+    # trust in a second provider is still being built.
     gemini_cost_usd = 0.0
     gemini_findings_by_idx: dict[int, list[dict]] = {}
     gemini_truncated = False
@@ -1143,10 +1077,9 @@ async def _check_language_for_sheet(
         )
         gemini_findings_by_idx = _resolve_repeated_findings(gemini_findings_by_idx, relevant_rows)
         gemini_findings_by_idx, _ = _extract_register_values(gemini_findings_by_idx)
-        # Same register-contamination fix as the calibration_debug pass
-        # above (see that block's comment) — Gemini gets sent the exact
-        # same prompt, including the register-instructions block when
-        # "register" is selected, so it can return the same register_mixed
+        # Gemini gets sent the exact same prompt, including the
+        # register-instructions block when "register" is selected, so it
+        # can return the same register_mixed
         # noise, which isn't what this second-opinion pass is for.
         gemini_findings_by_idx = {
             idx: [f for f in findings if f.get("type") != REGISTER_MIXED_TYPE]
@@ -1160,8 +1093,6 @@ async def _check_language_for_sheet(
         tgt = row["values"].get(lang, "")
         findings = run_rule_checks(src, tgt, checks, max_length=row["max_length"], lang_code=lang)
         findings += ai_findings_by_idx.get(idx, [])
-        if calibration_debug:
-            findings += _mark_calibration_debug_findings(ai_findings_by_idx_relaxed.get(idx, []))
         if gemini_check:
             findings += _mark_gemini_findings(gemini_findings_by_idx.get(idx, []))
         if findings:
@@ -1184,22 +1115,6 @@ async def _check_language_for_sheet(
             "source": "",
             "translation": "",
             "findings": [_truncation_warning()],
-        })
-    if calibration_debug and debug_truncated:
-        out.append({
-            "excel_row": 0,
-            "context": "⚠ Системное предупреждение",
-            "source": "",
-            "translation": "",
-            "findings": [{
-                "type": "system",
-                "severity": "low",
-                "message": (
-                    "🔬 Тестовый прогон с мягкой калибровкой для этого языка был обрезан из-за большого "
-                    "объёма — часть строк могла остаться непроверенной именно в тестовом (не обычном) "
-                    "проходе."
-                ),
-            }],
         })
     if gemini_check and gemini_truncated:
         out.append({
@@ -1247,7 +1162,7 @@ async def _check_language_for_sheet(
         block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
         if block is not None:
             out.append(block)
-    return out, cost_usd, debug_cost_usd, gemini_cost_usd
+    return out, cost_usd, gemini_cost_usd
 
 
 async def run_multi_check(
@@ -1256,7 +1171,6 @@ async def run_multi_check(
     checks: list[str],
     extra_instructions: str = "",
     target_langs_filter: set[str] | None = None,
-    calibration_debug: bool = False,
     gemini_check: bool = False,
 ) -> dict:
     """
@@ -1267,20 +1181,11 @@ async def run_multi_check(
     if the file has more columns — lets a manager check a subset of a
     large upload instead of every language every time.
 
-    calibration_debug: see _check_language_for_sheet's own comment — runs
-    every language's AI check a SECOND time with a loosened confidence bar
-    (same model, same rows), and adds whatever that extra pass catches to
-    the report as clearly marked "🔬" findings, so the two passes can be
-    compared side by side. This roughly doubles the AI cost of the run
-    (summary["calibration_debug_cost_usd"] shows exactly how much of the
-    total came from this extra pass) — off by default, only for a
-    deliberate one-off comparison, never for routine checking.
-
     gemini_check: see _check_language_for_sheet's own comment and
     app.gemini_client — runs every language's AI check ALSO through Google
     Gemini (same prompt/calibration, different model provider) and adds
     whatever it catches as "🌐"-tagged findings, counted as real findings
-    (unlike calibration_debug's test-only ones — see _mark_gemini_findings)
+    (see _mark_gemini_findings)
     since a blind test showed it independently catches real errors ours
     misses. Also roughly doubles AI cost (summary["gemini_cost_usd"]) —
     off by default, opt-in per run.
@@ -1288,11 +1193,9 @@ async def run_multi_check(
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
     total_findings = 0
-    total_debug_findings = 0
     total_gemini_findings = 0
     total_rows_checked = 0
     total_cost_usd = 0.0
-    total_debug_cost_usd = 0.0
     total_gemini_cost_usd = 0.0
 
     for sheet in sheets:
@@ -1302,7 +1205,7 @@ async def run_multi_check(
         tasks = [
             _check_language_for_sheet(
                 sheet, lang, source_lang, checks, extra_instructions, semaphore,
-                calibration_debug=calibration_debug, gemini_check=gemini_check,
+                gemini_check=gemini_check,
             )
             for lang in target_langs
         ]
@@ -1310,20 +1213,16 @@ async def run_multi_check(
 
         dup_cols = sheet.get("duplicate_language_columns") or {}
         languages_out = {}
-        for lang, (findings_list, lang_cost, lang_debug_cost, lang_gemini_cost) in zip(target_langs, per_lang_results):
+        for lang, (findings_list, lang_cost, lang_gemini_cost) in zip(target_langs, per_lang_results):
             findings_list = _apply_duplicate_language_warnings(
                 findings_list, lang, dup_cols, source_lang, show_source_warning=(lang == target_langs[0]),
             )
             languages_out[lang] = findings_list
             total_findings += _count_real_findings(findings_list)
-            total_debug_findings += sum(
-                1 for row in findings_list for f in row["findings"] if f.get("calibration_debug")
-            )
             total_gemini_findings += sum(
                 1 for row in findings_list for f in row["findings"] if f.get("gemini_check")
             )
-            total_cost_usd += lang_cost + lang_debug_cost + lang_gemini_cost
-            total_debug_cost_usd += lang_debug_cost
+            total_cost_usd += lang_cost + lang_gemini_cost
             total_gemini_cost_usd += lang_gemini_cost
 
         total_rows_checked += len(sheet["rows"])
@@ -1342,9 +1241,6 @@ async def run_multi_check(
         "total_findings": total_findings,
         "cost_usd": total_cost_usd,
     }
-    if calibration_debug:
-        summary["calibration_debug_cost_usd"] = total_debug_cost_usd
-        summary["calibration_debug_findings"] = total_debug_findings
     if gemini_check:
         summary["gemini_cost_usd"] = total_gemini_cost_usd
         summary["gemini_findings"] = total_gemini_findings

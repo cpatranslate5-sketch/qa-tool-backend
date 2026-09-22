@@ -63,6 +63,14 @@ MODEL_COMPARISON_CANDIDATES = {
     "haiku": lambda: "claude-haiku-4-5-20251001",
 }
 
+# Default subset of MODEL_COMPARISON_CANDIDATES a call runs when "models"
+# isn't given — Александр's ask, 2026-09-23: Opus is real money and he
+# doesn't want it included just for a routine comparison run any more (it
+# already proved its edge once — see HARD_LANGUAGE_BASES's own comment).
+# Still selectable by name via the "models" parameter when a comparison
+# against Opus specifically is actually wanted.
+DEFAULT_COMPARISON_MODELS = ["sonnet", "haiku"]
+
 # A hard ceiling on runs_per_model — this hits the real Anthropic API for
 # real money on every call, and it's a diagnostic tool reachable without
 # the usual project/manager plumbing, so a stray large number in a request
@@ -72,12 +80,10 @@ MAX_RUNS_PER_MODEL = 10
 
 async def _one_run(
     item: dict, checks: list[str], target_lang: str, source_lang: str, model_id: str, semaphore: asyncio.Semaphore,
-    relaxed: bool = False,
 ) -> tuple[list[dict], float, bool]:
     async with semaphore:
         findings_by_idx, cost_usd, truncated = await run_ai_checks_batch(
             [item], checks, target_lang=target_lang, source_lang=source_lang, model_override=model_id,
-            relaxed=relaxed,
         )
     # register_value entries aren't a "catch" of anything — they're the
     # register-reporting side-channel (see claude_client.REGISTER_VALUE_TYPE),
@@ -88,17 +94,17 @@ async def _one_run(
 
 # A deliberately MINIMAL prompt, bypassing claude_client.build_batch_prompt
 # entirely — no CHECK_LABELS "что считается опечаткой" description, no
-# calibration/confidence-bar sentence (strict OR relaxed), no JSON-schema
-# instructions, none of the other boilerplate (conciseness instruction,
-# type_enum, etc.) that the real production prompt carries. Added
-# 2026-09-22: after relaxed=True made zero difference to Sonnet's 0/5 (see
-# run_model_comparison's own comment on that result), the leading
-# remaining explanation is that the sheer LENGTH/complexity of our normal
-# prompt — not the confidence wording specifically — is what's costing
-# Sonnet the nuance here, since Александр got a correct answer from Sonnet
-# with a bare question shaped almost exactly like this one, outside our
-# pipeline entirely. This exists to test THAT, isolated from every other
-# variable (still the same row, same target language, same model).
+# calibration/confidence-bar sentence, no JSON-schema instructions, none of
+# the other boilerplate (conciseness instruction, type_enum, etc.) that the
+# real production prompt carries. Added 2026-09-22 after a relaxed-
+# confidence-bar test made zero difference to Sonnet's 0/5 result, pointing
+# away from confidence wording and toward the sheer LENGTH/complexity of
+# our normal prompt as what was costing Sonnet the nuance here — Александр
+# got a correct answer from Sonnet with a bare question shaped almost
+# exactly like this one, outside our pipeline entirely. This exists to
+# test THAT, isolated from every other variable (still the same row, same
+# target language, same model). Confirmed right: see
+# claude_client.BATCH_PROMPT_SINGLE_ITEM, the fix that came out of this.
 BARE_COMPARISON_PROMPT = (
     "Проверь эту пару «исходник/перевод» на ошибки смысла или грамматики. Ответь строго в таком формате, "
     "ничего не добавляя до или после:\n"
@@ -160,15 +166,15 @@ async def run_model_comparison(
     source_lang: str = "ru",
     checks: list[str] | None = None,
     runs_per_model: int = 5,
-    relaxed: bool = False,
     bare: bool = False,
+    models: list[str] | None = None,
 ) -> dict:
     """Runs the exact same (context, source, translation) row through each
-    of MODEL_COMPARISON_CANDIDATES, runs_per_model times each, in parallel
-    (bounded by a semaphore using the same AI_CONCURRENCY limit the real
-    product uses — a fresh Semaphore instance here, not literally shared
-    with a concurrent production check, but capped the same way so this
-    doesn't hammer Anthropic any harder than a normal check would),
+    of the selected candidate models, runs_per_model times each, in
+    parallel (bounded by a semaphore using the same AI_CONCURRENCY limit
+    the real product uses — a fresh Semaphore instance here, not literally
+    shared with a concurrent production check, but capped the same way so
+    this doesn't hammer Anthropic any harder than a normal check would),
     and returns a per-model hit-rate report: how many of the N runs
     produced ANY finding at all (a "catch"), that model's total cost across
     all its runs, and up to 3 distinct example finding messages from the
@@ -176,31 +182,22 @@ async def run_model_comparison(
     model is genuinely flagging the SAME real issue being tested, not just
     something unrelated.
 
-    relaxed: forwarded to run_ai_checks_batch/build_batch_prompt — swaps in
-    CALIBRATION_RELAXED_OPENING (see claude_client's own comment on it)
-    instead of the normal strict "only report if you're sure" confidence
-    bar. Added 2026-09-22 after Александр got a real Sonnet answer OUTSIDE
-    our pipeline (a bare, unstructured question with no confidence-bar
-    wording at all) that correctly caught the same Marathi row our own
-    strict-calibration Sonnet run missed 5 times in a row — real evidence
-    that at least SOME of the gap can be our own prompt's confidence bar
-    making Sonnet second-guess itself, not necessarily Sonnet lacking the
-    underlying knowledge outright. This flag exists to test exactly that,
-    with real numbers, before concluding either way. In practice
-    (2026-09-22): relaxed=True made ZERO difference to Sonnet (still 0/5),
-    which argues AGAINST the confidence-bar theory for Sonnet specifically
-    — see "bare" below for the hypothesis this result points to instead.
-
     bare: bypasses claude_client's whole prompt-building machinery
     (build_batch_prompt/run_ai_checks_batch — no CHECK_LABELS description,
     no calibration wording at all, no JSON-schema instructions) in favor
     of BARE_COMPARISON_PROMPT, a minimal question shaped like the one
     Александр asked Sonnet directly outside our pipeline (and which DID
     get a correct answer). Tests whether it's our prompt's sheer
-    length/complexity — not the confidence bar specifically — costing
-    Sonnet the nuance. When True, relaxed is ignored (irrelevant — the
-    bare prompt has no calibration wording to swap) and the report's
-    "relaxed" field is forced to False for clarity.
+    length/complexity — not the confidence bar — costing a model the
+    nuance.
+
+    models: which of MODEL_COMPARISON_CANDIDATES to actually run, by name
+    ("opus"/"sonnet"/"haiku"). Defaults to DEFAULT_COMPARISON_MODELS
+    (sonnet + haiku, no Opus — Александр's ask, 2026-09-23, to not spend on
+    Opus for a routine comparison). An unknown name is silently dropped
+    rather than erroring, same graceful-degradation spirit as the rest of
+    this tool; an empty/all-unknown result falls back to the default too,
+    so a bad request still returns a useful comparison instead of nothing.
 
     Returns {} when no ANTHROPIC_API_KEY is configured — same graceful
     no-op as the rest of the AI-check pipeline, rather than an error."""
@@ -210,12 +207,15 @@ async def run_model_comparison(
     runs_per_model = max(1, min(runs_per_model, MAX_RUNS_PER_MODEL))
     item = {"context": context, "source": source, "translation": translation}
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
-    relaxed = False if bare else relaxed
+
+    selected_names = [m for m in (models or DEFAULT_COMPARISON_MODELS) if m in MODEL_COMPARISON_CANDIDATES]
+    if not selected_names:
+        selected_names = DEFAULT_COMPARISON_MODELS
 
     results = {}
     total_cost = 0.0
-    for name, resolve_model in MODEL_COMPARISON_CANDIDATES.items():
-        model_id = resolve_model()
+    for name in selected_names:
+        model_id = MODEL_COMPARISON_CANDIDATES[name]()
         if bare:
             runs = await asyncio.gather(*[
                 _one_run_bare(item, target_lang, source_lang, model_id, semaphore)
@@ -223,7 +223,7 @@ async def run_model_comparison(
             ])
         else:
             runs = await asyncio.gather(*[
-                _one_run(item, checks, target_lang, source_lang, model_id, semaphore, relaxed=relaxed)
+                _one_run(item, checks, target_lang, source_lang, model_id, semaphore)
                 for _ in range(runs_per_model)
             ])
         catches = 0
@@ -259,8 +259,8 @@ async def run_model_comparison(
     report = {
         "target_lang": target_lang,
         "checks": checks,
-        "relaxed": relaxed,
         "bare": bare,
+        "models": selected_names,
         "total_cost_usd": round(total_cost, 4),
         "results": results,
     }
@@ -279,12 +279,7 @@ def _format_summary_ru(report: dict) -> str:
     """A ready-to-read Russian summary of the comparison, so the result can
     be understood at a glance in the /docs response without translating
     JSON field names by hand."""
-    if report.get("bare"):
-        mode = " (🧪 упрощённый прямой вопрос, без нашего обычного промпта)"
-    elif report.get("relaxed"):
-        mode = " (🔬 сниженная планка уверенности)"
-    else:
-        mode = ""
+    mode = " (🧪 упрощённый прямой вопрос, без нашего обычного промпта)" if report.get("bare") else ""
     lines = [f"Сравнение моделей для языка {report['target_lang']}{mode}:"]
     for name, r in report["results"].items():
         label = _NAMES_RU.get(name, name)

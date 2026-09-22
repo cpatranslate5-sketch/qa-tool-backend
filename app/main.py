@@ -752,19 +752,12 @@ async def multi_check(
     # an hour. Costs 2x (the batch queue is exactly half price — see
     # claude_client.BATCH_PRICE_DISCOUNT — so skipping it is full price).
     urgent: bool = Form(False),
-    # "🔬 Тест калибровки" checkbox — see excel_multi.run_multi_check's own
-    # comment. Doubles the AI cost of this one run (shown separately as
-    # calibration_debug_cost_usd in the response) and, like "urgent", forces
-    # the live path even for a job that would otherwise queue — a debug
-    # comparison is a deliberate one-off, not something to leave waiting an
-    # hour in the batch queue.
-    calibration_debug: bool = Form(False),
     # "🌐 Проверить также через Gemini" checkbox — see
     # excel_multi.run_multi_check's own comment and app.gemini_client.
     # Needs GEMINI_API_KEY configured on Railway (settings.GEMINI_API_KEY)
     # or it silently finds nothing for this pass, same graceful
     # degradation as a missing ANTHROPIC_API_KEY. Also forces the live
-    # path, like urgent/calibration_debug.
+    # path, like "urgent".
     gemini_check: bool = Form(False),
     db: Session = Depends(get_db),
 ):
@@ -800,10 +793,10 @@ async def multi_check(
     # its full, non-discounted price) regardless of size.
     volume = estimate_check_volume(sheets, resolved_source, target_filter)
 
-    if urgent or calibration_debug or gemini_check or volume <= BATCH_THRESHOLD_CHARS:
+    if urgent or gemini_check or volume <= BATCH_THRESHOLD_CHARS:
         results = await run_multi_check(
             sheets, resolved_source, selected_checks, extra_instructions,
-            target_filter, calibration_debug=calibration_debug, gemini_check=gemini_check,
+            target_filter, gemini_check=gemini_check,
         )
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
@@ -1097,8 +1090,8 @@ async def debug_model_comparison(payload: schemas.ModelComparisonIn):
         source_lang=payload.source_lang,
         checks=payload.checks,
         runs_per_model=payload.runs_per_model,
-        relaxed=payload.relaxed,
         bare=payload.bare,
+        models=payload.models,
     )
     if not result:
         raise HTTPException(

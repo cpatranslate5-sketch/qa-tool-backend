@@ -3,16 +3,20 @@ Optional second AI provider — "🌐 Проверить также через G
 app.excel_multi's gemini_check plumbing and CheckRunner.tsx's checkbox).
 
 Background (Александр, 2026-09-22): a debug test that ran our own model a
-second time with a loosened confidence bar (see claude_client's
-CALIBRATION_RELAXED_OPENING) still completely missed a real Marathi meaning
-error ("पैज न लावता" = "without placing a bet", when the source meant "no
-wagering requirement") — showing the gap there isn't really about
-calibration, it's the model not having that knowledge at all, regardless of
-how confident it's told to be. A blind side-by-side test then showed Gemini
-independently catches that same error (and 4 other real ones), while
-correctly staying silent on a genuinely-fine control example — real
-evidence that a second, independent model provider can catch what ours
-structurally can't, not just re-ask the same model differently.
+second time with a loosened confidence bar still completely missed a real
+Marathi meaning error ("पैज न लावता" = "without placing a bet", when the
+source meant "no wagering requirement") — at the time this suggested the
+gap wasn't about calibration at all. A later investigation found the actual
+cause: BATCH_PROMPT's own cross-row-duplicate instructions were diluting
+the model's attention, not a lack of knowledge — see BATCH_PROMPT_SINGLE_ITEM
+in claude_client.py and the translation-QA prompt catalog for the full
+story (the relaxed-calibration debug mode itself was removed 2026-09-23
+once that was settled). None of that changes the value of Gemini as a
+genuinely independent second opinion, though: a blind side-by-side test
+showed Gemini independently catches that same error (and 4 other real
+ones), while correctly staying silent on a genuinely-fine control example —
+real evidence that a second, independent model provider can catch what
+ours structurally can't, not just re-ask the same model differently.
 
 Deliberately reuses claude_client.build_batch_prompt/parse_json_array/
 group_batch_findings/_filter_findings_by_checks as-is: the SAME prompt text
@@ -199,7 +203,7 @@ async def run_gemini_checks_batch(
     configured is deliberately NOT an error here (mirrors a missing
     ANTHROPIC_API_KEY) — see _call_gemini's own comment."""
     prompt, number_to_index = build_batch_prompt(
-        items, checks, extra_instructions, target_lang, source_lang, relaxed=False,
+        items, checks, extra_instructions, target_lang, source_lang,
     )
     if prompt is None:
         return {}, 0.0, False, False, None
