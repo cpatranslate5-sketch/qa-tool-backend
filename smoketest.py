@@ -4628,6 +4628,94 @@ print("[OK] run_model_comparison: relaxed=True correctly swaps CALIBRATION_RELAX
       "candidate model's prompt (Opus/Sonnet/Haiku alike), letting the confidence-bar-vs-knowledge-gap "
       "question be tested with real data instead of assumed")
 
+# --- run_model_comparison: bare mode (minimal prompt, no calibration) ---
+# Added 2026-09-22 after relaxed=True made ZERO difference to Sonnet's 0/5
+# result — real evidence AGAINST the confidence-bar theory for Sonnet
+# specifically. The next hypothesis: our normal prompt's sheer length/
+# complexity (not the confidence sentence) is what costs Sonnet the
+# nuance, since Александр got a correct answer from a bare, minimal
+# question outside our pipeline. bare=True tests that in isolation.
+from app.model_comparison import _parse_bare_response
+
+# _parse_bare_response unit tests — the parsing logic itself, independent
+# of any API call.
+assert _parse_bare_response(None) == []
+assert _parse_bare_response("") == []
+assert _parse_bare_response("ПРОБЛЕМА: нет\nОБЪЯСНЕНИЕ:") == [], (
+    "'ПРОБЛЕМА: нет' must never count as a catch"
+)
+assert _parse_bare_response("что-то совсем не по формату") == [], (
+    "an unparseable response must count as 'no catch', not raise or false-positive"
+)
+_bare_parsed = _parse_bare_response(
+    "ПРОБЛЕМА: да\nОБЪЯСНЕНИЕ: «без отыгрыша» переведено как «без ставки» — искажение смысла."
+)
+assert len(_bare_parsed) == 1 and _bare_parsed[0]["type"] == "typo", _bare_parsed
+assert "искажение смысла" in _bare_parsed[0]["message"], _bare_parsed
+# Exact match on "да", not a "starts with д" prefix check — subagent
+# review (2026-09-22) caught that a prefix check would false-positive on
+# any д-starting non-answer, silently inflating a model's apparent hit
+# rate the moment it deviates from the requested да/нет format.
+assert _parse_bare_response("ПРОБЛЕМА: действительно\nОБЪЯСНЕНИЕ: неважно") == [], (
+    "'действительно' starts with 'д' but is NOT 'да' — must not be treated as a catch"
+)
+assert _parse_bare_response("ПРОБЛЕМА: дно\nОБЪЯСНЕНИЕ: неважно") == [], (
+    "'дно' starts with 'д' but is NOT 'да' — must not be treated as a catch"
+)
+assert len(_parse_bare_response("ПРОБЛЕМА: Да!\nОБЪЯСНЕНИЕ: пример")) == 1, (
+    "'Да!' (different case, trailing punctuation) must still be recognized as a real 'да'"
+)
+print("[OK] _parse_bare_response: 'ПРОБЛЕМА: да' with an explanation becomes exactly one finding, 'нет' "
+      "and unparseable responses correctly count as no catch rather than raising or false-positiving")
+
+# End-to-end: bare=True must bypass build_batch_prompt/calibration
+# entirely (a genuinely different, minimal prompt with none of the normal
+# machinery) and correctly tally catches from free-text "ПРОБЛЕМА: да/нет"
+# answers instead of JSON.
+_bare_seen_prompts = []
+
+
+async def _fake_call_claude_bare(prompt, model=None):
+    _bare_seen_prompts.append(prompt)
+    name = _cmp_name_for(model)
+    if name == "sonnet":
+        # Modelling the real result Александр got outside our pipeline —
+        # a bare question DOES get a correct answer from Sonnet.
+        return (
+            "ПРОБЛЕМА: да\nОБЪЯСНЕНИЕ: «без отыгрыша» — это условие по вейджеру, а «पैज न लावता» значит "
+            "«не делая ставки» — другой смысл.",
+            {"input_tokens": 20, "output_tokens": 15}, "end_turn",
+        )
+    return "ПРОБЛЕМА: нет\nОБЪЯСНЕНИЕ:", {"input_tokens": 20, "output_tokens": 5}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_bare
+_bare_report = asyncio.run(_run_model_comparison_direct(
+    context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=3, bare=True, relaxed=True,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _bare_report["bare"] is True
+assert _bare_report["relaxed"] is False, "relaxed must be forced False in the report when bare=True, even if passed True"
+assert not any(
+    ("Общее правило" in p) or ("ТЕСТОВЫЙ РЕЖИМ" in p) or ('"row"' in p) for p in _bare_seen_prompts
+), (
+    "bare mode's prompt must contain NONE of the normal pipeline's machinery (no calibration wording of "
+    "either kind, no JSON row-numbered schema) — it must be the minimal BARE_COMPARISON_PROMPT only"
+)
+assert _bare_report["results"]["sonnet"]["catches"] == 3 and _bare_report["results"]["sonnet"]["hit_rate"] == 1.0, (
+    f"a bare, minimal prompt must let the fake Sonnet catch it every time, mirroring the real result "
+    f"Александр got outside our pipeline — got {_bare_report['results']['sonnet']}"
+)
+assert _bare_report["results"]["opus"]["catches"] == 0 and _bare_report["results"]["haiku"]["catches"] == 0
+assert "🧪" in _bare_report["summary_ru"]
+print("[OK] run_model_comparison: bare=True sends a genuinely minimal prompt (no calibration wording, no "
+      "JSON schema) instead of the normal pipeline's, correctly parses free-text 'ПРОБЛЕМА: да/нет' answers, "
+      "and forces relaxed=False in the report since it's not applicable in this mode")
+
 # runs_per_model must be capped at MAX_RUNS_PER_MODEL — this hits the real,
 # billed Anthropic API on every call, reachable without any of the usual
 # project/manager plumbing, so an oversized request can't fire off an
@@ -4725,5 +4813,18 @@ r = check(
 print("[OK] POST /debug/model-comparison: the diagnostic endpoint returns a real per-model comparison "
       "(defaulting to the actual Marathi 'отыгрыш' row that started this investigation) when an API key is "
       "configured, and a clear 503 instead of a silently empty/misleading success when it isn't")
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_bare
+r = check("POST /debug/model-comparison with bare=true", client.post(
+    "/debug/model-comparison", json={"runs_per_model": 2, "bare": True},
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+_ep_bare_body = r.json()
+assert _ep_bare_body["bare"] is True, _ep_bare_body
+assert _ep_bare_body["results"]["sonnet"]["catches"] == 2, _ep_bare_body
+print("[OK] POST /debug/model-comparison: the bare=true field reaches run_model_comparison end-to-end "
+      "through the request schema, not just when called directly in Python")
 
 print("\nALL SMOKETEST CHECKS PASSED")

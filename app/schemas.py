@@ -178,3 +178,8 @@ class ModelComparisonIn(BaseModel):
     # "relaxed" — set true to test with the loosened confidence bar
     # instead of the normal strict one.
     relaxed: bool = False
+    # See app.model_comparison.run_model_comparison's own docstring on
+    # "bare" — set true to bypass our whole normal prompt in favor of a
+    # minimal, direct question (no calibration wording, no JSON schema).
+    # When true, "relaxed" is ignored.
+    bare: bool = False
