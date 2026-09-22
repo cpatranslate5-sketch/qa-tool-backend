@@ -29,6 +29,7 @@ from app.excel_multi import (
     submit_multi_check_batch,
     try_finalize_batch,
 )
+from app.model_comparison import run_model_comparison
 from app.rule_checks import run_rule_checks
 
 logger = logging.getLogger(__name__)
@@ -1074,3 +1075,33 @@ async def delete_multi_check(project_id: int, multi_check_id: int, manager_id: i
     db.delete(record)
     db.commit()
     return {"ok": True}
+
+
+@app.post("/debug/model-comparison")
+async def debug_model_comparison(payload: schemas.ModelComparisonIn):
+    # Standalone diagnostic tool, NOT part of the product managers use —
+    # see app.model_comparison's own comment for the full story
+    # (Александр's ask, 2026-09-22, to settle the "does asking a cheaper
+    # model several times make up for it being weaker" question with real
+    # numbers instead of more reasoning on paper). Deliberately has no
+    # project/manager plumbing — meant to be triggered by hand a handful of
+    # times via this backend's own interactive /docs page, not called from
+    # the frontend. Each call makes real, real-money calls to Anthropic
+    # (up to 3 models × runs_per_model each) — total_cost_usd in the
+    # response says exactly how much this one call spent.
+    result = await run_model_comparison(
+        context=payload.context,
+        source=payload.source,
+        translation=payload.translation,
+        target_lang=payload.target_lang,
+        source_lang=payload.source_lang,
+        checks=payload.checks,
+        runs_per_model=payload.runs_per_model,
+    )
+    if not result:
+        raise HTTPException(
+            503,
+            "ANTHROPIC_API_KEY не настроен на этом сервере — сравнение моделей требует реального обращения к "
+            "Anthropic, тестовый режим тут не поможет.",
+        )
+    return result

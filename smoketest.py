@@ -4479,4 +4479,216 @@ print("[OK] calibration_debug + gemini_check together: both optional extra passe
       "calibration_debug's stays test-only/excluded from total_findings while Gemini's is counted as real, "
       "and both extra costs fold independently into the same run-wide total")
 
+# --- run_ai_checks_batch: model_override bypasses _model_for_lang -------
+# app.model_comparison (2026-09-22, Александр's "run a cheaper model
+# several times" investigation) needs to force a SPECIFIC model regardless
+# of what _model_for_lang would normally pick for the target language —
+# this is the one piece of plumbing that makes that possible.
+from app.claude_client import run_ai_checks_batch as _run_ai_checks_batch_direct
+
+_override_seen_models = []
+
+
+async def _fake_call_claude_records_model(prompt, model=None):
+    _override_seen_models.append(model)
+    return "[]", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_records_model
+# "mr" is a hard language — _model_for_lang would normally pick
+# CLAUDE_MODEL_HARD (Opus) here. model_override must win instead.
+asyncio.run(_run_ai_checks_batch_direct(
+    [{"context": "x", "source": "y", "translation": "z"}], ["typo"], target_lang="mr", source_lang="ru",
+    model_override="claude-haiku-4-5-20251001",
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _override_seen_models == ["claude-haiku-4-5-20251001"], (
+    f"model_override must be sent to _call_claude verbatim, overriding _model_for_lang's normal hard-language "
+    f"pick (Opus) for 'mr' — got {_override_seen_models}"
+)
+print("[OK] run_ai_checks_batch: model_override forces a specific model regardless of what "
+      "_model_for_lang would normally choose for the target language — every real production caller still "
+      "leaves this unset and is unaffected")
+
+# --- app.model_comparison: the standalone model-comparison diagnostic ---
+# Built in direct response to Александр's "1 раз на sonnet и после 3 на
+# haiku" idea (2026-09-22) — before changing anything about how hard
+# languages actually get checked in production, this tool runs the same
+# real row through Opus/Sonnet/Haiku several times each and reports a real
+# hit rate per model, so that decision gets made from data, not more
+# reasoning on paper. See app.model_comparison's own module comment.
+from app.model_comparison import run_model_comparison as _run_model_comparison_direct
+from app.model_comparison import MAX_RUNS_PER_MODEL as _MAX_RUNS_PER_MODEL
+
+_cmp_counts = {"opus": 0, "sonnet": 0, "haiku": 0}
+
+
+def _cmp_name_for(model_id):
+    if model_id == settings.CLAUDE_MODEL_HARD:
+        return "opus"
+    if model_id == settings.CLAUDE_MODEL:
+        return "sonnet"
+    return "haiku"
+
+
+async def _fake_call_claude_for_comparison(prompt, model=None):
+    name = _cmp_name_for(model)
+    _cmp_counts[name] += 1
+    if name == "opus":
+        # Opus catches it every single time — the whole reason it was
+        # chosen for hard languages in the first place.
+        return (
+            '[{"row": 1, "type": "typo", "severity": "medium", "message": "opus поймала"}]',
+            {"input_tokens": 40, "output_tokens": 20}, "end_turn",
+        )
+    if name == "sonnet":
+        # Catches it on exactly 2 of however many calls it gets — an
+        # aggregate count that holds regardless of which of the
+        # concurrently-dispatched calls happens to complete first.
+        if _cmp_counts[name] <= 2:
+            return (
+                '[{"row": 1, "type": "typo", "severity": "medium", "message": "sonnet поймала"}]',
+                {"input_tokens": 40, "output_tokens": 20}, "end_turn",
+            )
+        return "[]", {"input_tokens": 40, "output_tokens": 2}, "end_turn"
+    # Haiku never catches it at all in this test — modelling the "genuine
+    # knowledge gap, not just bad luck" failure mode this whole comparison
+    # exists to tell apart from a lucky/unlucky sample.
+    return "[]", {"input_tokens": 40, "output_tokens": 2}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_for_comparison
+_cmp_report = asyncio.run(_run_model_comparison_direct(
+    context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=5,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _cmp_counts == {"opus": 5, "sonnet": 5, "haiku": 5}, (
+    f"each of the 3 candidate models must be called exactly runs_per_model times — got {_cmp_counts}"
+)
+assert _cmp_report["results"]["opus"]["catches"] == 5 and _cmp_report["results"]["opus"]["hit_rate"] == 1.0
+assert _cmp_report["results"]["sonnet"]["catches"] == 2 and _cmp_report["results"]["sonnet"]["hit_rate"] == 0.4
+assert _cmp_report["results"]["haiku"]["catches"] == 0 and _cmp_report["results"]["haiku"]["hit_rate"] == 0.0
+assert _cmp_report["results"]["opus"]["example_messages"] == ["opus поймала"]
+assert _cmp_report["results"]["haiku"]["example_messages"] == []
+assert all(_cmp_report["results"][m]["cost_usd"] > 0 for m in ("opus", "sonnet", "haiku")), (
+    "every model's cost_usd must reflect its own real calls, including the ones that found nothing "
+    "(a $0 finding is still a real, billed API call)"
+)
+assert _cmp_report["total_cost_usd"] == round(sum(
+    _cmp_report["results"][m]["cost_usd"] for m in ("opus", "sonnet", "haiku")
+), 4), (
+    "total_cost_usd must be exactly the sum of each candidate model's own (already-rounded) cost_usd, so "
+    "adding up the per-model figures by hand always matches the printed total"
+)
+assert "Opus: поймала 5 из 5 прогонов (100%)" in _cmp_report["summary_ru"]
+assert "Sonnet: поймала 2 из 5 прогонов (40%)" in _cmp_report["summary_ru"]
+assert "Haiku: поймала 0 из 5 прогонов (0%)" in _cmp_report["summary_ru"]
+print("[OK] run_model_comparison: runs the same real row through Opus/Sonnet/Haiku several times each and "
+      "correctly tallies a per-model hit rate/cost/example findings from real (here, faked) per-model "
+      "responses, including a ready-to-read Russian summary")
+
+# runs_per_model must be capped at MAX_RUNS_PER_MODEL — this hits the real,
+# billed Anthropic API on every call, reachable without any of the usual
+# project/manager plumbing, so an oversized request can't fire off an
+# unbounded number of paid calls.
+_cmp_counts2 = {"opus": 0, "sonnet": 0, "haiku": 0}
+
+
+async def _fake_call_claude_counts_only(prompt, model=None):
+    _cmp_counts2[_cmp_name_for(model)] += 1
+    return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_counts_only
+asyncio.run(_run_model_comparison_direct(
+    context="a", source="b", translation="c", target_lang="mr", source_lang="ru",
+    checks=["typo"], runs_per_model=999,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _cmp_counts2 == {"opus": _MAX_RUNS_PER_MODEL, "sonnet": _MAX_RUNS_PER_MODEL, "haiku": _MAX_RUNS_PER_MODEL}, (
+    f"runs_per_model=999 must be silently capped at MAX_RUNS_PER_MODEL ({_MAX_RUNS_PER_MODEL}) per model, not "
+    f"actually fire 999 real paid calls per model — got {_cmp_counts2}"
+)
+print(f"[OK] run_model_comparison: an oversized runs_per_model is capped at MAX_RUNS_PER_MODEL "
+      f"({_MAX_RUNS_PER_MODEL}) per model instead of firing an unbounded number of real paid API calls")
+
+# A register_value entry (the register-reporting side channel, not a real
+# problem) must never count as a "catch" — a model whose only response is
+# "here's the register" caught NOTHING for the purposes of this test.
+_cmp_calls_register = {"n": 0}
+
+
+async def _fake_call_claude_register_only(prompt, model=None):
+    _cmp_calls_register["n"] += 1
+    return (
+        '[{"row": 1, "type": "register_value", "value": "formal"}]',
+        {"input_tokens": 10, "output_tokens": 5}, "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_register_only
+_cmp_register_report = asyncio.run(_run_model_comparison_direct(
+    context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
+    target_lang="mr", source_lang="ru", checks=["typo", "register"], runs_per_model=2,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert all(_cmp_register_report["results"][m]["catches"] == 0 for m in ("opus", "sonnet", "haiku")), (
+    f"a register_value-only response must never count as a catch — got {_cmp_register_report['results']}"
+)
+print("[OK] run_model_comparison: a register_value entry (the register side-channel, not a real problem) "
+      "is correctly excluded from counting as a 'catch'")
+
+# No ANTHROPIC_API_KEY configured -> graceful no-op (same pattern as the
+# rest of the AI-check pipeline), not an error and not a real call.
+_cmp_counts3 = {"n": 0}
+
+
+async def _fake_call_claude_should_not_be_called(prompt, model=None):
+    _cmp_counts3["n"] += 1
+    return "[]", {}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_should_not_be_called
+assert settings.ANTHROPIC_API_KEY == ""
+_cmp_empty = asyncio.run(_run_model_comparison_direct(
+    context="a", source="b", translation="c", target_lang="mr", source_lang="ru",
+))
+claude_client_mod._call_claude = _previous_call_claude
+assert _cmp_empty == {}, "with no ANTHROPIC_API_KEY configured, run_model_comparison must return {} without calling anything"
+assert _cmp_counts3["n"] == 0, "no ANTHROPIC_API_KEY configured must mean zero real calls, not calls that get discarded"
+print("[OK] run_model_comparison: gracefully returns {} and makes zero calls when no ANTHROPIC_API_KEY is "
+      "configured, same graceful no-op as the rest of the AI-check pipeline")
+
+# --- /debug/model-comparison endpoint ------------------------------------
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_for_comparison
+_cmp_counts["opus"] = _cmp_counts["sonnet"] = _cmp_counts["haiku"] = 0
+r = check("POST /debug/model-comparison (defaults = the real Marathi row)", client.post(
+    "/debug/model-comparison", json={"runs_per_model": 3},
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+_ep_body = r.json()
+assert _ep_body["target_lang"] == "mr", _ep_body
+assert set(_ep_body["results"].keys()) == {"opus", "sonnet", "haiku"}, _ep_body
+assert "summary_ru" in _ep_body and "Opus" in _ep_body["summary_ru"], _ep_body
+
+r = check(
+    "POST /debug/model-comparison without ANTHROPIC_API_KEY -> 503, not a silent empty success",
+    client.post("/debug/model-comparison", json={}), expect=503,
+)
+print("[OK] POST /debug/model-comparison: the diagnostic endpoint returns a real per-model comparison "
+      "(defaulting to the actual Marathi 'отыгрыш' row that started this investigation) when an API key is "
+      "configured, and a clear 503 instead of a silently empty/misleading success when it isn't")
+
 print("\nALL SMOKETEST CHECKS PASSED")

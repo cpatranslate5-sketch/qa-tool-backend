@@ -157,3 +157,20 @@ class MultiCheckHistoryOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ModelComparisonIn(BaseModel):
+    """Input for the standalone /debug/model-comparison endpoint — see
+    app.model_comparison's own comment for why this exists. Defaults are
+    the real Marathi "отыгрыш" row (context "freebet") that started this
+    whole investigation, so the interactive /docs page already has a
+    meaningful example filled in without Александр needing to type
+    anything — he can just press "Try it out" → "Execute" to get a first
+    real result, then edit the fields to try other rows."""
+    context: str = "freebet"
+    source: str = "Фрибет без отыгрыша"
+    translation: str = "पैज न लावता फ्री बेट"
+    target_lang: str = "mr"
+    source_lang: str = "ru"
+    checks: list[str] = ["typo"]
+    runs_per_model: int = 5

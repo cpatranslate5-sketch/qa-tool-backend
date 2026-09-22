@@ -1137,6 +1137,7 @@ async def run_ai_checks_batch(
     target_lang: str = "",
     source_lang: str = "",
     relaxed: bool = False,
+    model_override: str | None = None,
 ) -> tuple[dict[int, list[dict]], float, bool]:
     """Synchronous path: builds the prompt, calls Claude right away, and
     returns (findings keyed by index into items, this call's cost_usd,
@@ -1147,6 +1148,12 @@ async def run_ai_checks_batch(
     relaxed: forwarded to build_batch_prompt/_calibration — see there.
     Only app.excel_multi's calibration_debug pass ever sets this True.
 
+    model_override: bypass the normal _model_for_lang(target_lang)
+    selection and force a specific model id instead. Added 2026-09-22
+    for app.model_comparison's diagnostic tool only (see its own
+    comment) — every real production caller leaves this None and gets
+    the normal per-language model choice, unaffected.
+
     Findings keyed by index here still include any REGISTER_VALUE_TYPE
     entries mixed in with real findings — app.excel_multi extracts and
     summarizes those itself (it's the one with the excel_row numbers to
@@ -1156,7 +1163,7 @@ async def run_ai_checks_batch(
     )
     if prompt is None:
         return {}, 0.0, False
-    model = _model_for_lang(target_lang)
+    model = model_override or _model_for_lang(target_lang)
     text_block, usage, stop_reason = await _call_claude(prompt, model=model)
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
