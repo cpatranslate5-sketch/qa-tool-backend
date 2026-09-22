@@ -75,9 +75,31 @@ CHECK_LABELS = {
     ),
 }
 
-CALIBRATION_BASE = (
+# Split into an "opening" (the part that actually sets the confidence bar)
+# and a "shared" tail (everything else — currency/date formatting notes,
+# multi-finding-per-pair rules) that stays identical in both calibration
+# modes below. This split exists ONLY so _calibration_debug's relaxed pass
+# (see CALIBRATION_RELAXED_OPENING) can swap out the ONE sentence that
+# controls confidence without touching anything else the prompt asks for —
+# see _calibration's "relaxed" parameter and app.excel_multi's
+# calibration_debug feature (Александр's ask, 2026-09-22: find out whether
+# real-world misses on hard-language/subtle findings come from the model's
+# own knowledge gap or from this confidence bar filtering out a correct-
+# but-uncertain finding).
+CALIBRATION_STRICT_OPENING = (
     "Общее правило: сообщай, только если уверен(а), что это настоящая ошибка. Сомневаешься или это может быть "
-    "допустимым вариантом — не включай. Лучше меньше, но точных находок. Порядок символа валюты относительно числа, "
+    "допустимым вариантом — не включай. Лучше меньше, но точных находок."
+)
+CALIBRATION_RELAXED_OPENING = (
+    "ТЕСТОВЫЙ РЕЖИМ пониженного порога уверенности (используется только для отладки чувствительности проверки, "
+    "не для обычной работы): сообщай о находке, даже если не до конца уверен(а) в ней — если это выглядит как "
+    "правдоподобный, реальный признак ошибки смысла или грамматики, а не просто другая, тоже корректная "
+    "формулировка. Смягчается ТОЛЬКО порог уверенности в том, что предполагаемая проблема настоящая — то, ЧТО "
+    "вообще считается проблемой, не меняется: другой синоним/порядок слов с тем же смыслом по-прежнему не "
+    "ошибка, и об этом по-прежнему не нужно сообщать."
+)
+_CALIBRATION_SHARED_TAIL = (
+    "Порядок символа валюты относительно числа, "
     "разделители тысяч/десятичных знаков, а также сам порядок частей даты (день/месяц/год) и то, точкой или "
     "слэшем они разделены — это НЕ ошибка перевода сама по себе, и об этом никогда не нужно сообщать. Важно: одна "
     "пара «исходник/перевод» может содержать НЕСКОЛЬКО разных проблем одновременно, в том числе разных типов из "
@@ -91,6 +113,10 @@ CALIBRATION_BASE = (
     "сообщении каждой находки, к какому именно предложению/фрагменту она относится (например, процитируй именно его) "
     "— чтобы находки не выглядели одинаковыми и не терялись друг в друге."
 )
+# Kept as a public name (imported/used elsewhere, e.g. tests) meaning "the
+# strict/production calibration text in full" — equivalent to what this
+# used to be as one single constant before the split above.
+CALIBRATION_BASE = f"{CALIBRATION_STRICT_OPENING} {_CALIBRATION_SHARED_TAIL}"
 
 # Александр's ask, 2026-09-18 (part of moving to Opus everywhere on the
 # hard-language list, and wanting to afford it): the model's OWN written
@@ -133,9 +159,10 @@ _CALIBRATION_WITHOUT_NUMBERS_CHECK = (
 )
 
 
-def _calibration(checks: list[str]) -> str:
+def _calibration(checks: list[str], relaxed: bool = False) -> str:
+    opening = CALIBRATION_RELAXED_OPENING if relaxed else CALIBRATION_STRICT_OPENING
     tail = _CALIBRATION_WITH_NUMBERS_CHECK if "numbers" in checks else _CALIBRATION_WITHOUT_NUMBERS_CHECK
-    return f"{CALIBRATION_BASE} {tail} {_CONCISENESS_INSTRUCTION}"
+    return f"{opening} {_CALIBRATION_SHARED_TAIL} {tail} {_CONCISENESS_INSTRUCTION}"
 
 
 SINGLE_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
@@ -902,6 +929,7 @@ def build_batch_prompt(
     extra_instructions: str = "",
     target_lang: str = "",
     source_lang: str = "",
+    relaxed: bool = False,
 ) -> tuple[str | None, dict[int, int]]:
     """
     Builds the prompt for one language's batch of (context, source,
@@ -913,6 +941,11 @@ def build_batch_prompt(
     items: list of {"context": str, "source": str, "translation": str}, all
     in the same target language. Items with an empty translation are
     skipped (handled by rule checks as "missing translation" instead).
+
+    relaxed: see _calibration's own "relaxed" parameter — swaps in
+    CALIBRATION_RELAXED_OPENING instead of the normal production confidence
+    bar. Only app.excel_multi's calibration_debug feature ever passes True;
+    every regular check (single or multi) leaves this at the default.
 
     Returns (prompt, number_to_index) — prompt is None when there's nothing
     to ask the AI (no AI check types selected, or nothing checkable).
@@ -937,7 +970,7 @@ def build_batch_prompt(
     )
     prompt = BATCH_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
-        calibration=_calibration(checks),
+        calibration=_calibration(checks, relaxed=relaxed),
         source_lang_note=_source_lang_note(source_lang, checks),
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
@@ -992,6 +1025,7 @@ async def run_ai_checks_batch(
     extra_instructions: str = "",
     target_lang: str = "",
     source_lang: str = "",
+    relaxed: bool = False,
 ) -> tuple[dict[int, list[dict]], float, bool]:
     """Synchronous path: builds the prompt, calls Claude right away, and
     returns (findings keyed by index into items, this call's cost_usd,
@@ -999,12 +1033,15 @@ async def run_ai_checks_batch(
     caller adds a visible warning for that rather than presenting a
     partial result as a complete one).
 
+    relaxed: forwarded to build_batch_prompt/_calibration — see there.
+    Only app.excel_multi's calibration_debug pass ever sets this True.
+
     Findings keyed by index here still include any REGISTER_VALUE_TYPE
     entries mixed in with real findings — app.excel_multi extracts and
     summarizes those itself (it's the one with the excel_row numbers to
     label them with), not this function."""
     prompt, number_to_index = build_batch_prompt(
-        items, checks, extra_instructions, target_lang, source_lang
+        items, checks, extra_instructions, target_lang, source_lang, relaxed=relaxed,
     )
     if prompt is None:
         return {}, 0.0, False

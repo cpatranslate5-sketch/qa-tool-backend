@@ -466,6 +466,37 @@ r = check("detect-languages also reports unrecognized columns up front", client.
 assert "Notes for reviewer" in r.json()["unrecognized_columns"], r.json()
 assert "en" in r.json()["languages"] and "ru" in r.json()["languages"], r.json()
 
+# --- a language code assigned to 2+ columns must also be reported back
+# BEFORE the manager presses "start" — the manager's own ask, verbatim:
+# "если платформа видит, что источника 2 или более и сомневается какой
+# правильный, пусть сообщит об этом" (2026-09-22, right after a duplicated
+# "ru" header was found live on his real file). Catching it here, at
+# detect-languages, means before any AI-backed check has been paid for —
+# the same warning is ALSO shown after a check runs (see the
+# _duplicate_language_warning coverage above), in case it's missed here. ---
+dup_detect_wb = openpyxl.Workbook()
+dup_detect_ws = dup_detect_wb.active
+dup_detect_ws.append(["Context", "en", "ru", "de", "ru"])
+dup_detect_ws.append(["Greeting", "Hello", "Привет", "Hallo", "Привет-2"])
+dup_detect_buf = io.BytesIO()
+dup_detect_wb.save(dup_detect_buf)
+dup_detect_buf.seek(0)
+r = check("detect-languages also reports a duplicated language column up front", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("dup_lang.xlsx", dup_detect_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+))
+assert "ru" in r.json()["duplicate_languages"], r.json()
+assert "C" in r.json()["duplicate_languages"]["ru"][0] and "E" in r.json()["duplicate_languages"]["ru"][0], r.json()
+assert r.json()["languages"].count("ru") == 1, "a duplicated language must still be listed only once among 'languages'"
+
+# --- and the control: a file with no duplicated columns must report none. ---
+unrec_buf.seek(0)
+r = check("detect-languages reports no duplicates for an ordinary, clean file", client.post(
+    f"/projects/{project_id}/multi-check/detect-languages",
+    files={"file": ("with_notes_column.xlsx", unrec_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+), expect=200)
+assert r.json()["duplicate_languages"] == {}, r.json()
+
 # --- Александр hit this live right after the above shipped: his real file
 # spells some region-qualified languages as "ES MX"/"PT BR" — the display
 # style ("ES (MX)") without the parentheses — which fell through to the
@@ -2164,7 +2195,7 @@ _rep_sheet = {
 }
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_repeated_batch
-_rep_out, _rep_cost = asyncio.get_event_loop().run_until_complete(
+_rep_out, _rep_cost, _rep_debug_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_rep_sheet, "ru", "en", ["typo", "untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2286,7 +2317,7 @@ _chunk_rows = [
 _chunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _chunk_rows}
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_chunked
-_chunk_out, _chunk_cost = asyncio.get_event_loop().run_until_complete(
+_chunk_out, _chunk_cost, _chunk_debug_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_chunk_sheet, "ru", "en", ["untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2840,7 +2871,7 @@ async def _fake_call_claude_register_batch(prompt, model=None):
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_batch
-_reg_out, _reg_cost = asyncio.get_event_loop().run_until_complete(
+_reg_out, _reg_cost, _reg_debug_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2949,7 +2980,7 @@ async def _fake_call_claude_register_mixed_batch(prompt, model=None):
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_mixed_batch
-_mixed_out, _mixed_cost = asyncio.get_event_loop().run_until_complete(
+_mixed_out, _mixed_cost, _mixed_debug_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -3494,5 +3525,408 @@ assert check_numbers("Confirm by 09/20, 23:59", "Подтверди до 20.09, 
 print("[OK] check_numbers: a whole-number range bound ('1.25 to 4') is recognized via a tight-proximity "
       "integer partner check, without breaking the pre-existing short-date-followed-by-a-clock-time case "
       "(a colon-adjacent number is never mistaken for a range bound)")
+
+# --- Duplicate language-header columns (e.g. two columns both headed "ru")
+# — a real structural ambiguity found live on Александр's real production
+# file (2026-09-22): "ru" appeared as both column C and column AA. Only
+# one column's data can ever be used per row (see parse_workbook's
+# col_letters_by_code), and before this fix that silent "rightmost column
+# wins" choice was never surfaced anywhere. His own ask, verbatim: "если
+# платформа видит, что источника 2 или более и сомневается какой
+# правильный, пусть сообщит об этом". Covers: parse_workbook detecting and
+# DEDUPLICATING the language (a duplicate used to make every caller that
+# builds target_langs from sheet["languages"] check it TWICE — doubling
+# both AI cost and findings, on top of the ambiguity itself), the live
+# run_multi_check path warning about a duplicated TARGET language, a
+# duplicated SOURCE language's warning appearing exactly once across the
+# whole sheet (not once per target language, which would misleadingly
+# inflate the "N found" headline), a clean file producing no such warning
+# at all, and the large-file Message Batch path (build_batch_plan /
+# finalize_batch_results) surfacing the identical warning. ---
+from app.excel_multi import run_multi_check as _run_multi_check_direct
+from app.excel_multi import build_batch_plan as _dup_build_batch_plan
+from app.excel_multi import finalize_batch_results as _dup_finalize_batch_results
+
+_dup_target_wb = openpyxl.Workbook()
+_dup_target_ws = _dup_target_wb.active
+_dup_target_ws.append(["Context", "en", "ru", "de", "ru"])
+_dup_target_ws.append(["greeting", "Hello", "Privet-C", "Hallo", "Privet-E"])
+_dup_target_buf = io.BytesIO()
+_dup_target_wb.save(_dup_target_buf)
+_dup_target_buf.seek(0)
+_dup_target_sheets = _parse_workbook_direct(_dup_target_buf.read())
+
+assert _dup_target_sheets[0]["languages"] == ["de", "en", "ru"], (
+    "a duplicated language code must appear only ONCE in the sheet's languages list — before this fix it "
+    "appeared twice, which made every caller building target_langs from it (run_multi_check, "
+    "estimate_check_volume, build_batch_plan) check that language TWICE, doubling both its AI cost and its "
+    "findings"
+)
+assert _dup_target_sheets[0]["duplicate_language_columns"] == {"ru": ["C", "E"]}, (
+    "parse_workbook must record which columns a duplicated language code came from, in left-to-right order"
+)
+assert _dup_target_sheets[0]["rows"][0]["values"]["ru"] == "Privet-E", (
+    "the rightmost duplicate column's data is what's actually used per row — the warning message must "
+    "describe this exact, real behavior, not a hypothetical one"
+)
+
+_dup_target_result = asyncio.run(_run_multi_check_direct(_dup_target_sheets, "en", ["numbers"]))
+_dup_target_ru_findings = _dup_target_result["sheets"][0]["languages"]["ru"]
+_dup_target_warnings = [f for row in _dup_target_ru_findings if row["excel_row"] == 0 for f in row["findings"]]
+assert (
+    len(_dup_target_warnings) == 1
+    and "ru" in _dup_target_warnings[0]["message"]
+    and "C" in _dup_target_warnings[0]["message"]
+    and "E" in _dup_target_warnings[0]["message"]
+), "a duplicated TARGET language column must produce exactly one visible system warning naming both columns"
+_dup_target_de_findings = _dup_target_result["sheets"][0]["languages"]["de"]
+assert not any(row["excel_row"] == 0 for row in _dup_target_de_findings), (
+    "the duplicate-column warning for 'ru' must only appear under 'ru' itself, not leak into an unrelated "
+    "language ('de') that has no duplicate of its own"
+)
+
+_dup_source_wb = openpyxl.Workbook()
+_dup_source_ws = _dup_source_wb.active
+_dup_source_ws.append(["Context", "ru", "en", "de", "ru"])
+_dup_source_ws.append(["greeting", "Privet-B", "Hello", "Hallo", "Privet-E"])
+_dup_source_buf = io.BytesIO()
+_dup_source_wb.save(_dup_source_buf)
+_dup_source_buf.seek(0)
+_dup_source_sheets = _parse_workbook_direct(_dup_source_buf.read())
+_dup_source_result = asyncio.run(_run_multi_check_direct(_dup_source_sheets, "ru", ["numbers"]))
+_dup_source_all_warnings = [
+    f
+    for lang_findings in _dup_source_result["sheets"][0]["languages"].values()
+    for row in lang_findings if row["excel_row"] == 0
+    for f in row["findings"]
+]
+assert len(_dup_source_all_warnings) == 1, (
+    "a duplicated SOURCE language must produce exactly ONE warning across the whole sheet (it affects every "
+    "target language equally, so repeating it per language would misleadingly inflate the 'N found' count) "
+    f"— got {len(_dup_source_all_warnings)}: {_dup_source_all_warnings}"
+)
+assert "СРАЗУ ВСЕХ" in _dup_source_all_warnings[0]["message"], (
+    "a duplicated SOURCE language's warning must be worded distinctly from an ordinary duplicated target "
+    "language, since it affects every checked language's report at once"
+)
+assert _dup_source_result["summary"]["total_findings"] == 1, (
+    "the single source-duplicate warning must be counted once in the headline total, not once per language"
+)
+
+_clean_wb = openpyxl.Workbook()
+_clean_ws = _clean_wb.active
+_clean_ws.append(["Context", "en", "ru", "de"])
+_clean_ws.append(["greeting", "Hello", "Privet", "Hallo"])
+_clean_buf = io.BytesIO()
+_clean_wb.save(_clean_buf)
+_clean_buf.seek(0)
+_clean_sheets = _parse_workbook_direct(_clean_buf.read())
+assert _clean_sheets[0]["duplicate_language_columns"] == {}, (
+    "a file with no duplicated language columns must report none"
+)
+_clean_result = asyncio.run(_run_multi_check_direct(_clean_sheets, "en", ["numbers"]))
+assert not any(
+    row["excel_row"] == 0
+    for lang_findings in _clean_result["sheets"][0]["languages"].values()
+    for row in lang_findings
+), "a file with no duplicated columns must never show a duplicate-language warning"
+
+# Same behavior on the large-file (Message Batch) path — build_batch_plan
+# must carry duplicate_language_columns through its skeleton, and
+# finalize_batch_results must apply the exact same warning logic once the
+# (here: empty, no AI checks requested) batch "finishes".
+_dup_batch_requests, _dup_batch_skeleton = _dup_build_batch_plan(_dup_target_sheets, "en", ["numbers"], "", None)
+_dup_batch_result = _dup_finalize_batch_results(_dup_batch_skeleton, {})
+_dup_batch_ru_findings = _dup_batch_result["sheets"][0]["languages"]["ru"]
+assert any(
+    row["excel_row"] == 0 and any("ru" in f["message"] for f in row["findings"])
+    for row in _dup_batch_ru_findings
+), "the batch (Message Batch / large-file) path must surface the same duplicate-language warning as the live path"
+
+print("[OK] parse_workbook/run_multi_check/finalize_batch_results: a language code assigned to 2+ columns "
+      "(e.g. two columns both headed \"ru\") is deduplicated in the languages list (so it's no longer "
+      "checked, and billed, twice) and surfaced as a visible warning naming the columns involved — worded "
+      "distinctly and shown exactly once when the duplicated column is the SOURCE language (since that "
+      "affects every checked language at once), on both the live and the large-file batch check paths")
+
+# Documenting a KNOWN, ACCEPTED gap found by subagent review: if a
+# target_langs_filter ends up excluding every target language (nothing at
+# all gets checked this run), a duplicated SOURCE language's warning has
+# no language "slot" left in the RESULT to attach itself to, so it's
+# silently absent from this particular response — even though nothing was
+# actually checked or billed in that state either, and the separate
+# pre-check /multi-check/detect-languages screen (see app.main) already
+# surfaces this exact ambiguity before "start", regardless of which target
+# languages the manager ends up selecting. Not worth restructuring the
+# per-language result shape to cover a state where nothing is being
+# checked at all — this test exists so the behavior stays a deliberate,
+# understood choice rather than an unnoticed regression.
+_dup_empty_result = asyncio.run(
+    _run_multi_check_direct(_dup_source_sheets, "ru", ["numbers"], target_langs_filter=set())
+)
+assert _dup_empty_result["sheets"][0]["languages"] == {}, (
+    "with every target language filtered out, nothing should be checked at all"
+)
+print("[OK] run_multi_check: documenting the accepted trade-off — when target_langs_filter excludes every "
+      "target language, a duplicated source language's warning is absent from THIS result (nothing was "
+      "checked or billed either), relying on the separate pre-check detect-languages screen to still "
+      "surface the ambiguity before \"start\"")
+
+# --- The actual real-world consequence of the duplicate-column bug, found
+# on Александр's real file right after the warning above shipped: one of
+# his two duplicate "ru" columns is COMPLETELY EMPTY (a stray leftover
+# column), sitting to the right of the one with his real Russian source
+# text. Before this fix, "rightmost wins" meant that empty column silently
+# won on every row whenever "ru" was picked as the source language — this
+# IS his very first "Источник пусто" ("source is empty") report from
+# earlier in this project, which a merged-cells theory failed to explain
+# because it was tested with "en" as source, never "ru". A blank duplicate
+# must never win over a non-blank one; only a genuine disagreement between
+# two REAL values still falls back to rightmost-wins (still flagged to the
+# manager as a data-hygiene issue via the warning above, since THAT kind
+# of collision genuinely needs a human decision, unlike an empty column). ---
+_blank_dup_wb = openpyxl.Workbook()
+_blank_dup_ws = _blank_dup_wb.active
+_blank_dup_ws.append(["Context", "en", "ru", "de", "ru"])  # 2nd "ru" (col E) is the blank leftover
+_blank_dup_ws.append(["greeting", "Hello", "Привет", "Hallo", None])
+_blank_dup_buf = io.BytesIO()
+_blank_dup_wb.save(_blank_dup_buf)
+_blank_dup_buf.seek(0)
+_blank_dup_sheets = _parse_workbook_direct(_blank_dup_buf.read())
+assert _blank_dup_sheets[0]["rows"][0]["values"]["ru"] == "Привет", (
+    "a blank duplicate column must NEVER win over a non-blank one for the same language code — this is "
+    "the exact real bug behind Александр's original 'Источник пусто' report: an empty leftover 'ru' "
+    "column silently produced an empty source on every row just because it happened to sit further right"
+)
+# Control: when duplicate columns genuinely DISAGREE (both non-blank, real
+# but different values), rightmost-wins is still the fallback — unchanged
+# from before this fix, and still surfaced via the warning above.
+_conflict_dup_wb = openpyxl.Workbook()
+_conflict_dup_ws = _conflict_dup_wb.active
+_conflict_dup_ws.append(["Context", "en", "ru", "de", "ru"])
+_conflict_dup_ws.append(["greeting", "Hello", "Привет-C", "Hallo", "Привет-E"])
+_conflict_dup_buf = io.BytesIO()
+_conflict_dup_wb.save(_conflict_dup_buf)
+_conflict_dup_buf.seek(0)
+_conflict_dup_sheets = _parse_workbook_direct(_conflict_dup_buf.read())
+assert _conflict_dup_sheets[0]["rows"][0]["values"]["ru"] == "Привет-E", (
+    "when both duplicate columns have real, DIFFERENT text, the rightmost one must still win, exactly as "
+    "before this fix — only a blank duplicate should ever be skipped in favor of a non-blank one"
+)
+print("[OK] parse_workbook: a blank duplicate-language column never wins over a non-blank one with the "
+      "same code (the real bug behind Александр's original 'Источник пусто' report — an empty leftover "
+      "'ru' column silently beat the one with his real Russian text on every row), while two duplicate "
+      "columns that genuinely disagree still resolve to the rightmost, exactly as before")
+
+# Extra coverage recommended by subagent review of the fix above: 3+
+# duplicate columns in various blank/real orders, and a whitespace-only
+# cell (must arbitrate as blank — a real value elsewhere still wins — but
+# must NOT be silently caught by the all-blank skip below it that a
+# genuinely empty row relies on).
+_triple_dup_wb = openpyxl.Workbook()
+_triple_dup_ws = _triple_dup_wb.active
+_triple_dup_ws.append(["Context", "en", "ru", "de", "ru", "ru"])
+_triple_dup_ws.append(["blank-blank-real", "Hello", None, "Hallo", None, "Привет-real"])
+_triple_dup_ws.append(["real-blank-real", "Hello", "Привет-C", "Hallo", None, "Привет-G"])
+_triple_dup_ws.append(["blank-real-blank", "Hello", None, "Hallo", "Привет-E", None])
+_triple_dup_buf = io.BytesIO()
+_triple_dup_wb.save(_triple_dup_buf)
+_triple_dup_buf.seek(0)
+_triple_dup_sheets = _parse_workbook_direct(_triple_dup_buf.read())
+_triple_dup_rows = {row["context"]: row for row in _triple_dup_sheets[0]["rows"]}
+assert _triple_dup_rows["blank-blank-real"]["values"]["ru"] == "Привет-real", (
+    "with 3 duplicate columns (blank, blank, real), the single real value must survive regardless of "
+    "how many blanks come before it"
+)
+assert _triple_dup_rows["real-blank-real"]["values"]["ru"] == "Привет-G", (
+    "with 3 duplicate columns (real, blank, real), the two real values genuinely disagree, so the "
+    "rightmost one must win — a blank in the middle must not break that fallback"
+)
+assert _triple_dup_rows["blank-real-blank"]["values"]["ru"] == "Привет-E", (
+    "with 3 duplicate columns (blank, real, blank), the single real value in the middle must survive "
+    "despite a blank column after it"
+)
+
+_ws_dup_wb = openpyxl.Workbook()
+_ws_dup_ws = _ws_dup_wb.active
+_ws_dup_ws.append(["Context", "en", "ru", "de", "ru"])
+_ws_dup_ws.append(["whitespace vs real", "Hello", "   ", "Hallo", "Привет"])
+_ws_dup_ws.append(["all genuinely blank", None, "   ", None, "  "])
+_ws_dup_buf = io.BytesIO()
+_ws_dup_wb.save(_ws_dup_buf)
+_ws_dup_buf.seek(0)
+_ws_dup_sheets = _parse_workbook_direct(_ws_dup_buf.read())
+_ws_dup_rows = {row["context"]: row for row in _ws_dup_sheets[0]["rows"]}
+assert _ws_dup_rows["whitespace vs real"]["values"]["ru"] == "Привет", (
+    "a whitespace-only duplicate column must be treated as blank for arbitration — a real value in "
+    "another duplicate column of the same code must still win"
+)
+assert "all genuinely blank" not in _ws_dup_rows, (
+    "a row where every language's value is blank or whitespace-only (including across duplicate columns) "
+    "must still be skipped entirely, exactly as before this fix"
+)
+print("[OK] parse_workbook: 3+ duplicate columns resolve correctly in every blank/real order, and a "
+      "whitespace-only duplicate column is treated as blank for arbitration without breaking the "
+      "all-blank-row skip")
+
+# --- calibration_debug ("🔬 Тест калибровки") — Александр's ask, 2026-09-22:
+# find out whether real-world misses (found by GPT/Gemini, not by us) come
+# from the model's own knowledge gap or from CALIBRATION_BASE's "only if
+# confident" bar filtering out a correct-but-uncertain finding, by running
+# the SAME rows through the SAME model a second time with only that one bar
+# loosened (CALIBRATION_RELAXED_OPENING) and surfacing whatever it
+# additionally catches as clearly marked findings alongside the normal
+# result, instead of guessing. ---
+from app.claude_client import CALIBRATION_RELAXED_OPENING, CALIBRATION_STRICT_OPENING
+
+_cal_dbg_wb = openpyxl.Workbook()
+_cal_dbg_ws = _cal_dbg_wb.active
+_cal_dbg_ws.append(["Context", "en", "fr"])
+_cal_dbg_ws.append(["banner", "Available to users from {{country}}.", "Disponible dans les pays suivants : {{country}}."])
+_cal_dbg_buf = io.BytesIO()
+_cal_dbg_wb.save(_cal_dbg_buf)
+_cal_dbg_buf.seek(0)
+_cal_dbg_sheets = _parse_workbook_direct(_cal_dbg_buf.read())
+
+_cal_dbg_call_count = {"strict": 0, "relaxed": 0}
+
+
+async def _fake_call_claude_calibration_debug(prompt, model=None):
+    # Distinguishes the two passes purely by which calibration opening
+    # actually landed in the prompt text — proves build_batch_prompt really
+    # is swapping the confidence-bar sentence, not just being told to by
+    # the test's own bookkeeping.
+    if CALIBRATION_RELAXED_OPENING in prompt:
+        _cal_dbg_call_count["relaxed"] += 1
+        return (
+            '[{"row": 1, "type": "typo", "severity": "medium", '
+            '"message": "Похоже на искажение множественного числа с {{country}}, но не уверен(а) до конца"}]',
+            {"input_tokens": 40, "output_tokens": 20},
+            "end_turn",
+        )
+    assert CALIBRATION_STRICT_OPENING in prompt, "every non-debug prompt must still carry the normal strict opening"
+    _cal_dbg_call_count["strict"] += 1
+    return "[]", {"input_tokens": 40, "output_tokens": 5}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_calibration_debug
+_cal_dbg_result = asyncio.run(
+    _run_multi_check_direct(_cal_dbg_sheets, "en", ["typo"], calibration_debug=True)
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _cal_dbg_call_count == {"strict": 1, "relaxed": 1}, (
+    f"calibration_debug=True must call the AI exactly once with the strict opening and once with the relaxed "
+    f"one per language — got {_cal_dbg_call_count}"
+)
+_cal_dbg_fr_findings = _cal_dbg_result["sheets"][0]["languages"]["fr"]
+_cal_dbg_all = [f for row in _cal_dbg_fr_findings for f in row["findings"]]
+assert len(_cal_dbg_all) == 1, f"expected exactly the one relaxed-pass finding (strict pass found nothing) — got {_cal_dbg_all}"
+assert _cal_dbg_all[0]["calibration_debug"] is True, "the relaxed-pass finding must be tagged calibration_debug=True"
+assert _cal_dbg_all[0]["message"].startswith("🔬 "), "the relaxed-pass finding's message must be visibly prefixed"
+assert _cal_dbg_result["summary"]["total_findings"] == 0, (
+    "calibration_debug findings must NOT be counted in the headline total_findings — otherwise merely ticking "
+    "the debug checkbox would make an unchanged file look like it suddenly has more problems"
+)
+assert _cal_dbg_result["summary"]["calibration_debug_findings"] == 1, (
+    "the debug-only findings must still be counted separately, in their own summary field"
+)
+assert _cal_dbg_result["summary"]["calibration_debug_cost_usd"] > 0, (
+    "the extra relaxed-pass API call must show up as its own, separately reported cost"
+)
+assert _cal_dbg_result["summary"]["cost_usd"] >= _cal_dbg_result["summary"]["calibration_debug_cost_usd"], (
+    "the debug pass's cost must still be folded into the run's real total cost_usd, not hidden from it"
+)
+
+# Control: with calibration_debug left at its default (False), only the
+# strict pass ever runs — no second call, no debug fields at all in the
+# summary, and the behavior is byte-for-byte what it was before this
+# feature existed.
+_cal_dbg_call_count["strict"] = 0
+_cal_dbg_call_count["relaxed"] = 0
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_calibration_debug
+_cal_dbg_off_result = asyncio.run(_run_multi_check_direct(_cal_dbg_sheets, "en", ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _cal_dbg_call_count == {"strict": 1, "relaxed": 0}, (
+    "without calibration_debug, the relaxed pass must never run at all — no extra cost, no extra calls"
+)
+assert "calibration_debug_cost_usd" not in _cal_dbg_off_result["summary"], (
+    "the debug-only summary fields must be entirely absent (not just zero) when the feature wasn't used"
+)
+assert "calibration_debug_findings" not in _cal_dbg_off_result["summary"]
+print("[OK] calibration_debug (\"🔬 Тест калибровки\"): a second AI pass with only the confidence-bar sentence "
+      "swapped (CALIBRATION_RELAXED_OPENING) runs alongside the normal strict pass, its extra findings are "
+      "clearly tagged and message-prefixed, excluded from the headline 'N проблем' count but reported in their "
+      "own separate finding/cost totals that still fold into the run's real total cost — and none of this runs "
+      "at all (zero extra calls, zero extra summary fields) unless the feature is explicitly turned on")
+
+# Subagent review (2026-09-22) caught a real contamination bug: "register"
+# reporting isn't confidence-gated by CALIBRATION_BASE at all (it's "report
+# what's there", not "only if sure"), so a "mixed" register value the
+# RELAXED pass happens to report has no business showing up as a 🔬
+# calibration-comparison finding — it would falsely look like "the relaxed
+# pass caught an extra problem" when it's really just AI response
+# variance on a completely unrelated, non-confidence-gated question.
+from app.claude_client import REGISTER_MIXED_TYPE as _REG_MIXED_TYPE
+
+_cal_reg_wb = openpyxl.Workbook()
+_cal_reg_ws = _cal_reg_wb.active
+_cal_reg_ws.append(["Context", "en", "ru"])
+_cal_reg_ws.append(["greeting", "Hello", "Здравствуйте"])
+_cal_reg_buf = io.BytesIO()
+_cal_reg_wb.save(_cal_reg_buf)
+_cal_reg_buf.seek(0)
+_cal_reg_sheets = _parse_workbook_direct(_cal_reg_buf.read())
+
+
+async def _fake_call_claude_calibration_debug_register(prompt, model=None):
+    # Strict pass reports an ordinary, single-value tone ("formal") — no
+    # register_mixed finding should come from it. Relaxed pass reports
+    # "mixed" for the same row — this must NOT surface as a 🔬 finding.
+    if CALIBRATION_RELAXED_OPENING in prompt:
+        return (
+            f'[{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
+            {"input_tokens": 20, "output_tokens": 10},
+            "end_turn",
+        )
+    return (
+        f'[{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal", "message": ""}}]',
+        {"input_tokens": 20, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_calibration_debug_register
+_cal_reg_result = asyncio.run(
+    _run_multi_check_direct(_cal_reg_sheets, "en", ["register"], calibration_debug=True)
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+_cal_reg_ru_findings = _cal_reg_result["sheets"][0]["languages"]["ru"]
+_cal_reg_all = [f for row in _cal_reg_ru_findings for f in row["findings"]]
+assert not any(f.get("calibration_debug") for f in _cal_reg_all), (
+    f"a register value from the relaxed pass must never surface as a 🔬 calibration_debug finding — register "
+    f"reporting isn't confidence-gated, so it's not part of what this feature compares — got {_cal_reg_all}"
+)
+assert not any(f.get("type") == _REG_MIXED_TYPE and f.get("calibration_debug") for f in _cal_reg_all), (
+    "specifically: a 'mixed' value from the relaxed pass must be dropped, not turned into a tagged "
+    "register_mixed finding"
+)
+# The strict pass's own real "formal" value must still work normally —
+# producing the ordinary register_summary block, unaffected by any of this.
+_cal_reg_summary_findings = [f for row in _cal_reg_ru_findings if row["excel_row"] == 0 for f in row["findings"]]
+assert any(f.get("type") == "register_summary" for f in _cal_reg_summary_findings), (
+    f"the strict pass's own register value must still produce a normal register_summary — got {_cal_reg_ru_findings}"
+)
+print("[OK] calibration_debug + register: a 'mixed' register value reported ONLY by the relaxed pass is "
+      "correctly discarded rather than surfaced as a 🔬 finding (register reporting isn't confidence-gated, "
+      "so it's outside what this feature is meant to compare), while the strict pass's own register_summary "
+      "is completely unaffected")
 
 print("\nALL SMOKETEST CHECKS PASSED")

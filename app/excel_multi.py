@@ -11,6 +11,7 @@ import re
 import openpyxl
 
 from app.claude_client import (
+    REGISTER_MIXED_TYPE,
     REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
@@ -550,10 +551,52 @@ def parse_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -
         if not lang_cols:
             continue
 
+        # A language code assigned to 2+ columns (e.g. two columns both
+        # headed "ru") is a real structural ambiguity, not just cosmetic —
+        # the per-row `values` dict comprehension just below can only keep
+        # ONE column's value per code, and silently lets the rightmost
+        # column win with no record anywhere that the other one was
+        # dropped. Recorded here (column order preserved) so callers can
+        # warn the manager about it instead of leaving it invisible —
+        # caught live on Александр's real file (2026-09-22): a duplicated
+        # "ru" header at both C1 and AA1, which doubled his "missing
+        # translation" findings for ru and quietly discarded whichever
+        # column wasn't C1/rightmost — see _duplicate_language_warning.
+        col_letters_by_code: dict[str, list[str]] = {}
+        for c, code in lang_cols.items():
+            col_letters_by_code.setdefault(code, []).append(openpyxl.utils.get_column_letter(c))
+        duplicate_language_columns = {
+            code: letters for code, letters in col_letters_by_code.items() if len(letters) > 1
+        }
+
         rows = []
         last_context = ""
         for r in range(header_row + 1, ws.max_row + 1):
-            values = {code: ws.cell(row=r, column=c).value for c, code in lang_cols.items()}
+            # When a code maps to 2+ columns (see duplicate_language_columns
+            # above), a plain {code: ...} dict comprehension over lang_cols
+            # would just let the LAST column blindly overwrite every earlier
+            # one, blank or not — and that's exactly how a real, actively
+            # used bug hid for this long: Александр's real file has a
+            # completely empty second "ru" column sitting to the right of
+            # the one with his actual Russian text, so "rightmost wins"
+            # silently produced an EMPTY source for every single row
+            # whenever "ru" was picked as the source language — this is the
+            # true cause of his very first "Источник пусто" report from
+            # earlier in this project, not merged cells as first suspected.
+            # A blank duplicate column is essentially never the intended
+            # one, so this instead keeps the last NON-BLANK value seen,
+            # falling back to blank only if every duplicate for that code is
+            # genuinely blank on this row. Columns that actually DISAGREE
+            # (two different real values) still resolve to the rightmost —
+            # unchanged from before, and still flagged to the manager via
+            # duplicate_language_columns/the warning it drives, since THAT
+            # kind of collision genuinely needs a human decision.
+            values: dict[str, object] = {}
+            for c, code in lang_cols.items():
+                v = ws.cell(row=r, column=c).value
+                is_blank = v is None or str(v).strip() == ""
+                if code not in values or not is_blank:
+                    values[code] = v
             if all(v is None or str(v).strip() == "" for v in values.values()):
                 continue
 
@@ -581,9 +624,17 @@ def parse_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -
 
         sheets.append({
             "sheet_name": sheet_name,
-            "languages": sorted(lang_cols.values()),
+            # Deduplicated — a code appearing in 2+ columns must not appear
+            # twice in this list. Before this fix it did, and every caller
+            # that builds `target_langs` from it (run_multi_check,
+            # estimate_check_volume, build_batch_plan) would check that one
+            # language TWICE — doubling both its AI cost and its findings —
+            # on top of the ambiguity `duplicate_language_columns` itself
+            # already warns about.
+            "languages": sorted(set(lang_cols.values())),
             "rows": rows,
             "unrecognized_columns": unrecognized,
+            "duplicate_language_columns": duplicate_language_columns,
         })
 
     return sheets
@@ -611,6 +662,90 @@ def pick_source_lang(sheets: list[dict], preferred: str | None) -> str:
     if "en" in all_langs:
         return "en"
     return sorted(all_langs)[0] if all_langs else "en"
+
+
+def _duplicate_language_warning(code: str, columns: list[str], is_source: bool) -> dict:
+    """Same synthetic-finding pattern as _truncation_warning/
+    _ai_failure_warning (a "type": "system" entry, already rendered by the
+    frontend with its own "⚠ Внимание" badge — no UI change needed) —
+    makes an otherwise silent multi-column ambiguity visible instead of
+    just looking like ordinary clean data.
+
+    `columns` is in left-to-right sheet order (see parse_workbook). Which
+    column's value actually gets used is now decided PER ROW there — a
+    blank duplicate never wins over a non-blank one, only a genuine
+    disagreement between two non-blank values falls back to "rightmost
+    wins" — so this message can no longer name a single fixed "used"
+    column the way it used to; it describes the rule instead. That
+    per-row resolution is exactly what fixed Александр's real "Источник
+    пусто" bug (2026-09): a totally empty second "ru" column, to the
+    right of the one with his actual Russian text, used to silently win
+    every row just for being rightmost."""
+    if is_source:
+        intro = (
+            f"Внимание: в файле несколько столбцов помечены как исходный язык «{code}» "
+            f"(столбцы {', '.join(columns)}). Это влияет на проверку СРАЗУ ВСЕХ языков перевода в этом "
+            f"листе — показано здесь один раз. "
+        )
+    else:
+        intro = (
+            f"В файле несколько столбцов с одинаковым языковым кодом «{code}» "
+            f"(столбцы {', '.join(columns)}). "
+        )
+    return {
+        "type": "system",
+        "severity": "high",
+        "message": (
+            intro
+            + f"Платформа не может определить, какой из них правильный. Для каждой строки используется "
+              f"непустое значение (если пустая только одна из колонок — берётся та, где есть текст), а "
+              f"если заполнены обе и текст в них отличается — используется самая правая колонка, "
+              f"{columns[-1]}. Проверьте, пожалуйста, структуру файла — возможно, один из этих столбцов "
+              f"лишний или назван неправильно."
+        ),
+    }
+
+
+# KNOWN GAP (low severity, caught by subagent review): both callers
+# (run_multi_check, finalize_batch_results) only ever invoke the function
+# below once per language actually being checked. If the manager's
+# target_langs_filter ends up excluding every target language (or the file
+# genuinely has none besides the duplicated source), there's no language
+# "slot" left to attach the source's warning to, and it's silently absent
+# from the check RESULT — though nothing was actually checked or billed in
+# that state either, and the pre-check /multi-check/detect-languages screen
+# (see app.main) already shows this exact ambiguity before "start"
+# regardless of which target languages end up selected. Not worth
+# restructuring the per-language result shape to cover a case where
+# nothing is being checked at all.
+def _apply_duplicate_language_warnings(
+    findings_list: list[dict],
+    lang: str,
+    duplicate_language_columns: dict[str, list[str]],
+    source_lang: str,
+    show_source_warning: bool,
+) -> list[dict]:
+    """Appends a synthetic warning "row" (excel_row=0, same pattern as the
+    truncation/AI-failure warnings) for any duplicate-header ambiguity that
+    affects THIS language's own check — its own column is duplicated, or
+    (once per sheet, via `show_source_warning`) the shared source column
+    is duplicated, which affects every language equally."""
+    warnings = []
+    if lang in duplicate_language_columns:
+        warnings.append(_duplicate_language_warning(lang, duplicate_language_columns[lang], is_source=False))
+    if show_source_warning and source_lang in duplicate_language_columns:
+        warnings.append(
+            _duplicate_language_warning(source_lang, duplicate_language_columns[source_lang], is_source=True)
+        )
+    if not warnings:
+        return findings_list
+    return findings_list + [{
+        "excel_row": 0,
+        "context": "⚠ Системное предупреждение",
+        "source": "",
+        "translation": "",
+        "findings": warnings,
+    }]
 
 
 def _extract_register_values(grouped: dict[int, list[dict]]) -> tuple[dict[int, list[dict]], dict[int, str]]:
@@ -696,12 +831,18 @@ def _count_real_findings(findings_list: list[dict]) -> int:
     not 1 per language — counting it here would contradict the whole point
     of dropping the old pass/fail tone-of-address judgment. Truncation/
     AI-failure warnings (type "system") are deliberately still counted —
-    those genuinely are something the manager needs to notice."""
+    those genuinely are something the manager needs to notice.
+
+    Also excludes calibration_debug findings (see
+    _mark_calibration_debug_findings) — those are a separate, opt-in test
+    signal shown alongside the real result, not part of it; counting them
+    here would make turning on "🔬 Тест калибровки" alone inflate "N
+    проблем" and look like the file got worse, which it didn't."""
     return sum(
         1
         for row in findings_list
         for f in row["findings"]
-        if f.get("type") != "register_summary"
+        if f.get("type") != "register_summary" and not f.get("calibration_debug")
     )
 
 
@@ -745,39 +886,27 @@ def _register_summary_block(report: dict | None) -> dict | None:
     }
 
 
-async def _check_language_for_sheet(
-    sheet: dict,
-    lang: str,
-    source_lang: str,
+async def _run_ai_chunks(
+    item_chunks: list[list[dict]],
     checks: list[str],
     extra_instructions: str,
+    lang: str,
+    source_lang: str,
     semaphore: asyncio.Semaphore,
-) -> tuple[list[dict], float]:
-    relevant_rows = []
-    ai_items = []
-    for row in sheet["rows"]:
-        src = row["values"].get(source_lang, "")
-        tgt = row["values"].get(lang, "")
-        if not src.strip() and not tgt.strip():
-            continue
-        if _is_do_not_translate(tgt):
-            continue
-        relevant_rows.append(row)
-        ai_items.append({"context": row["context"], "source": src, "translation": tgt})
-
-    if not relevant_rows:
-        return [], 0.0
-
-    # See MAX_ROWS_PER_AI_CALL above — one big AI call covering the whole
-    # language is split into several smaller ones instead, each still
-    # bounded by the same shared semaphore (so the total number of AI calls
-    # in flight at once across the whole upload is unaffected by chunking,
-    # only how many rows any single call has to hold at once).
-    item_chunks = _chunk_list(ai_items, MAX_ROWS_PER_AI_CALL)
-
+    relaxed: bool = False,
+) -> tuple[dict[int, list[dict]], float, bool]:
+    """Runs every chunk of one language's items through the AI (bounded by
+    the shared semaphore) and merges the per-chunk results back into a
+    single {item index: findings} dict, with "_also_idx" indices shifted to
+    match. Factored out of _check_language_for_sheet so the calibration
+    debug pass (relaxed=True — see claude_client._calibration) can reuse
+    the exact same chunking/merging logic as the normal, production pass
+    instead of a second hand-rolled copy of it."""
     async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool]:
         async with semaphore:
-            return await run_ai_checks_batch(chunk_items, checks, extra_instructions, lang, source_lang)
+            return await run_ai_checks_batch(
+                chunk_items, checks, extra_instructions, lang, source_lang, relaxed=relaxed,
+            )
 
     chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
 
@@ -801,8 +930,99 @@ async def _check_language_for_sheet(
         truncated = truncated or chunk_truncated
         offset += len(chunk_items)
 
+    return ai_findings_by_idx, cost_usd, truncated
+
+
+def _mark_calibration_debug_findings(findings: list[dict]) -> list[dict]:
+    """Tags each finding from the relaxed-calibration debug pass (see
+    calibration_debug below) so it's visibly distinct from a normal,
+    production finding wherever findings get rendered — both a
+    machine-readable "calibration_debug": True field (for the frontend, if
+    it wants to style these differently) and a plain-text prefix on the
+    message itself (so it's unmistakable even in the .xlsx report export,
+    which just prints "message" as-is)."""
+    out = []
+    for f in findings:
+        f = dict(f)
+        f["calibration_debug"] = True
+        f["message"] = "🔬 [Тест: мягкая калибровка, не обычный результат] " + str(f.get("message", ""))
+        out.append(f)
+    return out
+
+
+async def _check_language_for_sheet(
+    sheet: dict,
+    lang: str,
+    source_lang: str,
+    checks: list[str],
+    extra_instructions: str,
+    semaphore: asyncio.Semaphore,
+    calibration_debug: bool = False,
+) -> tuple[list[dict], float, float]:
+    """Returns (rows-with-findings, production cost_usd, extra cost_usd
+    spent on the calibration_debug pass — always 0.0 when
+    calibration_debug is False)."""
+    relevant_rows = []
+    ai_items = []
+    for row in sheet["rows"]:
+        src = row["values"].get(source_lang, "")
+        tgt = row["values"].get(lang, "")
+        if not src.strip() and not tgt.strip():
+            continue
+        if _is_do_not_translate(tgt):
+            continue
+        relevant_rows.append(row)
+        ai_items.append({"context": row["context"], "source": src, "translation": tgt})
+
+    if not relevant_rows:
+        return [], 0.0, 0.0
+
+    # See MAX_ROWS_PER_AI_CALL above — one big AI call covering the whole
+    # language is split into several smaller ones instead, each still
+    # bounded by the same shared semaphore (so the total number of AI calls
+    # in flight at once across the whole upload is unaffected by chunking,
+    # only how many rows any single call has to hold at once).
+    item_chunks = _chunk_list(ai_items, MAX_ROWS_PER_AI_CALL)
+
+    ai_findings_by_idx, cost_usd, truncated = await _run_ai_chunks(
+        item_chunks, checks, extra_instructions, lang, source_lang, semaphore, relaxed=False,
+    )
     ai_findings_by_idx = _resolve_repeated_findings(ai_findings_by_idx, relevant_rows)
     ai_findings_by_idx, register_values_by_idx = _extract_register_values(ai_findings_by_idx)
+
+    # Александр's ask, 2026-09-22: find out whether real-world misses (found
+    # by GPT/Gemini, not by us) come from the model's own knowledge gap or
+    # from CALIBRATION_BASE's "only if confident" bar filtering out a
+    # correct-but-uncertain finding — by running the SAME model, on the SAME
+    # rows, a second time with only that one confidence bar loosened (see
+    # claude_client.CALIBRATION_RELAXED_OPENING), and showing whatever it
+    # additionally catches right alongside the normal result instead of
+    # guessing. Deliberately NOT scoped to "hard" languages only — the
+    # French {{country}} miss he wants covered too is on the ordinary model.
+    debug_cost_usd = 0.0
+    ai_findings_by_idx_relaxed: dict[int, list[dict]] = {}
+    debug_truncated = False
+    if calibration_debug:
+        ai_findings_by_idx_relaxed, debug_cost_usd, debug_truncated = await _run_ai_chunks(
+            item_chunks, checks, extra_instructions, lang, source_lang, semaphore, relaxed=True,
+        )
+        ai_findings_by_idx_relaxed = _resolve_repeated_findings(ai_findings_by_idx_relaxed, relevant_rows)
+        ai_findings_by_idx_relaxed, _ = _extract_register_values(ai_findings_by_idx_relaxed)
+        # _extract_register_values already strips raw REGISTER_VALUE_TYPE
+        # entries, but a "mixed" value is turned INTO a visible
+        # REGISTER_MIXED_TYPE finding right inside that same function (see
+        # its own docstring) — register reporting isn't confidence-gated by
+        # CALIBRATION_BASE at all (it's "report what's there", not "only if
+        # sure"), so it has no business in a calibration comparison. Left
+        # in, it would either falsely look like "the relaxed pass caught an
+        # extra problem" (subagent review, 2026-09-22) or show as a
+        # confusing duplicate 🔬 copy right next to the strict pass's own,
+        # identical register_mixed finding for the same row.
+        ai_findings_by_idx_relaxed = {
+            idx: [f for f in findings if f.get("type") != REGISTER_MIXED_TYPE]
+            for idx, findings in ai_findings_by_idx_relaxed.items()
+        }
+        ai_findings_by_idx_relaxed = {idx: fs for idx, fs in ai_findings_by_idx_relaxed.items() if fs}
 
     out = []
     for idx, row in enumerate(relevant_rows):
@@ -810,6 +1030,8 @@ async def _check_language_for_sheet(
         tgt = row["values"].get(lang, "")
         findings = run_rule_checks(src, tgt, checks, max_length=row["max_length"], lang_code=lang)
         findings += ai_findings_by_idx.get(idx, [])
+        if calibration_debug:
+            findings += _mark_calibration_debug_findings(ai_findings_by_idx_relaxed.get(idx, []))
         if findings:
             out.append({
                 "excel_row": row["excel_row"],
@@ -831,6 +1053,22 @@ async def _check_language_for_sheet(
             "translation": "",
             "findings": [_truncation_warning()],
         })
+    if calibration_debug and debug_truncated:
+        out.append({
+            "excel_row": 0,
+            "context": "⚠ Системное предупреждение",
+            "source": "",
+            "translation": "",
+            "findings": [{
+                "type": "system",
+                "severity": "low",
+                "message": (
+                    "🔬 Тестовый прогон с мягкой калибровкой для этого языка был обрезан из-за большого "
+                    "объёма — часть строк могла остаться непроверенной именно в тестовом (не обычном) "
+                    "проходе."
+                ),
+            }],
+        })
     if "register" in checks:
         by_excel_row = {relevant_rows[idx]["excel_row"]: v for idx, v in register_values_by_idx.items()}
         texts_by_excel_row = {
@@ -840,7 +1078,7 @@ async def _check_language_for_sheet(
         block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
         if block is not None:
             out.append(block)
-    return out, cost_usd
+    return out, cost_usd, debug_cost_usd
 
 
 async def run_multi_check(
@@ -849,6 +1087,7 @@ async def run_multi_check(
     checks: list[str],
     extra_instructions: str = "",
     target_langs_filter: set[str] | None = None,
+    calibration_debug: bool = False,
 ) -> dict:
     """
     Each target language gets its own AI call, so the prompt for e.g.
@@ -857,28 +1096,50 @@ async def run_multi_check(
     target_langs_filter: when given, only these languages are checked even
     if the file has more columns — lets a manager check a subset of a
     large upload instead of every language every time.
+
+    calibration_debug: see _check_language_for_sheet's own comment — runs
+    every language's AI check a SECOND time with a loosened confidence bar
+    (same model, same rows), and adds whatever that extra pass catches to
+    the report as clearly marked "🔬" findings, so the two passes can be
+    compared side by side. This roughly doubles the AI cost of the run
+    (summary["calibration_debug_cost_usd"] shows exactly how much of the
+    total came from this extra pass) — off by default, only for a
+    deliberate one-off comparison, never for routine checking.
     """
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
     total_findings = 0
+    total_debug_findings = 0
     total_rows_checked = 0
     total_cost_usd = 0.0
+    total_debug_cost_usd = 0.0
 
     for sheet in sheets:
         target_langs = [l for l in sheet["languages"] if l != source_lang]
         if target_langs_filter is not None:
             target_langs = [l for l in target_langs if _lang_selected(l, target_langs_filter)]
         tasks = [
-            _check_language_for_sheet(sheet, lang, source_lang, checks, extra_instructions, semaphore)
+            _check_language_for_sheet(
+                sheet, lang, source_lang, checks, extra_instructions, semaphore,
+                calibration_debug=calibration_debug,
+            )
             for lang in target_langs
         ]
         per_lang_results = await asyncio.gather(*tasks) if tasks else []
 
+        dup_cols = sheet.get("duplicate_language_columns") or {}
         languages_out = {}
-        for lang, (findings_list, lang_cost) in zip(target_langs, per_lang_results):
+        for lang, (findings_list, lang_cost, lang_debug_cost) in zip(target_langs, per_lang_results):
+            findings_list = _apply_duplicate_language_warnings(
+                findings_list, lang, dup_cols, source_lang, show_source_warning=(lang == target_langs[0]),
+            )
             languages_out[lang] = findings_list
             total_findings += _count_real_findings(findings_list)
-            total_cost_usd += lang_cost
+            total_debug_findings += sum(
+                1 for row in findings_list for f in row["findings"] if f.get("calibration_debug")
+            )
+            total_cost_usd += lang_cost + lang_debug_cost
+            total_debug_cost_usd += lang_debug_cost
 
         total_rows_checked += len(sheet["rows"])
         result_sheets.append({
@@ -896,6 +1157,9 @@ async def run_multi_check(
         "total_findings": total_findings,
         "cost_usd": total_cost_usd,
     }
+    if calibration_debug:
+        summary["calibration_debug_cost_usd"] = total_debug_cost_usd
+        summary["calibration_debug_findings"] = total_debug_findings
     return {"sheets": result_sheets, "summary": summary}
 
 
@@ -1040,6 +1304,7 @@ def build_batch_plan(
             "target_langs": target_langs,
             "languages": languages_skeleton,
             "unrecognized_columns": sheet.get("unrecognized_columns", []),
+            "duplicate_language_columns": sheet.get("duplicate_language_columns", {}),
             "row_count": len(sheet["rows"]),
         })
 
@@ -1071,6 +1336,8 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
 
     for sheet in skeleton["sheets"]:
         languages_out = {}
+        dup_cols = sheet.get("duplicate_language_columns") or {}
+        first_target_lang = (sheet.get("target_langs") or [None])[0]
         for lang, lang_skel in sheet["languages"].items():
             # One chunk's problem (missing/errored/truncated — see below)
             # never throws away another chunk's perfectly good findings;
@@ -1196,6 +1463,10 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                 block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
                 if block is not None:
                     findings_list.append(block)
+            findings_list = _apply_duplicate_language_warnings(
+                findings_list, lang, dup_cols, skeleton["source_lang"],
+                show_source_warning=(lang == first_target_lang),
+            )
             languages_out[lang] = findings_list
             total_findings += _count_real_findings(findings_list)
 

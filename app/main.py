@@ -587,7 +587,7 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     above) — read-only: just parses the file and reports what's in it,
     doesn't run any check, store anything, or touch the catalog itself.
 
-    Three buckets, not two:
+    Four buckets, not three:
     - languages: column headers that look like a language code AND match
       something already in the project's catalog (via the same safe
       resolve_lang_code bridging used everywhere else) — these become
@@ -603,12 +603,22 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     - unrecognized_columns: headers that don't even look like a language
       code at all (e.g. "Task name") — unrelated to the catalog, exactly
       as before.
+    - duplicate_languages: a language code assigned to 2+ columns (e.g. two
+      columns both headed "ru") — a real structural ambiguity, since only
+      one of them can actually be used per row (see parse_workbook's
+      col_letters_by_code). Caught live on Александр's real file
+      (2026-09-22): a duplicated "ru" header doubled his "missing
+      translation" findings for ru and silently discarded one column's
+      data with no record of it anywhere. The same ambiguity is ALSO
+      flagged after a check runs (see _duplicate_language_warning in
+      app.excel_multi) in case it isn't noticed here first — but catching
+      it here means before any AI-backed check has been paid for.
 
     Given back before the manager presses "start" instead of only
-    surfacing inside a finished report, so any of the three situations
-    above can be caught and fixed up front — rather than only noticed
-    afterward, by which point an AI-backed check may already have been
-    paid for without ever having covered the language that needed it."""
+    surfacing inside a finished report, so any of these situations can be
+    caught and fixed up front — rather than only noticed afterward, by
+    which point an AI-backed check may already have been paid for without
+    ever having covered the language that needed it."""
     _get_project(project_id, db)
     file_bytes = await file.read()
     try:
@@ -617,9 +627,12 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
     langs: set[str] = set()
     unrecognized: set[str] = set()
+    duplicates: dict[str, list[str]] = {}
     for s in sheets:
         langs.update(s["languages"])
         unrecognized.update(s.get("unrecognized_columns", []))
+        for code, cols in (s.get("duplicate_language_columns") or {}).items():
+            duplicates.setdefault(code, []).append(f"{s['sheet_name']}: {', '.join(cols)}")
 
     catalog = {
         row[0]
@@ -637,6 +650,7 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
         "languages": merge_lang_codes(known),
         "unknown_languages": sorted(unknown),
         "unrecognized_columns": sorted(unrecognized),
+        "duplicate_languages": duplicates,
     }
 
 
@@ -737,6 +751,13 @@ async def multi_check(
     # an hour. Costs 2x (the batch queue is exactly half price — see
     # claude_client.BATCH_PRICE_DISCOUNT — so skipping it is full price).
     urgent: bool = Form(False),
+    # "🔬 Тест калибровки" checkbox — see excel_multi.run_multi_check's own
+    # comment. Doubles the AI cost of this one run (shown separately as
+    # calibration_debug_cost_usd in the response) and, like "urgent", forces
+    # the live path even for a job that would otherwise queue — a debug
+    # comparison is a deliberate one-off, not something to leave waiting an
+    # hour in the batch queue.
+    calibration_debug: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     # Captured up front (rather than relying on created_at's own
@@ -771,10 +792,10 @@ async def multi_check(
     # its full, non-discounted price) regardless of size.
     volume = estimate_check_volume(sheets, resolved_source, target_filter)
 
-    if urgent or volume <= BATCH_THRESHOLD_CHARS:
+    if urgent or calibration_debug or volume <= BATCH_THRESHOLD_CHARS:
         results = await run_multi_check(
             sheets, resolved_source, selected_checks, extra_instructions,
-            target_filter,
+            target_filter, calibration_debug=calibration_debug,
         )
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
