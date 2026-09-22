@@ -2995,4 +2995,202 @@ print("[OK] _count_real_findings excludes the synthetic register_summary report 
       "count everywhere it's used, while still counting real findings, system warnings, and "
       "register_mixed findings")
 
+# --- letter-run placeholder + grammatical suffix glued on with no space
+# (Александр's ask, 2026-09-22): Korean/Turkic-style agglutination attaches
+# a case/particle ending directly onto a letter-run placeholder with no
+# separating space. The old regex required a trailing \b, and Unicode word
+# characters (Hangul included) never form a boundary against the
+# placeholder's own Latin letters, so the run went completely unmatched in
+# the translation and was reported as "lost" even though it's genuinely
+# there.
+from app.rule_checks import (
+    check_em_dash_spacing,
+    check_hyphen_for_dash,
+    check_letter_placeholders,
+    check_punctuation,
+)
+
+korean_src = (
+    "A specialized collection of games by XXXXXXXXXXXXXXXXXXXX is now accessible on your account."
+)
+korean_tr = "XXXXXXXXXXXXXXXXXXXX의 엄선된 게임 컬렉션을 이제 계정에서 이용할 수 있습니다."
+assert check_letter_placeholders(korean_src, korean_tr) == [], (
+    "a letter-run placeholder with a grammatical suffix glued directly onto it (no space) must still be "
+    "recognized as present, not reported as lost"
+)
+# a Turkic-style possessive/case suffix glued the same way
+assert check_letter_placeholders("Your code: XXXXXXXX", "Kodunuz: XXXXXXXXniz") == [], (
+    "the same glued-suffix tolerance must hold for a Latin-script agglutinative suffix, not just Hangul"
+)
+# genuinely dropped placeholder must still be caught even with a suffix language in play
+assert check_letter_placeholders("Your code: XXXXXXXX", "Kodunuz hazır") != [], (
+    "a placeholder actually missing from the translation must still be flagged — the suffix fix must not "
+    "make the check blind to real drops"
+)
+print("[OK] check_letter_placeholders: a grammatical suffix glued directly onto a letter-run placeholder "
+      "with no space (Korean, Turkic, ...) no longer produces a false \"placeholder lost\" finding, while a "
+      "genuinely dropped placeholder is still caught")
+
+# Regression caught in review of the first version of this fix: loosening
+# _PLACEHOLDER_LETTER_RUN_RE itself (dropping its trailing \b) also made it
+# match the first 4+ letters of any ordinary word that happens to start
+# with a repeated letter and continue as the same word — an informal
+# elongated-emphasis spelling ("оооочень"), or a marketing "WOOOOW". Fixed
+# by leaving the regex exactly as strict as before and instead doing a
+# plain, boundary-free substring check for the specific already-known
+# source text — these must stay clean.
+assert check_letter_placeholders("This offer is amazing!", "Это оооочень крутое предложение!") == [], (
+    "an ordinary word that happens to start with 4+ of the same letter (informal emphasis) must not be "
+    "misread as a letter-run placeholder"
+)
+assert check_letter_placeholders("Wow, big win!", "WOOOOW, большой выигрыш!") == [], (
+    "an all-caps elongated exclamation (\"WOOOOW\") must not be misread as a letter-run placeholder either"
+)
+print("[OK] check_letter_placeholders: the glued-suffix fix does not loosen the underlying regex, so an "
+      "ordinary word starting with a repeated letter (informal emphasis, \"WOOOOW\"-style exclamations) is "
+      "still correctly left alone")
+
+# Regression caught in review: the glued-suffix survival check must not
+# credit the SAME physical occurrence of a repeated placeholder text to
+# more than one leftover entry — a naive "is this text anywhere in the
+# translation" test would let a surviving copy silently mask a genuinely
+# DIFFERENT, separately-dropped occurrence of the identical placeholder
+# (e.g. two masked card numbers both shown as "XXXXXXXX").
+dup_one_dropped = check_letter_placeholders(
+    "Card 1: XXXXXXXX. Card 2: XXXXXXXX.", "Karta 1: XXXXXXXX. Karta 2 nomeri yashirin."
+)
+assert dup_one_dropped != [], (
+    "when the same placeholder text appears twice in the source and only one copy survives in the "
+    "translation, the genuinely dropped second copy must still be flagged"
+)
+assert check_letter_placeholders(
+    "Card 1: XXXXXXXX. Card 2: XXXXXXXX.", "Karta1: XXXXXXXXbb. Karta2: XXXXXXXXcc."
+) == [], "but when BOTH copies survive, each with its own glued suffix, neither should be flagged"
+print("[OK] check_letter_placeholders: the glued-suffix survival check correctly tracks each occurrence of a "
+      "repeated placeholder text separately, instead of one surviving copy masking a different dropped one")
+
+# Regression caught in review: counting "glued survivors" with a plain
+# text.count(run) can't tell a genuine SHORT placeholder from that many
+# letters sitting INSIDE an unrelated LONGER run of the same letter — a
+# surviving 16-letter masked card number textually contains every possible
+# 4-letter substring of "X", so a bare substring count wrongly credited a
+# completely different, genuinely-dropped 4-letter PIN placeholder as
+# still present.
+diff_length_dropped = check_letter_placeholders(
+    "Card: XXXXXXXXXXXXXXXX. PIN: XXXX.", "Karta: XXXXXXXXXXXXXXXX. PIN otsutstvuet."
+)
+assert diff_length_dropped != [], (
+    "a genuinely dropped SHORT placeholder must still be flagged even when a longer run of the identical "
+    "letter survives elsewhere in the same translation"
+)
+assert check_letter_placeholders(
+    "Card: XXXXXXXXXXXXXXXX. PIN: XXXX.", "Karta: XXXXXXXXXXXXXXXX. PIN: XXXXqo."
+) == [], "but when the short placeholder genuinely survives too (glued), it must not be flagged"
+print("[OK] check_letter_placeholders: the glued-suffix survival check counts MAXIMAL same-length runs, not "
+      "plain substrings, so a shorter placeholder's genuine loss isn't masked by an unrelated longer run of "
+      "the same letter surviving elsewhere")
+
+# --- check_punctuation: bidirectional terminal-punctuation detection, past
+# trailing wrappers (Александр's ask, 2026-09-22: "не всегда видит
+# присутствие/отсутствие... знака"). Two real bugs confirmed empirically
+# and fixed: (1) translation ADDING an unwarranted terminal mark when the
+# source has none was never checked at all; (2) naive src[-1]/tr[-1]
+# indexing missed a genuinely dropped mark whenever it was followed by a
+# trailing tag/placeholder/closing quote.
+assert any(f["type"] == "punctuation" for f in check_punctuation("Play now", "Играйте сейчас.")), (
+    "translation adding an unwarranted terminal period when the source has none at all must be flagged"
+)
+assert check_punctuation("Играйте сейчас.", "Play now.") == [], (
+    "sanity: check_punctuation must still be callable with no checks= argument at all (existing call sites)"
+)
+assert check_punctuation("Click here.</b>", "Нажмите здесь</b>") != [], (
+    "a genuinely dropped terminal period must still be caught even when the real last character is followed "
+    "by a trailing closing tag"
+)
+assert check_punctuation("Click here.</b>", "Нажмите здесь.</b>") == [], (
+    "a correctly preserved terminal period followed by a trailing closing tag must NOT be flagged as missing"
+)
+assert check_punctuation("Order now!", "Закажите сейчас!") == [], (
+    "matching terminal punctuation must not be flagged"
+)
+print("[OK] check_punctuation: now catches a translation ADDING an unwarranted terminal mark when the source "
+      "has none (not just dropping one), and correctly looks past a trailing closing tag/placeholder/quote "
+      "instead of naively indexing the very last character")
+
+# Regression caught in review: _real_last_char used PLACEHOLDER_RE.search()
+# alone, which returns the LEFTMOST match in the string, not one anchored
+# at the end — a string with an earlier tag too ("<b>...</b> text.<icon>")
+# never had that leftmost match reach the end, so the real trailing token
+# was never stripped and this fell back to naive last-character indexing,
+# the exact bug the rewrite was meant to fix. Fixed by scanning every
+# match (finditer) for the one actually touching the end of the string.
+assert check_punctuation("Claim your bonus now.", "<b>Заберите</b> бонус сейчас.<icon>") == [], (
+    "a correctly preserved terminal period must not be flagged as missing just because an EARLIER tag/"
+    "placeholder appears before the real trailing one in the same string"
+)
+# Regression caught in review: an empty _real_last_char() result (source or
+# translation is nothing but a stripped-away placeholder) used to pass
+# straight into Python's `"" in some_string`, which is always True —
+# silently mis-firing both the forward and reverse checks. Both directions
+# must now behave sanely when there's no real trailing character at all.
+assert check_punctuation("{icon}", "Иконка бонуса.") == [], (
+    "a source that's nothing but a placeholder must not spuriously trigger the terminal-punctuation checks"
+)
+assert check_punctuation("{icon}", "{icon}") == [], (
+    "a source and translation that are both nothing but a placeholder must not produce a garbled empty-"
+    "character punctuation finding"
+)
+print("[OK] check_punctuation: _real_last_char correctly finds the trailing tag/placeholder even when an "
+      "earlier one appears first in the same string, and a placeholder-only source or translation (no real "
+      "trailing character at all) no longer produces a spurious or garbled finding")
+
+# Regression caught in review: _real_last_char's wrapper-stripping loop
+# used to be unbounded ("while changed"), re-scanning the whole shrinking
+# string every layer — quadratic for a pathological string built almost
+# entirely of tiny trailing wrapper tokens. Now capped at a fixed number
+# of layers (_MAX_WRAPPER_STRIP_LAYERS), which real content never gets
+# close to, but a corrupted/malformed cell can't turn into a slow check.
+from app.rule_checks import _real_last_char
+import time as _time
+
+_perf_start = _time.time()
+_real_last_char("text" + "<i></i>" * 20000)
+assert _time.time() - _perf_start < 2.0, (
+    "a pathological string with many tiny trailing wrapper tokens must not make _real_last_char slow"
+)
+# a normal, realistic handful of stacked wrapper layers must still be fully unwrapped
+assert _real_last_char("Great offer!</b>)") == "!", (
+    "several ordinary trailing wrapper layers (closing tag, then closing bracket) must all be stripped to "
+    "find the real terminal punctuation"
+)
+print("[OK] _real_last_char: bounded wrapper-stripping stays fast even on a pathological string with many "
+      "tiny trailing tokens, while still fully unwrapping any realistic number of stacked layers")
+
+# --- new "Оформление" rules: em dash needs spaces on both sides, and a
+# hyphen standing in for a dash is flagged by meaning (Александр's ask,
+# 2026-09-22), with an SMS/Latin exception since Александр's own SMS spec
+# requires the opposite (plain hyphen, never an em dash).
+assert check_em_dash_spacing("Быстро—просто.") != [], "an em dash glued to text with no space must be flagged"
+assert check_em_dash_spacing("Быстро — просто.") == [], "a correctly spaced em dash must not be flagged"
+assert check_hyphen_for_dash("Быстро - просто.") != [], (
+    "a hyphen standing alone between spaces (typographically a dash, not a real hyphen) must be flagged"
+)
+assert check_hyphen_for_dash("видео-игра проста.") == [], (
+    "an ordinary hyphenated compound word (no spaces around the hyphen) must not be flagged"
+)
+# folded into check_punctuation under the "punctuation" checkbox
+assert any(f["type"] == "punctuation" for f in check_punctuation("Fast.", "Быстро—просто.")), (
+    "the em-dash-spacing rule must be reachable through check_punctuation itself, not just its own function"
+)
+# SMS exception: skipped entirely when "sms_charset" is among the active checks
+assert check_punctuation("Fast.", "Быстро - просто.", checks=["punctuation"]) != [], (
+    "outside SMS, a hyphen standing in for a dash must be flagged"
+)
+assert check_punctuation("Fast.", "Быстро - просто.", checks=["punctuation", "sms_charset"]) == [], (
+    "for SMS content, the dash-vs-hyphen and em-dash-spacing rules must be skipped entirely — Александр's own "
+    "SMS spec requires a plain ASCII hyphen and forbids the em dash outright"
+)
+print("[OK] check_punctuation: new rules require spaces around an em dash and flag a lone hyphen standing in "
+      "for one, both skipped for SMS content (where a plain hyphen is required and an em dash is forbidden)")
+
 print("\nALL SMOKETEST CHECKS PASSED")

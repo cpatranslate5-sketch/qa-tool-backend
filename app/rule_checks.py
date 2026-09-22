@@ -293,6 +293,20 @@ def check_placeholders(source: str, translation: str) -> list[dict]:
 # here would silently shadow it at module load time, since Python just
 # keeps the LAST top-level assignment to a name; the two patterns are not
 # interchangeable, and this exact collision was caught live in review.
+#
+# Kept requiring BOTH boundaries here — an earlier attempt dropped the
+# trailing \b to handle a grammatical ending glued straight onto the
+# placeholder with no space (a Korean particle like "의", or a Turkic
+# case/possessive suffix — Александр's ask, 2026-09-22), but that loosened
+# the regex itself, so it also newly matched the FIRST 4+ letters of any
+# ordinary word that happens to start with a repeated letter and keep
+# going as the same word (e.g. Russian informal emphasis "оооочень", or a
+# marketing "WOOOOW") — caught in review. Fixed properly in
+# check_letter_placeholders below instead: this regex stays exactly as
+# strict as before (so it can't newly misfire on ordinary text), and the
+# glued-suffix case is handled by a separate, targeted maximal-run search
+# for the EXACT letter+length already known from the source side, which
+# needs no \w boundary at all (see _count_maximal_runs).
 _PLACEHOLDER_LETTER_RUN_RE = re.compile(r"\b([A-Za-zА-Яа-яЁё])\1{3,}\b")
 
 
@@ -302,6 +316,27 @@ def _extract_letter_runs(text: str) -> list[str]:
 
 def _run_script(run: str) -> str:
     return "cyrillic" if _CYRILLIC_LETTER_RE.search(run) else "latin"
+
+
+def _count_maximal_runs(run: str, text: str) -> int:
+    """Count occurrences of `run` (a string of N repeats of one letter) in
+    `text` that are a MAXIMAL same-letter run of exactly that length — not
+    just any substring match. Deliberately not a plain `text.count(run)`:
+    caught in review — a bare substring count can't tell a genuine 4-letter
+    placeholder from 4 consecutive letters sitting INSIDE an unrelated
+    longer run of the same letter (a 16-letter masked card number embeds
+    every possible 4-letter substring of the same repeated letter), which
+    would wrongly credit a completely different, genuinely-dropped shorter
+    placeholder as still present. Boundary-free with respect to any OTHER
+    character on purpose (so a run glued directly onto a following/
+    preceding grammatical suffix with no space, e.g. a Korean particle or
+    Turkic case ending, still counts) — only runs of the SAME letter
+    immediately before/after disqualify a candidate, via the lookaround."""
+    if not run:
+        return 0
+    letter = re.escape(run[0])
+    pattern = re.compile(r"(?<!" + letter + r")" + letter + "{" + str(len(run)) + "}" + r"(?!" + letter + r")")
+    return len(pattern.findall(text))
 
 
 def check_letter_placeholders(source: str, translation: str) -> list[dict]:
@@ -343,7 +378,23 @@ def check_letter_placeholders(source: str, translation: str) -> list[dict]:
     swap with each other is vanishingly unlikely on top of that — solving
     it properly would need a full alignment (e.g. edit-distance/
     assignment) between leftovers rather than a simple position pairing,
-    which isn't worth the complexity for how rare this combination is."""
+    which isn't worth the complexity for how rare this combination is.
+
+    (3, added 2026-09-22) Before a leftover source run is reported as
+    genuinely missing, it's checked for a boundary-free (w.r.t. any OTHER
+    character) maximal same-length run of the identical letter anywhere in
+    the translation, beyond however many the strict extraction already
+    accounted for — that catches a placeholder that's actually still
+    there but has a grammatical suffix glued directly onto it with no
+    separating space (a Korean particle, a Turkic case/possessive ending),
+    which the extraction regex's own \\b requirement can't see as a
+    separate token, while still correctly telling apart a repeated
+    placeholder text (two masked card numbers, one genuinely dropped) and
+    a short placeholder from an unrelated longer run of the same letter
+    elsewhere in the same cell. See _PLACEHOLDER_LETTER_RUN_RE's own
+    comment for why that regex itself was deliberately left untouched
+    instead of being loosened to handle this, and _count_maximal_runs'
+    own docstring for why a plain substring count isn't enough here."""
     src_runs = _extract_letter_runs(source)
     tr_runs = _extract_letter_runs(translation)
     if not src_runs and not tr_runs:
@@ -357,6 +408,44 @@ def check_letter_placeholders(source: str, translation: str) -> list[dict]:
         else:
             leftover_src.append(run)
     leftover_tr = tr_pool
+
+    # Glued-suffix survival check (Александр's ask, 2026-09-22): a run that
+    # looks "missing" so far might just have a grammatical ending glued
+    # directly onto it with no space (a Korean particle, a Turkic case
+    # suffix), which is exactly what makes _PLACEHOLDER_LETTER_RUN_RE's own
+    # trailing \b fail to extract it from the translation in the first
+    # place. We already know the EXACT text to look for from the source
+    # side, so a boundary-free (w.r.t. any OTHER character) maximal-run
+    # search settles it without loosening the regex itself (and without
+    # the false positives that loosening it introduced — see the regex's
+    # own comment above). Uses _count_maximal_runs, not a plain substring
+    # count — caught in review: a bare `text.count(run)` can't tell a
+    # genuine short placeholder from that many letters sitting INSIDE an
+    # unrelated longer run of the same letter (every 4-letter window of a
+    # surviving 16-letter run is also, textually, "XXXX").
+    #
+    # Counted, not a bare "in"/">0" test either — caught in review: a naive
+    # presence test credits the SAME physical occurrence to every leftover
+    # entry with that text, so when the source has the same placeholder run
+    # TWICE (two masked card numbers both shown as "XXXXXXXX") and only one
+    # genuinely survives (glued or not) while the other is truly dropped, a
+    # bare presence test would find the surviving copy and wrongly clear
+    # BOTH leftovers. Only occurrences beyond what strict extraction
+    # already paired up (tr_runs itself, physically the same occurrence(s)
+    # already consumed above) count as "extra" glued survivors, and each
+    # one is consumed at most once.
+    strict_counts = Counter(tr_runs)
+    glued_available = {
+        run: max(0, _count_maximal_runs(run, translation) - strict_counts.get(run, 0))
+        for run in set(leftover_src)
+    }
+    still_leftover = []
+    for run in leftover_src:
+        if glued_available.get(run, 0) > 0:
+            glued_available[run] -= 1
+        else:
+            still_leftover.append(run)
+    leftover_src = still_leftover
 
     findings = []
     for i, src_run in enumerate(leftover_src):
@@ -590,18 +679,143 @@ def check_emoji(source: str, translation: str) -> list[dict]:
     return findings
 
 
-def check_punctuation(source: str, translation: str, lang_code: str = "") -> list[dict]:
-    findings = []
-    src = source.rstrip()
-    tr = translation.rstrip()
-    lang_base = lang_code.split("-")[0].lower() if lang_code else ""
+# Terminal punctuation is only reliably visible past trailing "wrapper"
+# content that carries no meaning of its own — a closing HTML/XML tag
+# ("</b>"), a placeholder/tag token (PLACEHOLDER_RE — "{icon}", "%s"), or a
+# closing quote/bracket a sentence naturally ends inside of (", ', », ",
+# ), ], }). Naive src[-1]/tr[-1] indexing (the original version of this
+# check) reads "Click here.</b>" as ending in ">", not ".", and misses a
+# genuinely dropped period entirely — confirmed empirically, and matches
+# Александр's report (2026-09-22) that presence/absence detection wasn't
+# always reliable. Stripped repeatedly since a sentence can end several
+# wrapper layers deep ("...!</b>").
+_TRAILING_CLOSING_RE = re.compile(r"[\"'»”’)\]}]\s*$")
 
-    if lang_base not in NO_TERMINAL_PUNCT_LANGS and src and src[-1] in TERMINAL_PUNCT:
-        if not tr or tr[-1] not in TERMINAL_PUNCT_ACCEPTABLE:
+
+_MAX_WRAPPER_STRIP_LAYERS = 50  # see the loop's own comment below
+
+
+def _real_last_char(text: str) -> str:
+    t = text.rstrip()
+    # Bounded to a fixed number of layers, not "while changed" alone —
+    # caught in review: each layer re-scans the whole (shrinking) string
+    # with finditer, so a string built almost entirely of tiny trailing
+    # wrapper tokens (a corrupted export gluing hundreds of empty tags
+    # together) would make this quadratic in the number of layers. A real
+    # sentence is never wrapped more than a handful of layers deep, so this
+    # cap only ever matters for pathological input, where falling back to
+    # judging whatever's left (rather than continuing to strip) is fine.
+    for _ in range(_MAX_WRAPPER_STRIP_LAYERS):
+        if not t:
+            break
+        changed = False
+        # PLACEHOLDER_RE.search() alone would return the LEFTMOST match in
+        # the string, not one anchored at the end — for a string with an
+        # earlier tag/placeholder too ("<b>Text</b> here.<icon>"), that
+        # leftmost match ("<b>") never reaches len(t), so the real trailing
+        # one ("<icon>") would be silently skipped and this would fall back
+        # to naive last-character indexing, the exact bug this function
+        # exists to avoid. finditer() walks every non-overlapping match, so
+        # the one actually touching the end of the string is found instead.
+        for m in PLACEHOLDER_RE.finditer(t):
+            if m.end() == len(t):
+                t = t[: m.start()].rstrip()
+                changed = True
+                break
+        if changed:
+            continue
+        m = _TRAILING_CLOSING_RE.search(t)
+        if m:
+            t = t[: m.start()].rstrip()
+            changed = True
+        if not changed:
+            break
+    return t[-1] if t else ""
+
+
+# "Оформление": length long dash "—" requires spaces on both sides
+# (Александр's ask, 2026-09-22) — anything glued straight onto a
+# neighboring word looks like a typo, not intentional typography.
+def check_em_dash_spacing(translation: str) -> list[dict]:
+    bad_count = 0
+    for i, ch in enumerate(translation):
+        if ch != "—":
+            continue
+        before_ok = i == 0 or translation[i - 1].isspace()
+        after_ok = i == len(translation) - 1 or translation[i + 1].isspace()
+        if not before_ok or not after_ok:
+            bad_count += 1
+    if not bad_count:
+        return []
+    return [{
+        "type": "punctuation",
+        "severity": "low",
+        "message": (
+            f"В переводе длинное тире «—» стоит без пробела с одной из сторон ({bad_count} раз(а)) — "
+            "вокруг «—» должны быть пробелы с обеих сторон."
+        ),
+    }]
+
+
+# A plain hyphen "-" surrounded by SPACES on both sides is almost always a
+# dash used where the translation should have an em dash "—" — a genuine
+# hyphen (as in "video-game") never has spaces around it, so this is a
+# reliable, purely mechanical signal for "по смыслу здесь тире, а не
+# дефис" without needing AI judgment. Deliberately skipped for SMS content
+# (see check_sms_charset, gated the same way in run_rule_checks below),
+# where Александр's own spec requires the OPPOSITE — a plain ASCII hyphen
+# and never an em dash — so this rule would be actively wrong there.
+def check_hyphen_for_dash(translation: str) -> list[dict]:
+    count = len(re.findall(r"(?<=\s)-(?=\s)", translation))
+    if not count:
+        return []
+    return [{
+        "type": "punctuation",
+        "severity": "low",
+        "message": (
+            f"В переводе короткий дефис «-» стоит отдельным словом, окружённым пробелами ({count} раз(а)) — "
+            "похоже, здесь по смыслу должно быть длинное тире «—», а не дефис."
+        ),
+    }]
+
+
+def check_punctuation(
+    source: str, translation: str, lang_code: str = "", checks: list[str] | None = None
+) -> list[dict]:
+    findings = []
+    lang_base = lang_code.split("-")[0].lower() if lang_code else ""
+    checks = checks or []
+
+    if lang_base not in NO_TERMINAL_PUNCT_LANGS:
+        src_last = _real_last_char(source)
+        tr_last = _real_last_char(translation)
+        # Guarded with "src_last and"/"tr_last and" everywhere below — an
+        # empty string from _real_last_char (source/translation is nothing
+        # but a stripped-away placeholder, e.g. a cell that's just
+        # "{icon}") would otherwise pass Python's `"" in "some string"`
+        # check, which is always True, and both misfire as a false "ends in
+        # this punctuation mark" and silently skip a real "doesn't end in
+        # any punctuation" case — caught in review.
+        if src_last and src_last in TERMINAL_PUNCT:
+            if not tr_last or tr_last not in TERMINAL_PUNCT_ACCEPTABLE:
+                findings.append({
+                    "type": "punctuation",
+                    "severity": "low",
+                    "message": f"В исходнике в конце стоит «{src_last}», а перевод не заканчивается знаком препинания.",
+                })
+        elif src_last and src_last not in TERMINAL_PUNCT_ACCEPTABLE and tr_last and tr_last in TERMINAL_PUNCT:
+            # Reverse direction — added rather than dropped — deliberately
+            # only fires when the source has NO terminal punctuation at
+            # all (not even a "?"/other accepted mark), to stay a clean
+            # mechanical fact rather than second-guessing "?" vs "."
+            # across languages, which is real judgment-call territory.
             findings.append({
                 "type": "punctuation",
                 "severity": "low",
-                "message": f"В исходнике в конце стоит «{src[-1]}», а перевод не заканчивается знаком препинания.",
+                "message": (
+                    f"В переводе в конце добавлен «{tr_last}», которого нет в исходнике "
+                    f"(там в конце «{src_last}»)."
+                ),
             })
 
     if "  " in translation:
@@ -610,6 +824,10 @@ def check_punctuation(source: str, translation: str, lang_code: str = "") -> lis
             "severity": "low",
             "message": "В переводе есть двойной пробел.",
         })
+
+    if "sms_charset" not in checks:
+        findings += check_em_dash_spacing(translation)
+        findings += check_hyphen_for_dash(translation)
 
     findings += check_mixed_script(translation)
     findings += check_emoji(source, translation)
@@ -679,7 +897,7 @@ def run_rule_checks(
     if "max_length" in checks:
         findings += check_max_length(translation, max_length)
     if "punctuation" in checks:
-        findings += check_punctuation(source, translation, lang_code)
+        findings += check_punctuation(source, translation, lang_code, checks)
     if "sms_charset" in checks:
         findings += check_sms_charset(translation)
     return findings
