@@ -3938,6 +3938,25 @@ print("[OK] calibration_debug + register: a 'mixed' register value reported ONLY
 # only their SOURCE is tagged, not their standing. ---
 import app.gemini_client as gemini_client_mod
 
+# _gemini_error_detail: turns whatever went wrong into a short, actionable
+# Russian phrase Александр can read directly in the report — added
+# 2026-09-22 after a real Railway run only surfaced the generic "ошибка
+# сети, ключа или модели" with no way to tell which of the three it
+# actually was.
+assert "ключ отклонён" in gemini_client_mod._gemini_error_detail(None, 401, None)
+assert "ключ отклонён" in gemini_client_mod._gemini_error_detail(None, 403, None)
+assert "модель не найдена" in gemini_client_mod._gemini_error_detail(None, 404, None)
+assert "лимит запросов" in gemini_client_mod._gemini_error_detail(None, 429, None)
+assert "сбой на стороне Google" in gemini_client_mod._gemini_error_detail(None, 503, None)
+assert "не удалось подключиться" in gemini_client_mod._gemini_error_detail(
+    _httpx_for_fault_injection.ConnectError("x"), None, None
+)
+assert "не удалось разобрать" in gemini_client_mod._gemini_error_detail(ValueError("bad json"), None, None)
+assert gemini_client_mod._gemini_error_detail(None, None, None) == "неизвестная ошибка при обращении к Gemini"
+print("[OK] _gemini_error_detail: maps a Gemini failure (bad key, bad model id, rate limit, Google-side "
+      "outage, network failure, unparseable response) to its own short, actionable Russian reason instead "
+      "of one generic catch-all message")
+
 _gem_wb = openpyxl.Workbook()
 _gem_ws = _gem_wb.active
 _gem_ws.append(["Context", "ru", "mr"])
@@ -3964,6 +3983,7 @@ async def _fake_call_gemini_ok(prompt, model=None):
         '"message": "पैज न लावता буквально значит «без ставки», а не «без отыгрыша»"}]',
         {"input_tokens": 40, "output_tokens": 25},
         "end_turn",
+        None,
     )
 
 
@@ -4016,9 +4036,13 @@ assert "gemini_findings" not in _gem_off_result["summary"]
 # rate limit — anything _call_gemini folds into stop_reason="errored")
 # must show a visible warning, but must NEVER take down the normal Claude
 # result for that same language — this is an optional bolt-on, not
-# something that should ever make the primary check less reliable.
+# something that should ever make the primary check less reliable. The
+# warning must also name the SPECIFIC reason (error_detail), not just a
+# generic "something went wrong" — added 2026-09-22 after a real Railway
+# run only showed the generic text with no way to tell what actually
+# failed without checking Railway's own logs.
 async def _fake_call_gemini_errored(prompt, model=None):
-    return None, {}, "errored"
+    return None, {}, "errored", "ключ отклонён (проверьте GEMINI_API_KEY на Railway)"
 
 
 async def _fake_call_claude_finds_something(prompt, model=None):
@@ -4046,6 +4070,10 @@ assert any(f["message"] == "обычная находка через Claude" for
 assert any("не выполнилась" in f.get("message", "") and "🌐" in f.get("message", "") for f in _gem_err_all), (
     f"a failed Gemini call must produce a visible warning so it doesn't look like 'Gemini checked, found "
     f"nothing' — got {_gem_err_all}"
+)
+assert any("ключ отклонён" in f.get("message", "") for f in _gem_err_all), (
+    f"the warning must name the SPECIFIC reason the call failed (error_detail), not just the generic "
+    f"'ошибка сети, ключа или модели' text — got {_gem_err_all}"
 )
 assert _gem_err_result["summary"]["gemini_cost_usd"] == 0.0, "a failed Gemini call must cost nothing"
 print("[OK] gemini_check (\"🌐 Проверить также через Gemini\"): runs the SAME prompt through Gemini alongside "
@@ -4080,6 +4108,7 @@ async def _fake_call_gemini_register_mixed(prompt, model=None):
         f'[{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
         {"input_tokens": 20, "output_tokens": 10},
         "end_turn",
+        None,
     )
 
 
@@ -4133,9 +4162,10 @@ async def _fake_call_gemini_partial_failure(prompt, model=None):
             '[{"row": 1, "type": "typo", "severity": "low", "message": "первая часть нашла проблему"}]',
             {"input_tokens": 30, "output_tokens": 15},
             "end_turn",
+            None,
         )
-    # second chunk: the call itself fails outright
-    return None, {}, "errored"
+    # second chunk: the call itself fails outright, with its own specific reason
+    return None, {}, "errored", "Gemini не ответила вовремя (таймаут)"
 
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
@@ -4161,6 +4191,10 @@ _gchunk_warnings = [
 ]
 assert any("не выполнилась" in f.get("message", "") and "🌐" in f.get("message", "") for f in _gchunk_warnings), (
     f"a failure in even ONE of several Gemini chunks must still raise the run-wide warning — got {_gchunk_warnings}"
+)
+assert any("таймаут" in f.get("message", "") for f in _gchunk_warnings), (
+    f"the warning must carry the failed chunk's own specific reason, not just a generic message — got "
+    f"{_gchunk_warnings}"
 )
 print("[OK] gemini_check + chunking: when a language spans several chunks (MAX_ROWS_PER_AI_CALL) and only "
       "ONE chunk's Gemini call fails outright, that chunk's rows simply have no Gemini coverage while every "
@@ -4203,6 +4237,7 @@ async def _fake_call_gemini_combo(prompt, model=None):
         '[{"row": 1, "type": "typo", "severity": "medium", "message": "находка Gemini"}]',
         {"input_tokens": 30, "output_tokens": 10},
         "end_turn",
+        None,
     )
 
 

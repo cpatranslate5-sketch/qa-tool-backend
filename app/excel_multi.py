@@ -958,17 +958,19 @@ async def _run_gemini_chunks(
     lang: str,
     source_lang: str,
     semaphore: asyncio.Semaphore,
-) -> tuple[dict[int, list[dict]], float, bool, bool]:
+) -> tuple[dict[int, list[dict]], float, bool, bool, str | None]:
     """Same chunking/merging/"_also_idx"-shifting as _run_ai_chunks above,
     but against Gemini (see app.gemini_client.run_gemini_checks_batch) —
     kept as its own function rather than a shared one because Gemini's
-    per-chunk call returns one extra element (errored) that Claude's
-    doesn't. Returns (findings keyed by item index, cost_usd, whether ANY
-    chunk was truncated, whether ANY chunk failed to get a usable answer
-    at all) — a language split across several chunks (MAX_ROWS_PER_AI_CALL)
-    must still surface a warning even if only one of several chunks had a
-    problem, not have it silently swallowed by the others that succeeded."""
-    async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool, bool]:
+    per-chunk call returns two extra elements (errored, error_detail) that
+    Claude's doesn't. Returns (findings keyed by item index, cost_usd,
+    whether ANY chunk was truncated, whether ANY chunk failed to get a
+    usable answer at all, a short reason why — from whichever failed chunk
+    hit the problem first) — a language split across several chunks
+    (MAX_ROWS_PER_AI_CALL) must still surface a warning even if only one of
+    several chunks had a problem, not have it silently swallowed by the
+    others that succeeded."""
+    async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool, bool, str | None]:
         async with semaphore:
             return await run_gemini_checks_batch(chunk_items, checks, extra_instructions, lang, source_lang)
 
@@ -978,8 +980,11 @@ async def _run_gemini_chunks(
     cost_usd = 0.0
     truncated = False
     errored = False
+    error_detail = None
     offset = 0
-    for (chunk_findings, chunk_cost, chunk_truncated, chunk_errored), chunk_items in zip(chunk_results, item_chunks):
+    for (chunk_findings, chunk_cost, chunk_truncated, chunk_errored, chunk_error_detail), chunk_items in zip(
+        chunk_results, item_chunks
+    ):
         for local_idx, findings in chunk_findings.items():
             remapped = []
             for f in findings:
@@ -990,9 +995,10 @@ async def _run_gemini_chunks(
         cost_usd += chunk_cost
         truncated = truncated or chunk_truncated
         errored = errored or chunk_errored
+        error_detail = error_detail or chunk_error_detail
         offset += len(chunk_items)
 
-    return findings_by_idx, cost_usd, truncated, errored
+    return findings_by_idx, cost_usd, truncated, errored, error_detail
 
 
 def _mark_gemini_findings(findings: list[dict]) -> list[dict]:
@@ -1103,8 +1109,11 @@ async def _check_language_for_sheet(
     gemini_findings_by_idx: dict[int, list[dict]] = {}
     gemini_truncated = False
     gemini_errored = False
+    gemini_error_detail = None
     if gemini_check:
-        gemini_findings_by_idx, gemini_cost_usd, gemini_truncated, gemini_errored = await _run_gemini_chunks(
+        (
+            gemini_findings_by_idx, gemini_cost_usd, gemini_truncated, gemini_errored, gemini_error_detail,
+        ) = await _run_gemini_chunks(
             item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
         )
         gemini_findings_by_idx = _resolve_repeated_findings(gemini_findings_by_idx, relevant_rows)
@@ -1184,6 +1193,12 @@ async def _check_language_for_sheet(
             }],
         })
     if gemini_check and gemini_errored:
+        # Added 2026-09-22 after a real Railway run only showed the generic
+        # "ошибка сети, ключа или модели" text with no way to tell which of
+        # the three it actually was — now names the specific reason
+        # (_gemini_error_detail) right in the report itself, so Александр
+        # doesn't need to check Railway's own logs to know what to fix.
+        _gemini_reason = gemini_error_detail or "ошибка сети, ключа или модели"
         out.append({
             "excel_row": 0,
             "context": "⚠ Системное предупреждение",
@@ -1193,9 +1208,8 @@ async def _check_language_for_sheet(
                 "type": "system",
                 "severity": "low",
                 "message": (
-                    "🌐 Проверка через Gemini для этого языка не выполнилась (ошибка сети, ключа или "
-                    "модели) — не повлияло на обычную проверку через Claude, но эта дополнительная "
-                    "проверка не сработала."
+                    f"🌐 Проверка через Gemini для этого языка не выполнилась: {_gemini_reason}. Не повлияло "
+                    f"на обычную проверку через Claude, но эта дополнительная проверка не сработала."
                 ),
             }],
         })
