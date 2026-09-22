@@ -59,10 +59,12 @@ MAX_RUNS_PER_MODEL = 10
 
 async def _one_run(
     item: dict, checks: list[str], target_lang: str, source_lang: str, model_id: str, semaphore: asyncio.Semaphore,
+    relaxed: bool = False,
 ) -> tuple[list[dict], float, bool]:
     async with semaphore:
         findings_by_idx, cost_usd, truncated = await run_ai_checks_batch(
             [item], checks, target_lang=target_lang, source_lang=source_lang, model_override=model_id,
+            relaxed=relaxed,
         )
     # register_value entries aren't a "catch" of anything — they're the
     # register-reporting side-channel (see claude_client.REGISTER_VALUE_TYPE),
@@ -79,6 +81,7 @@ async def run_model_comparison(
     source_lang: str = "ru",
     checks: list[str] | None = None,
     runs_per_model: int = 5,
+    relaxed: bool = False,
 ) -> dict:
     """Runs the exact same (context, source, translation) row through each
     of MODEL_COMPARISON_CANDIDATES, runs_per_model times each, in parallel
@@ -92,6 +95,18 @@ async def run_model_comparison(
     runs that did catch something — so it's visible at a glance whether a
     model is genuinely flagging the SAME real issue being tested, not just
     something unrelated.
+
+    relaxed: forwarded to run_ai_checks_batch/build_batch_prompt — swaps in
+    CALIBRATION_RELAXED_OPENING (see claude_client's own comment on it)
+    instead of the normal strict "only report if you're sure" confidence
+    bar. Added 2026-09-22 after Александр got a real Sonnet answer OUTSIDE
+    our pipeline (a bare, unstructured question with no confidence-bar
+    wording at all) that correctly caught the same Marathi row our own
+    strict-calibration Sonnet run missed 5 times in a row — real evidence
+    that at least SOME of the gap can be our own prompt's confidence bar
+    making Sonnet second-guess itself, not necessarily Sonnet lacking the
+    underlying knowledge outright. This flag exists to test exactly that,
+    with real numbers, before concluding either way.
 
     Returns {} when no ANTHROPIC_API_KEY is configured — same graceful
     no-op as the rest of the AI-check pipeline, rather than an error."""
@@ -107,7 +122,7 @@ async def run_model_comparison(
     for name, resolve_model in MODEL_COMPARISON_CANDIDATES.items():
         model_id = resolve_model()
         runs = await asyncio.gather(*[
-            _one_run(item, checks, target_lang, source_lang, model_id, semaphore)
+            _one_run(item, checks, target_lang, source_lang, model_id, semaphore, relaxed=relaxed)
             for _ in range(runs_per_model)
         ])
         catches = 0
@@ -143,6 +158,7 @@ async def run_model_comparison(
     report = {
         "target_lang": target_lang,
         "checks": checks,
+        "relaxed": relaxed,
         "total_cost_usd": round(total_cost, 4),
         "results": results,
     }
@@ -161,7 +177,8 @@ def _format_summary_ru(report: dict) -> str:
     """A ready-to-read Russian summary of the comparison, so the result can
     be understood at a glance in the /docs response without translating
     JSON field names by hand."""
-    lines = [f"Сравнение моделей для языка {report['target_lang']}:"]
+    mode = " (🔬 сниженная планка уверенности)" if report.get("relaxed") else ""
+    lines = [f"Сравнение моделей для языка {report['target_lang']}{mode}:"]
     for name, r in report["results"].items():
         label = _NAMES_RU.get(name, name)
         lines.append(

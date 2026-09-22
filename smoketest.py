@@ -4593,6 +4593,41 @@ print("[OK] run_model_comparison: runs the same real row through Opus/Sonnet/Hai
       "correctly tallies a per-model hit rate/cost/example findings from real (here, faked) per-model "
       "responses, including a ready-to-read Russian summary")
 
+# relaxed=True must actually swap in CALIBRATION_RELAXED_OPENING for every
+# candidate model's prompt — added 2026-09-22 after Александр got a
+# correct answer from a bare, unstructured Sonnet question (no confidence
+# bar at all) on a row our strict-calibration pipeline missed 5/5 times,
+# raising the real possibility that our OWN prompt's confidence bar (not a
+# Sonnet knowledge gap) explains at least part of the miss.
+from app.claude_client import CALIBRATION_RELAXED_OPENING, CALIBRATION_STRICT_OPENING
+
+_cmp_seen_prompts = []
+
+
+async def _fake_call_claude_records_prompt(prompt, model=None):
+    _cmp_seen_prompts.append(prompt)
+    return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_records_prompt
+asyncio.run(_run_model_comparison_direct(
+    context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=1, relaxed=True,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert len(_cmp_seen_prompts) == 3, f"expected exactly 3 prompts (one per candidate model) — got {len(_cmp_seen_prompts)}"
+assert all(CALIBRATION_RELAXED_OPENING in p for p in _cmp_seen_prompts), (
+    "relaxed=True must swap CALIBRATION_RELAXED_OPENING into EVERY candidate model's prompt, not just some"
+)
+assert all(CALIBRATION_STRICT_OPENING not in p for p in _cmp_seen_prompts), (
+    "relaxed=True must fully replace the strict opening, not send both"
+)
+print("[OK] run_model_comparison: relaxed=True correctly swaps CALIBRATION_RELAXED_OPENING into every "
+      "candidate model's prompt (Opus/Sonnet/Haiku alike), letting the confidence-bar-vs-knowledge-gap "
+      "question be tested with real data instead of assumed")
+
 # runs_per_model must be capped at MAX_RUNS_PER_MODEL — this hits the real,
 # billed Anthropic API on every call, reachable without any of the usual
 # project/manager plumbing, so an oversized request can't fire off an

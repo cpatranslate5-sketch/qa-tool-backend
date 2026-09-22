@@ -174,3 +174,7 @@ class ModelComparisonIn(BaseModel):
     source_lang: str = "ru"
     checks: list[str] = ["typo"]
     runs_per_model: int = 5
+    # See app.model_comparison.run_model_comparison's own docstring on
+    # "relaxed" — set true to test with the loosened confidence bar
+    # instead of the normal strict one.
+    relaxed: bool = False

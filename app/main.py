@@ -1097,6 +1097,7 @@ async def debug_model_comparison(payload: schemas.ModelComparisonIn):
         source_lang=payload.source_lang,
         checks=payload.checks,
         runs_per_model=payload.runs_per_model,
+        relaxed=payload.relaxed,
     )
     if not result:
         raise HTTPException(
