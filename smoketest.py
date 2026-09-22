@@ -3957,6 +3957,84 @@ print("[OK] _gemini_error_detail: maps a Gemini failure (bad key, bad model id, 
       "outage, network failure, unparseable response) to its own short, actionable Russian reason instead "
       "of one generic catch-all message")
 
+# A real production run (2026-09-22) showed Google returning a plain 400
+# both for a rate-limit case (initially read as "код 429") and, after
+# switching models, an unrelated 400 — proving the STATUS CODE ALONE isn't
+# reliable enough to tell different problems apart. Google's own error
+# message text is, so it's now checked FIRST, by content.
+assert "недействителен" in gemini_client_mod._gemini_error_detail(None, 400, "API key not valid. Please pass a valid API key.")
+assert "модель не найдена" in gemini_client_mod._gemini_error_detail(
+    None, 400, "models/gemini-9.9-nonexistent is not found for API version v1beta"
+)
+assert "лимит запросов" in gemini_client_mod._gemini_error_detail(None, 400, "Resource has been exhausted (e.g. check quota).")
+assert "доступ отклонён" in gemini_client_mod._gemini_error_detail(None, 403, "Permission denied on resource.")
+# No recognized pattern in the body text — the raw Google message must
+# still be shown verbatim rather than thrown away, since it's the one
+# clue that could actually pin the problem down.
+_unmatched_detail = gemini_client_mod._gemini_error_detail(None, 400, "Some other request problem Google reported.")
+assert "код 400" in _unmatched_detail and "Some other request problem Google reported." in _unmatched_detail, (
+    f"an unrecognized error body must still be shown verbatim alongside the status code — got {_unmatched_detail!r}"
+)
+print("[OK] _gemini_error_detail: matches on GOOGLE'S OWN error message text first (not just the HTTP status "
+      "code alone, which a real run showed isn't reliable enough to tell a rate limit apart from an unrelated "
+      "400), and shows the raw message verbatim as a last resort when no known pattern matches")
+
+# Integration-style: a real httpx.HTTPStatusError, with Google's actual
+# {"error": {"message": ...}} JSON shape in the response body, must have
+# that message correctly extracted and threaded all the way through
+# _call_gemini into error_detail — not just the status-code fallback.
+# Exercises the exact extraction code (exc.response.json()...) that the
+# unit tests above bypass by calling _gemini_error_detail directly.
+class _FakeGeminiErrorResponse:
+    def __init__(self, status_code, error_json):
+        self.status_code = status_code
+        self._error_json = error_json
+
+    def raise_for_status(self):
+        raise _httpx_for_fault_injection.HTTPStatusError(
+            f"{self.status_code} error",
+            request=_httpx_for_fault_injection.Request("POST", "http://fake"),
+            response=self,
+        )
+
+    def json(self):
+        return self._error_json
+
+
+class _FakeGeminiErrorClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, params=None, json=None):
+        return _FakeGeminiErrorResponse(400, {"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", "status": "INVALID_ARGUMENT"}})
+
+
+settings.GEMINI_API_KEY = "fake-key-for-smoketest"
+_previous_gemini_async_client = gemini_client_mod.httpx.AsyncClient
+gemini_client_mod.httpx.AsyncClient = _FakeGeminiErrorClient
+_gem_http_text, _gem_http_usage, _gem_http_stop, _gem_http_detail = asyncio.run(
+    gemini_client_mod._call_gemini("some prompt")
+)
+gemini_client_mod.httpx.AsyncClient = _previous_gemini_async_client
+settings.GEMINI_API_KEY = ""
+
+assert _gem_http_text is None and _gem_http_stop == "errored", (
+    _gem_http_text, _gem_http_stop,
+)
+assert "недействителен" in _gem_http_detail, (
+    f"Google's own error message body must be extracted from the real httpx.HTTPStatusError response and "
+    f"threaded into error_detail — got {_gem_http_detail!r}"
+)
+print("[OK] _call_gemini: a real httpx.HTTPStatusError's JSON error body (Google's own "
+      "{\"error\": {\"message\": ...}} shape) is correctly extracted and fed into _gemini_error_detail, not "
+      "just the bare status code")
+
 _gem_wb = openpyxl.Workbook()
 _gem_ws = _gem_wb.active
 _gem_ws.append(["Context", "ru", "mr"])

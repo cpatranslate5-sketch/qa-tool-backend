@@ -55,14 +55,36 @@ def _gemini_usage_cost(model: str, usage: dict | None) -> float:
     return usage.get("input_tokens", 0) * rates["input"] + usage.get("output_tokens", 0) * rates["output"]
 
 
-def _gemini_error_detail(exc: Exception | None, status_code: int | None, body: object | None) -> str:
+def _gemini_error_detail(exc: Exception | None, status_code: int | None, body: str | None) -> str:
     """Turns whatever went wrong into a short, non-technical Russian phrase
     Александр can act on directly from the report itself — added 2026-09-22
     after a real Railway run showed only the generic "ошибка сети, ключа
     или модели" with no way to tell which of the three it actually was
     without SSH-ing into Railway's own logs (which he doesn't have reason
     to check day to day). Deliberately short — this rides inside an
-    already-long warning message, not a full stack trace."""
+    already-long warning message, not a full stack trace.
+
+    body: Google's own error message text (data["error"]["message"] from
+    the JSON error body — see _call_gemini), when one could be extracted.
+    Checked FIRST and by content, not by HTTP status code alone — a real
+    production run (2026-09-22) showed Google returning plain 400s for
+    both a bad API key AND other request problems, so status code alone
+    isn't reliable enough to tell those apart; Google's own message text
+    is. Falls back to the status-code table below when there's no body
+    text, or its wording doesn't match a known pattern — but even then,
+    the raw message (if any) is appended so nothing Google actually said
+    is thrown away."""
+    body_lower = (body or "").lower()
+    if body:
+        if "api key not valid" in body_lower or "api_key_invalid" in body_lower:
+            return "ключ отклонён — Google говорит, что он недействителен (проверьте GEMINI_API_KEY на Railway)"
+        if "model" in body_lower and ("not found" in body_lower or "not_found" in body_lower):
+            return "модель не найдена — проверьте GEMINI_MODEL на Railway (возможно, устарело название модели)"
+        if "quota" in body_lower or "rate limit" in body_lower or "resource_exhausted" in body_lower:
+            return "Gemini превысила лимит запросов, попробуйте позже"
+        if "permission" in body_lower or "denied" in body_lower:
+            return "доступ отклонён — проверьте, что у ключа включён доступ к Gemini API"
+
     if status_code in (401, 403):
         return "ключ отклонён (проверьте GEMINI_API_KEY на Railway)"
     if status_code == 404:
@@ -78,7 +100,13 @@ def _gemini_error_detail(exc: Exception | None, status_code: int | None, body: o
     if isinstance(exc, ValueError):
         return "Gemini прислала ответ, который не удалось разобрать"
     if status_code is not None:
-        return f"Gemini ответила с ошибкой (код {status_code})"
+        base = f"Gemini ответила с ошибкой (код {status_code})"
+        # No recognized pattern above, but Google DID send some explanation
+        # text — better to show it verbatim (even in English) than hide
+        # it, since it's the one clue that could actually pin this down.
+        if body:
+            return f"{base}: {body[:200]}"
+        return base
     return "неизвестная ошибка при обращении к Gemini"
 
 
@@ -115,7 +143,17 @@ async def _call_gemini(prompt: str, model: str | None = None) -> tuple[str | Non
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPStatusError as exc:
-        return None, {}, "errored", _gemini_error_detail(exc, exc.response.status_code, None)
+        # Google's own error responses are JSON shaped like
+        # {"error": {"code": 400, "message": "...", "status": "..."}} —
+        # pulled out here (best-effort; the body might not even be JSON on
+        # some failures) so _gemini_error_detail can match on what Google
+        # actually said instead of guessing from the status code alone.
+        error_message = None
+        try:
+            error_message = exc.response.json().get("error", {}).get("message")
+        except (ValueError, AttributeError):
+            pass
+        return None, {}, "errored", _gemini_error_detail(exc, exc.response.status_code, error_message)
     except (httpx.HTTPError, ValueError) as exc:
         return None, {}, "errored", _gemini_error_detail(exc, None, None)
 
