@@ -10,6 +10,7 @@ import re
 
 import openpyxl
 
+from app.gemini_client import run_gemini_checks_batch
 from app.claude_client import (
     REGISTER_MIXED_TYPE,
     REGISTER_VALUE_TYPE,
@@ -950,6 +951,69 @@ def _mark_calibration_debug_findings(findings: list[dict]) -> list[dict]:
     return out
 
 
+async def _run_gemini_chunks(
+    item_chunks: list[list[dict]],
+    checks: list[str],
+    extra_instructions: str,
+    lang: str,
+    source_lang: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[dict[int, list[dict]], float, bool, bool]:
+    """Same chunking/merging/"_also_idx"-shifting as _run_ai_chunks above,
+    but against Gemini (see app.gemini_client.run_gemini_checks_batch) —
+    kept as its own function rather than a shared one because Gemini's
+    per-chunk call returns one extra element (errored) that Claude's
+    doesn't. Returns (findings keyed by item index, cost_usd, whether ANY
+    chunk was truncated, whether ANY chunk failed to get a usable answer
+    at all) — a language split across several chunks (MAX_ROWS_PER_AI_CALL)
+    must still surface a warning even if only one of several chunks had a
+    problem, not have it silently swallowed by the others that succeeded."""
+    async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool, bool]:
+        async with semaphore:
+            return await run_gemini_checks_batch(chunk_items, checks, extra_instructions, lang, source_lang)
+
+    chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
+
+    findings_by_idx: dict[int, list[dict]] = {}
+    cost_usd = 0.0
+    truncated = False
+    errored = False
+    offset = 0
+    for (chunk_findings, chunk_cost, chunk_truncated, chunk_errored), chunk_items in zip(chunk_results, item_chunks):
+        for local_idx, findings in chunk_findings.items():
+            remapped = []
+            for f in findings:
+                if "_also_idx" in f:
+                    f = {**f, "_also_idx": [offset + i for i in f["_also_idx"]]}
+                remapped.append(f)
+            findings_by_idx[offset + local_idx] = remapped
+        cost_usd += chunk_cost
+        truncated = truncated or chunk_truncated
+        errored = errored or chunk_errored
+        offset += len(chunk_items)
+
+    return findings_by_idx, cost_usd, truncated, errored
+
+
+def _mark_gemini_findings(findings: list[dict]) -> list[dict]:
+    """Tags each finding from the optional "🌐 Проверить также через
+    Gemini" pass (see gemini_check below) — a machine-readable
+    "gemini_check": True field plus a "🌐 [Gemini] " message prefix,
+    mirroring _mark_calibration_debug_findings's pattern. Unlike a
+    calibration_debug finding, these ARE meant to be real, actionable
+    findings — Александр explicitly chose to keep them counted in the
+    headline "N проблем" (see run_multi_check/_count_real_findings, which
+    only excludes calibration_debug and register_summary, not this). The
+    tag says WHICH engine found it, not "ignore this, it's just a test"."""
+    out = []
+    for f in findings:
+        f = dict(f)
+        f["gemini_check"] = True
+        f["message"] = "🌐 [Gemini] " + str(f.get("message", ""))
+        out.append(f)
+    return out
+
+
 async def _check_language_for_sheet(
     sheet: dict,
     lang: str,
@@ -958,10 +1022,11 @@ async def _check_language_for_sheet(
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
     calibration_debug: bool = False,
-) -> tuple[list[dict], float, float]:
+    gemini_check: bool = False,
+) -> tuple[list[dict], float, float, float]:
     """Returns (rows-with-findings, production cost_usd, extra cost_usd
-    spent on the calibration_debug pass — always 0.0 when
-    calibration_debug is False)."""
+    spent on the calibration_debug pass, extra cost_usd spent on the
+    gemini_check pass — the last two always 0.0 when that feature is off)."""
     relevant_rows = []
     ai_items = []
     for row in sheet["rows"]:
@@ -975,7 +1040,7 @@ async def _check_language_for_sheet(
         ai_items.append({"context": row["context"], "source": src, "translation": tgt})
 
     if not relevant_rows:
-        return [], 0.0, 0.0
+        return [], 0.0, 0.0, 0.0
 
     # See MAX_ROWS_PER_AI_CALL above — one big AI call covering the whole
     # language is split into several smaller ones instead, each still
@@ -1024,6 +1089,37 @@ async def _check_language_for_sheet(
         }
         ai_findings_by_idx_relaxed = {idx: fs for idx, fs in ai_findings_by_idx_relaxed.items() if fs}
 
+    # "🌐 Проверить также через Gemini" — Александр's ask, 2026-09-22, after
+    # a blind test (same prompt, no hints) showed Gemini independently
+    # caught a real Marathi meaning error that Opus missed even with the
+    # confidence bar loosened above, while correctly staying silent on a
+    # genuinely-fine control example. Runs for EVERY checked language when
+    # on (his own choice — not scoped to "hard" languages only), and its
+    # findings are shown as real, actionable findings (not a debug-only
+    # curiosity like calibration_debug above) — just clearly tagged with
+    # which engine found them, since trust in a second provider is still
+    # being built.
+    gemini_cost_usd = 0.0
+    gemini_findings_by_idx: dict[int, list[dict]] = {}
+    gemini_truncated = False
+    gemini_errored = False
+    if gemini_check:
+        gemini_findings_by_idx, gemini_cost_usd, gemini_truncated, gemini_errored = await _run_gemini_chunks(
+            item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
+        )
+        gemini_findings_by_idx = _resolve_repeated_findings(gemini_findings_by_idx, relevant_rows)
+        gemini_findings_by_idx, _ = _extract_register_values(gemini_findings_by_idx)
+        # Same register-contamination fix as the calibration_debug pass
+        # above (see that block's comment) — Gemini gets sent the exact
+        # same prompt, including the register-instructions block when
+        # "register" is selected, so it can return the same register_mixed
+        # noise, which isn't what this second-opinion pass is for.
+        gemini_findings_by_idx = {
+            idx: [f for f in findings if f.get("type") != REGISTER_MIXED_TYPE]
+            for idx, findings in gemini_findings_by_idx.items()
+        }
+        gemini_findings_by_idx = {idx: fs for idx, fs in gemini_findings_by_idx.items() if fs}
+
     out = []
     for idx, row in enumerate(relevant_rows):
         src = row["values"].get(source_lang, "")
@@ -1032,6 +1128,8 @@ async def _check_language_for_sheet(
         findings += ai_findings_by_idx.get(idx, [])
         if calibration_debug:
             findings += _mark_calibration_debug_findings(ai_findings_by_idx_relaxed.get(idx, []))
+        if gemini_check:
+            findings += _mark_gemini_findings(gemini_findings_by_idx.get(idx, []))
         if findings:
             out.append({
                 "excel_row": row["excel_row"],
@@ -1069,6 +1167,38 @@ async def _check_language_for_sheet(
                 ),
             }],
         })
+    if gemini_check and gemini_truncated:
+        out.append({
+            "excel_row": 0,
+            "context": "⚠ Системное предупреждение",
+            "source": "",
+            "translation": "",
+            "findings": [{
+                "type": "system",
+                "severity": "low",
+                "message": (
+                    "🌐 Проверка через Gemini для этого языка была обрезана из-за большого объёма — часть "
+                    "строк могла остаться непроверенной именно этой дополнительной проверкой. На обычную "
+                    "проверку через Claude это не повлияло."
+                ),
+            }],
+        })
+    if gemini_check and gemini_errored:
+        out.append({
+            "excel_row": 0,
+            "context": "⚠ Системное предупреждение",
+            "source": "",
+            "translation": "",
+            "findings": [{
+                "type": "system",
+                "severity": "low",
+                "message": (
+                    "🌐 Проверка через Gemini для этого языка не выполнилась (ошибка сети, ключа или "
+                    "модели) — не повлияло на обычную проверку через Claude, но эта дополнительная "
+                    "проверка не сработала."
+                ),
+            }],
+        })
     if "register" in checks:
         by_excel_row = {relevant_rows[idx]["excel_row"]: v for idx, v in register_values_by_idx.items()}
         texts_by_excel_row = {
@@ -1078,7 +1208,7 @@ async def _check_language_for_sheet(
         block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
         if block is not None:
             out.append(block)
-    return out, cost_usd, debug_cost_usd
+    return out, cost_usd, debug_cost_usd, gemini_cost_usd
 
 
 async def run_multi_check(
@@ -1088,6 +1218,7 @@ async def run_multi_check(
     extra_instructions: str = "",
     target_langs_filter: set[str] | None = None,
     calibration_debug: bool = False,
+    gemini_check: bool = False,
 ) -> dict:
     """
     Each target language gets its own AI call, so the prompt for e.g.
@@ -1105,14 +1236,25 @@ async def run_multi_check(
     (summary["calibration_debug_cost_usd"] shows exactly how much of the
     total came from this extra pass) — off by default, only for a
     deliberate one-off comparison, never for routine checking.
+
+    gemini_check: see _check_language_for_sheet's own comment and
+    app.gemini_client — runs every language's AI check ALSO through Google
+    Gemini (same prompt/calibration, different model provider) and adds
+    whatever it catches as "🌐"-tagged findings, counted as real findings
+    (unlike calibration_debug's test-only ones — see _mark_gemini_findings)
+    since a blind test showed it independently catches real errors ours
+    misses. Also roughly doubles AI cost (summary["gemini_cost_usd"]) —
+    off by default, opt-in per run.
     """
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
     total_findings = 0
     total_debug_findings = 0
+    total_gemini_findings = 0
     total_rows_checked = 0
     total_cost_usd = 0.0
     total_debug_cost_usd = 0.0
+    total_gemini_cost_usd = 0.0
 
     for sheet in sheets:
         target_langs = [l for l in sheet["languages"] if l != source_lang]
@@ -1121,7 +1263,7 @@ async def run_multi_check(
         tasks = [
             _check_language_for_sheet(
                 sheet, lang, source_lang, checks, extra_instructions, semaphore,
-                calibration_debug=calibration_debug,
+                calibration_debug=calibration_debug, gemini_check=gemini_check,
             )
             for lang in target_langs
         ]
@@ -1129,7 +1271,7 @@ async def run_multi_check(
 
         dup_cols = sheet.get("duplicate_language_columns") or {}
         languages_out = {}
-        for lang, (findings_list, lang_cost, lang_debug_cost) in zip(target_langs, per_lang_results):
+        for lang, (findings_list, lang_cost, lang_debug_cost, lang_gemini_cost) in zip(target_langs, per_lang_results):
             findings_list = _apply_duplicate_language_warnings(
                 findings_list, lang, dup_cols, source_lang, show_source_warning=(lang == target_langs[0]),
             )
@@ -1138,8 +1280,12 @@ async def run_multi_check(
             total_debug_findings += sum(
                 1 for row in findings_list for f in row["findings"] if f.get("calibration_debug")
             )
-            total_cost_usd += lang_cost + lang_debug_cost
+            total_gemini_findings += sum(
+                1 for row in findings_list for f in row["findings"] if f.get("gemini_check")
+            )
+            total_cost_usd += lang_cost + lang_debug_cost + lang_gemini_cost
             total_debug_cost_usd += lang_debug_cost
+            total_gemini_cost_usd += lang_gemini_cost
 
         total_rows_checked += len(sheet["rows"])
         result_sheets.append({
@@ -1160,6 +1306,9 @@ async def run_multi_check(
     if calibration_debug:
         summary["calibration_debug_cost_usd"] = total_debug_cost_usd
         summary["calibration_debug_findings"] = total_debug_findings
+    if gemini_check:
+        summary["gemini_cost_usd"] = total_gemini_cost_usd
+        summary["gemini_findings"] = total_gemini_findings
     return {"sheets": result_sheets, "summary": summary}
 
 

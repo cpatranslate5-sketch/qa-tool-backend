@@ -2195,7 +2195,7 @@ _rep_sheet = {
 }
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_repeated_batch
-_rep_out, _rep_cost, _rep_debug_cost = asyncio.get_event_loop().run_until_complete(
+_rep_out, _rep_cost, _rep_debug_cost, _rep_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_rep_sheet, "ru", "en", ["typo", "untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2317,7 +2317,7 @@ _chunk_rows = [
 _chunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _chunk_rows}
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_chunked
-_chunk_out, _chunk_cost, _chunk_debug_cost = asyncio.get_event_loop().run_until_complete(
+_chunk_out, _chunk_cost, _chunk_debug_cost, _chunk_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_chunk_sheet, "ru", "en", ["untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2871,7 +2871,7 @@ async def _fake_call_claude_register_batch(prompt, model=None):
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_batch
-_reg_out, _reg_cost, _reg_debug_cost = asyncio.get_event_loop().run_until_complete(
+_reg_out, _reg_cost, _reg_debug_cost, _reg_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2980,7 +2980,7 @@ async def _fake_call_claude_register_mixed_batch(prompt, model=None):
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_mixed_batch
-_mixed_out, _mixed_cost, _mixed_debug_cost = asyncio.get_event_loop().run_until_complete(
+_mixed_out, _mixed_cost, _mixed_debug_cost, _mixed_gemini_cost = asyncio.get_event_loop().run_until_complete(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -3928,5 +3928,327 @@ print("[OK] calibration_debug + register: a 'mixed' register value reported ONLY
       "correctly discarded rather than surfaced as a 🔬 finding (register reporting isn't confidence-gated, "
       "so it's outside what this feature is meant to compare), while the strict pass's own register_summary "
       "is completely unaffected")
+
+# --- gemini_check ("🌐 Проверить также через Gemini") — Александр's ask,
+# 2026-09-22, after a blind test showed Gemini independently caught a real
+# Marathi meaning error our own model (even with a loosened confidence bar)
+# completely missed, while correctly staying silent on a genuinely-fine
+# control example. Unlike calibration_debug, Gemini's findings are meant to
+# be real/actionable, so they're counted in the headline total_findings —
+# only their SOURCE is tagged, not their standing. ---
+import app.gemini_client as gemini_client_mod
+
+_gem_wb = openpyxl.Workbook()
+_gem_ws = _gem_wb.active
+_gem_ws.append(["Context", "ru", "mr"])
+_gem_ws.append(["freebet", "Фрибет без отыгрыша", "पैज न लावता फ्री बेट"])
+_gem_buf = io.BytesIO()
+_gem_wb.save(_gem_buf)
+_gem_buf.seek(0)
+_gem_sheets = _parse_workbook_direct(_gem_buf.read())
+
+_gem_call_count = {"claude": 0, "gemini": 0}
+
+
+async def _fake_call_claude_for_gemini_test(prompt, model=None):
+    # The normal Claude pass finds nothing here — mirrors the real
+    # production gap this feature exists to cover.
+    _gem_call_count["claude"] += 1
+    return "[]", {"input_tokens": 30, "output_tokens": 5}, "end_turn"
+
+
+async def _fake_call_gemini_ok(prompt, model=None):
+    _gem_call_count["gemini"] += 1
+    return (
+        '[{"row": 1, "type": "typo", "severity": "medium", '
+        '"message": "पैज न लावता буквально значит «без ставки», а не «без отыгрыша»"}]',
+        {"input_tokens": 40, "output_tokens": 25},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.GEMINI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_for_gemini_test
+gemini_client_mod._call_gemini = _fake_call_gemini_ok
+_gem_result = asyncio.run(_run_multi_check_direct(_gem_sheets, "ru", ["typo"], gemini_check=True))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+settings.GEMINI_API_KEY = ""
+
+assert _gem_call_count == {"claude": 1, "gemini": 1}, (
+    f"gemini_check=True must call both Claude (normal pass) and Gemini (extra pass) exactly once each per "
+    f"language — got {_gem_call_count}"
+)
+_gem_mr_findings = _gem_result["sheets"][0]["languages"]["mr"]
+_gem_all = [f for row in _gem_mr_findings for f in row["findings"]]
+assert len(_gem_all) == 1, f"expected exactly the one Gemini finding (Claude found nothing) — got {_gem_all}"
+assert _gem_all[0]["gemini_check"] is True, "a Gemini finding must be tagged gemini_check=True"
+assert _gem_all[0]["message"].startswith("🌐 [Gemini] "), "a Gemini finding's message must be visibly prefixed"
+assert _gem_result["summary"]["total_findings"] == 1, (
+    "unlike calibration_debug, a Gemini finding IS a real, actionable finding and must be counted in the "
+    "headline total_findings — Александр explicitly chose this (not the 'separate, uncounted' treatment "
+    "calibration_debug gets)"
+)
+assert _gem_result["summary"]["gemini_findings"] == 1
+assert _gem_result["summary"]["gemini_cost_usd"] > 0, "the Gemini API call's own cost must be reported separately"
+assert _gem_result["summary"]["cost_usd"] >= _gem_result["summary"]["gemini_cost_usd"], (
+    "the Gemini pass's cost must still be folded into the run's real total cost_usd"
+)
+
+# Control: gemini_check left at its default (False) — no Gemini call at
+# all, no extra summary fields, byte-for-byte the pre-existing behavior.
+_gem_call_count["claude"] = 0
+_gem_call_count["gemini"] = 0
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.GEMINI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_for_gemini_test
+gemini_client_mod._call_gemini = _fake_call_gemini_ok
+_gem_off_result = asyncio.run(_run_multi_check_direct(_gem_sheets, "ru", ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+settings.GEMINI_API_KEY = ""
+assert _gem_call_count == {"claude": 1, "gemini": 0}, "without gemini_check, Gemini must never be called at all"
+assert "gemini_cost_usd" not in _gem_off_result["summary"]
+assert "gemini_findings" not in _gem_off_result["summary"]
+
+# A Gemini call that fails outright (network error, bad key, bad model id,
+# rate limit — anything _call_gemini folds into stop_reason="errored")
+# must show a visible warning, but must NEVER take down the normal Claude
+# result for that same language — this is an optional bolt-on, not
+# something that should ever make the primary check less reliable.
+async def _fake_call_gemini_errored(prompt, model=None):
+    return None, {}, "errored"
+
+
+async def _fake_call_claude_finds_something(prompt, model=None):
+    return (
+        '[{"row": 1, "type": "typo", "severity": "low", "message": "обычная находка через Claude"}]',
+        {"input_tokens": 30, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.GEMINI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_finds_something
+gemini_client_mod._call_gemini = _fake_call_gemini_errored
+_gem_err_result = asyncio.run(_run_multi_check_direct(_gem_sheets, "ru", ["typo"], gemini_check=True))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+settings.GEMINI_API_KEY = ""
+
+_gem_err_mr = _gem_err_result["sheets"][0]["languages"]["mr"]
+_gem_err_all = [f for row in _gem_err_mr for f in row["findings"]]
+assert any(f["message"] == "обычная находка через Claude" for f in _gem_err_all), (
+    f"a failed Gemini call must never suppress the normal Claude finding for the same language — got {_gem_err_all}"
+)
+assert any("не выполнилась" in f.get("message", "") and "🌐" in f.get("message", "") for f in _gem_err_all), (
+    f"a failed Gemini call must produce a visible warning so it doesn't look like 'Gemini checked, found "
+    f"nothing' — got {_gem_err_all}"
+)
+assert _gem_err_result["summary"]["gemini_cost_usd"] == 0.0, "a failed Gemini call must cost nothing"
+print("[OK] gemini_check (\"🌐 Проверить также через Gemini\"): runs the SAME prompt through Gemini alongside "
+      "the normal Claude pass, its findings are tagged/prefixed but counted as real findings (unlike "
+      "calibration_debug's test-only ones) with their own separately-reported cost that still folds into the "
+      "run's total — none of it runs unless explicitly turned on, and a failed Gemini call surfaces a visible "
+      "warning without ever suppressing the normal Claude result for that language")
+
+# Same register-contamination check as calibration_debug got, but for the
+# Gemini pass — register reporting isn't part of what this feature is
+# meant to compare either.
+_gem_reg_wb = openpyxl.Workbook()
+_gem_reg_ws = _gem_reg_wb.active
+_gem_reg_ws.append(["Context", "en", "ru"])
+_gem_reg_ws.append(["greeting", "Hello", "Здравствуйте"])
+_gem_reg_buf = io.BytesIO()
+_gem_reg_wb.save(_gem_reg_buf)
+_gem_reg_buf.seek(0)
+_gem_reg_sheets = _parse_workbook_direct(_gem_reg_buf.read())
+
+
+async def _fake_call_claude_register_formal(prompt, model=None):
+    return (
+        f'[{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal", "message": ""}}]',
+        {"input_tokens": 20, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+async def _fake_call_gemini_register_mixed(prompt, model=None):
+    return (
+        f'[{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
+        {"input_tokens": 20, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.GEMINI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_register_formal
+gemini_client_mod._call_gemini = _fake_call_gemini_register_mixed
+_gem_reg_result = asyncio.run(_run_multi_check_direct(_gem_reg_sheets, "en", ["register"], gemini_check=True))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+settings.GEMINI_API_KEY = ""
+
+_gem_reg_ru = _gem_reg_result["sheets"][0]["languages"]["ru"]
+_gem_reg_all = [f for row in _gem_reg_ru for f in row["findings"]]
+assert not any(f.get("gemini_check") for f in _gem_reg_all), (
+    f"a register value from Gemini must never surface as a 🌐 finding — register reporting isn't part of "
+    f"what this feature compares — got {_gem_reg_all}"
+)
+assert any(f.get("type") == "register_summary" for f in _gem_reg_all), (
+    "the normal Claude-side register_summary must still work, completely unaffected"
+)
+print("[OK] gemini_check + register: a 'mixed' register value returned by Gemini is correctly discarded "
+      "rather than surfaced as a 🌐 finding, exactly like the calibration_debug fix above")
+
+# Partial-chunk-failure isolation for _run_gemini_chunks: a language split
+# across 2+ chunks (MAX_ROWS_PER_AI_CALL) where ONE chunk's Gemini call
+# fails outright must not swallow the OTHER chunk's perfectly good Gemini
+# findings — only the failed chunk's rows should be missing Gemini
+# coverage, with the run-wide "errored" flag still raised so the "🌐 ...
+# не выполнилась" warning shows (subagent review, 2026-09-22 — verified
+# correct via a standalone probe at the time, folded in here as permanent
+# coverage rather than left as a one-off check).
+_gchunk_rows = [
+    {"excel_row": 200 + i, "context": f"row {i}", "max_length": None,
+     "values": {"en": f"Item {i}", "mr": f"आयटम {i}"}}
+    for i in range(MAX_ROWS_PER_AI_CALL + 2)  # spills into a second, smaller chunk
+]
+_gchunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "mr"], "rows": _gchunk_rows}
+_gchunk_gemini_calls: list[list[dict]] = []
+
+
+async def _fake_call_claude_no_findings(prompt, model=None):
+    return "[]", {"input_tokens": 20, "output_tokens": 5}, "end_turn"
+
+
+async def _fake_call_gemini_partial_failure(prompt, model=None):
+    _gchunk_gemini_calls.append(prompt)
+    if len(_gchunk_gemini_calls) == 1:
+        # first chunk: a genuine, usable finding
+        return (
+            '[{"row": 1, "type": "typo", "severity": "low", "message": "первая часть нашла проблему"}]',
+            {"input_tokens": 30, "output_tokens": 15},
+            "end_turn",
+        )
+    # second chunk: the call itself fails outright
+    return None, {}, "errored"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.GEMINI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_no_findings
+gemini_client_mod._call_gemini = _fake_call_gemini_partial_failure
+_gchunk_out, _gchunk_cost, _gchunk_debug_cost, _gchunk_gemini_cost = asyncio.run(
+    _check_language_for_sheet(_gchunk_sheet, "mr", "en", ["typo"], "", asyncio.Semaphore(5), gemini_check=True)
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+settings.GEMINI_API_KEY = ""
+
+assert len(_gchunk_gemini_calls) == 2, "expected exactly 2 Gemini calls — one per chunk"
+_gchunk_by_row = {r["excel_row"]: r["findings"] for r in _gchunk_out}
+# first chunk's finding: local row 1 -> global index 0 -> excel_row 200
+assert any(f.get("gemini_check") and "первая часть нашла проблему" in f["message"] for f in _gchunk_by_row.get(200, [])), (
+    f"the first (successful) chunk's Gemini finding must survive untouched even though the second chunk's "
+    f"call failed — got {_gchunk_by_row.get(200)}"
+)
+_gchunk_warnings = [
+    f for row in _gchunk_out if row["context"] == "⚠ Системное предупреждение" for f in row["findings"]
+]
+assert any("не выполнилась" in f.get("message", "") and "🌐" in f.get("message", "") for f in _gchunk_warnings), (
+    f"a failure in even ONE of several Gemini chunks must still raise the run-wide warning — got {_gchunk_warnings}"
+)
+print("[OK] gemini_check + chunking: when a language spans several chunks (MAX_ROWS_PER_AI_CALL) and only "
+      "ONE chunk's Gemini call fails outright, that chunk's rows simply have no Gemini coverage while every "
+      "OTHER chunk's genuine findings still come through untouched, and the run-wide 🌐 warning still fires "
+      "so the gap is visible rather than silently swallowed")
+
+# Combined calibration_debug=True + gemini_check=True in the same run: both
+# optional extra passes must coexist without interfering with each other —
+# each tagged with its own marker/prefix, each counted (or not) exactly as
+# it would be on its own, and their costs both folding into the same total
+# independently.
+_combo_wb = openpyxl.Workbook()
+_combo_ws = _combo_wb.active
+_combo_ws.append(["Context", "ru", "mr"])
+_combo_ws.append(["freebet", "Фрибет без отыгрыша", "पैज न लावता फ्री बेट"])
+_combo_buf = io.BytesIO()
+_combo_wb.save(_combo_buf)
+_combo_buf.seek(0)
+_combo_sheets = _parse_workbook_direct(_combo_buf.read())
+
+_combo_calls = {"claude_strict": 0, "claude_relaxed": 0, "gemini": 0}
+
+
+async def _fake_call_claude_combo(prompt, model=None):
+    # Called twice per language when calibration_debug=True (strict pass,
+    # then relaxed) — same fake answer both times is fine here, since this
+    # test only needs ONE Claude-side finding to check it isn't duplicated
+    # or miscounted against the relaxed pass or Gemini's own finding below.
+    _combo_calls["claude_strict"] += 1
+    return (
+        '[{"row": 1, "type": "typo", "severity": "low", "message": "обычная находка Claude"}]',
+        {"input_tokens": 30, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+async def _fake_call_gemini_combo(prompt, model=None):
+    _combo_calls["gemini"] += 1
+    return (
+        '[{"row": 1, "type": "typo", "severity": "medium", "message": "находка Gemini"}]',
+        {"input_tokens": 30, "output_tokens": 10},
+        "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.GEMINI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_combo
+gemini_client_mod._call_gemini = _fake_call_gemini_combo
+_combo_result = asyncio.run(
+    _run_multi_check_direct(_combo_sheets, "ru", ["typo"], calibration_debug=True, gemini_check=True)
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+settings.GEMINI_API_KEY = ""
+
+assert _combo_calls == {"claude_strict": 2, "claude_relaxed": 0, "gemini": 1}, (
+    f"expected 2 Claude calls (strict pass + relaxed calibration_debug pass) and 1 Gemini call for this single "
+    f"target language — got {_combo_calls}"
+)
+_combo_mr = _combo_result["sheets"][0]["languages"]["mr"]
+_combo_all = [f for row in _combo_mr for f in row["findings"]]
+_combo_normal = [f for f in _combo_all if not f.get("calibration_debug") and not f.get("gemini_check")]
+_combo_debug = [f for f in _combo_all if f.get("calibration_debug")]
+_combo_gemini = [f for f in _combo_all if f.get("gemini_check")]
+assert len(_combo_normal) == 1 and len(_combo_debug) == 1 and len(_combo_gemini) == 1, (
+    f"expected exactly one finding from each of the three passes (normal Claude, relaxed calibration_debug, "
+    f"Gemini), each distinctly tagged, with none of them bleeding into another — got {_combo_all}"
+)
+assert _combo_debug[0]["message"].startswith("🔬 "), _combo_debug
+assert _combo_gemini[0]["message"].startswith("🌐 [Gemini] "), _combo_gemini
+# calibration_debug's finding stays test-only (excluded); Gemini's finding
+# is real/actionable (included) — total_findings must reflect exactly that
+# split, not double-count or drop either one.
+assert _combo_result["summary"]["total_findings"] == 2, (
+    f"total_findings must count the normal Claude finding + the Gemini finding (both real), but NOT the "
+    f"calibration_debug one (test-only) — got {_combo_result['summary']}"
+)
+assert _combo_result["summary"]["calibration_debug_findings"] == 1
+assert _combo_result["summary"]["gemini_findings"] == 1
+assert _combo_result["summary"]["calibration_debug_cost_usd"] > 0
+assert _combo_result["summary"]["gemini_cost_usd"] > 0
+assert _combo_result["summary"]["cost_usd"] >= (
+    _combo_result["summary"]["calibration_debug_cost_usd"] + _combo_result["summary"]["gemini_cost_usd"]
+), "both extra passes' costs must independently fold into the same run-wide total cost_usd"
+print("[OK] calibration_debug + gemini_check together: both optional extra passes can run in the same "
+      "check without interfering with each other — each produces its own distinctly-tagged finding, "
+      "calibration_debug's stays test-only/excluded from total_findings while Gemini's is counted as real, "
+      "and both extra costs fold independently into the same run-wide total")
 
 print("\nALL SMOKETEST CHECKS PASSED")

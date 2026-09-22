@@ -36,6 +36,19 @@ class Settings:
     CLAUDE_MODEL_HARD: str = os.environ.get("CLAUDE_MODEL_HARD", "claude-opus-5")
     ALLOWED_ORIGINS: list[str] = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
+    # Второй ИИ для сравнения ("🌐 Проверить также через Gemini" — see
+    # app.gemini_client) — Александр's ask, 2026-09-22, after a blind test
+    # showed Gemini independently caught a Marathi meaning error that even
+    # Opus with a loosened confidence bar completely missed (see
+    # app.excel_multi.gemini_check's own comment for the full story). A
+    # SEPARATE Google AI Studio API key, not the Anthropic one above — get
+    # one at aistudio.google.com ("Get API key"), then set GEMINI_API_KEY on
+    # Railway. Optional: GEMINI_MODEL overrides the model id below if
+    # Google renames/retires this one later (see gemini_client.py's own
+    # comment on why this is worth keeping easy to change).
+    GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
+
 
 settings = Settings()
 
@@ -48,3 +61,11 @@ if not settings.ANTHROPIC_API_KEY:
     import warnings
 
     warnings.warn("ANTHROPIC_API_KEY is not set — AI-based checks will be skipped.")
+
+if not settings.GEMINI_API_KEY:
+    # Only the opt-in "🌐 Проверить также через Gemini" pass is skipped —
+    # everything else (the whole rest of the product) works exactly as
+    # before without this key, same graceful-degradation pattern as above.
+    import warnings
+
+    warnings.warn("GEMINI_API_KEY is not set — the optional Gemini second-opinion check will be skipped.")
