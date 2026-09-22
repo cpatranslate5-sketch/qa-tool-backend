@@ -2341,6 +2341,116 @@ print(f"[OK] live multi-check path: a language with more rows than MAX_ROWS_PER_
       f"DIFFERENT chunk is correctly left unmerged, since that chunk's AI call never saw the first chunk's "
       f"rows")
 
+# MAX_ROWS_PER_AI_CALL_HARD: a real Marathi miss (2026-09-22) — the exact
+# same pair, same model (Opus, since mr is on HARD_LANGUAGE_BASES), same
+# prompt — was caught when checked ALONE via the single-pair form but
+# MISSED as part of a normal batched multi-check. Confirms MAX_ROWS_PER_AI_CALL
+# (15) is still too many rows at once for the hardest languages specifically,
+# so those now get their own, much smaller chunk size (1 row — only ever
+# actually proven, not a guessed middle value) while every other language
+# keeps the normal size.
+from app.excel_multi import MAX_ROWS_PER_AI_CALL_HARD, _chunk_size_for_lang
+
+assert MAX_ROWS_PER_AI_CALL_HARD == 1
+assert _chunk_size_for_lang("mr") == MAX_ROWS_PER_AI_CALL_HARD, "mr (Marathi) is on HARD_LANGUAGE_BASES"
+assert _chunk_size_for_lang("mr-IN") == MAX_ROWS_PER_AI_CALL_HARD, "region variants of a hard base must match too"
+assert _chunk_size_for_lang("ky") == MAX_ROWS_PER_AI_CALL_HARD, "ky (Kyrgyz) is on HARD_LANGUAGE_BASES"
+assert _chunk_size_for_lang("ru") == MAX_ROWS_PER_AI_CALL, "ru is NOT a hard language — normal chunk size"
+assert _chunk_size_for_lang("es-mx") == MAX_ROWS_PER_AI_CALL, "an easy language's region variant is unaffected"
+
+_hard_chunk_rows = [
+    {"excel_row": 400 + i, "context": f"row {i}", "max_length": None,
+     "values": {"ru": "Фрибет без отыгрыша", "mr": f"पैज न लावता {i}"}}
+    for i in range(3)
+]
+_hard_chunk_sheet = {"sheet_name": "Sheet1", "languages": ["ru", "mr"], "rows": _hard_chunk_rows}
+_hard_chunk_calls = {"n": 0}
+
+
+async def _fake_call_claude_count_calls(prompt, model=None):
+    _hard_chunk_calls["n"] += 1
+    return "[]", {"input_tokens": 20, "output_tokens": 5}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_count_calls
+asyncio.get_event_loop().run_until_complete(
+    _check_language_for_sheet(_hard_chunk_sheet, "mr", "ru", ["typo"], "", asyncio.Semaphore(5))
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _hard_chunk_calls["n"] == 3, (
+    f"a hard language (mr) with 3 rows must make 3 SEPARATE AI calls (1 row each, MAX_ROWS_PER_AI_CALL_HARD), "
+    f"not 1 batched call — got {_hard_chunk_calls['n']} calls"
+)
+print("[OK] MAX_ROWS_PER_AI_CALL_HARD: a hard-list language (mr, ky, ...) is checked ONE row at a time — proven "
+      "necessary by a real Marathi miss that a single-pair check caught but a same-model, same-prompt batched "
+      "check didn't — while every other language keeps the normal, larger MAX_ROWS_PER_AI_CALL chunk size")
+
+# BATCH_PROMPT_SINGLE_ITEM: Александр's SHARPER follow-up test, 2026-09-22 —
+# even a 1-ROW document upload (so MAX_ROWS_PER_AI_CALL_HARD's chunking
+# fix above doesn't even come into play; it was already exactly 1 row)
+# still missed the same Marathi finding that the single-pair FIELDS form
+# caught reliably. Proved it's not about row COUNT at all — build_batch_prompt
+# always used the full BATCH_PROMPT text, which spends a large block on
+# cross-row duplicate detection that's meaningless with only one pair to
+# compare against nothing. Now build_batch_prompt uses a leaner template
+# (BATCH_PROMPT_SINGLE_ITEM) whenever there's exactly one checkable item —
+# same "row"-numbered JSON shape (so group_batch_findings needs no
+# special-casing), just without the irrelevant cross-row instructions.
+from app.claude_client import build_batch_prompt as _build_batch_prompt_direct
+from app.claude_client import BATCH_PROMPT_SINGLE_ITEM
+
+_one_item = [{"context": "freebet", "source": "Фрибет без отыгрыша", "translation": "पैज न लावता फ्री बेट"}]
+_one_prompt, _one_map = _build_batch_prompt_direct(_one_item, ["typo"], "", "mr", "ru")
+assert "Повторяется по всему документу" not in _one_prompt, (
+    "a single-item prompt must NOT include the cross-row duplicate-detection instructions — there's nothing "
+    "to compare against with only one pair, and Александр's real test showed this extra text costs accuracy"
+)
+assert "Дана одна пара" in _one_prompt, "a single-item prompt must use BATCH_PROMPT_SINGLE_ITEM, not BATCH_PROMPT"
+assert '"row": 1' in _one_prompt, "the single-item prompt must still ask for the SAME row-numbered JSON shape"
+assert _one_map == {1: 0}, "number_to_index must still map correctly for the single-item case"
+
+_two_items = [
+    {"context": "a", "source": "Hello", "translation": "Привет"},
+    {"context": "b", "source": "World", "translation": "Мир"},
+]
+_two_prompt, _two_map = _build_batch_prompt_direct(_two_items, ["typo"], "", "ru", "en")
+assert "Повторяется по всему документу" in _two_prompt, (
+    "a real multi-item batch must still get the full cross-row duplicate-detection instructions — this is "
+    "ONLY skipped for the single-item case, not lost for genuine batches"
+)
+assert "Дана одна пара" not in _two_prompt
+assert _two_map == {1: 0, 2: 1}
+
+# Two review-caught defects, both fixed before shipping: (1) the single-item
+# template must still forbid citing internal row/pair numbers inside a
+# finding's own "message" text — dropped by accident when BATCH_PROMPT_SINGLE_ITEM
+# was first written; (2) register instructions (batch=True) referenced "Пары
+# для проверки" — a section that doesn't exist at all in the single-item
+# template, which uses plain Контекст/Исходный текст/Перевод fields instead.
+assert "НИКОГДА не упоминай" in _one_prompt, (
+    "the single-item prompt must still forbid citing internal row/pair numbers in a finding's message text"
+)
+_one_prompt_reg, _ = _build_batch_prompt_direct(_one_item, ["typo", "register"], "", "mr", "ru")
+assert "Пары для проверки" not in _one_prompt_reg, (
+    f"register instructions for a single-item prompt must NOT reference the (nonexistent, in this template) "
+    f"«Пары для проверки» list — got {_one_prompt_reg!r}"
+)
+assert '"row": 1' in _one_prompt_reg and "register_value" in _one_prompt_reg, (
+    "the single-item register instructions must still ask for a row-numbered register_value entry, matching "
+    "the JSON shape group_batch_findings/_extract_register_values expect"
+)
+_two_prompt_reg, _ = _build_batch_prompt_direct(_two_items, ["typo", "register"], "", "ru", "en")
+assert "Пары для проверки" in _two_prompt_reg, (
+    "a real multi-item batch's register instructions must still reference the pairs list as before"
+)
+print("[OK] BATCH_PROMPT_SINGLE_ITEM: a document check with exactly ONE checkable row now gets a leaner "
+      "prompt (no cross-row duplicate-detection instructions, which are meaningless with nothing to compare "
+      "against) instead of the full BATCH_PROMPT text — a real multi-row batch is completely unaffected and "
+      "still gets the full instructions, and the JSON response shape (\"row\"-numbered) stays identical "
+      "either way so downstream parsing needs no special-casing")
+
 # Message Batches (large-file) path: the same chunking, but through
 # build_batch_plan/finalize_batch_results — one custom_id per chunk, and a
 # chunk that never came back (missing) must not swallow another chunk's
@@ -4219,12 +4329,17 @@ print("[OK] gemini_check + register: a 'mixed' register value returned by Gemini
 # не выполнилась" warning shows (subagent review, 2026-09-22 — verified
 # correct via a standalone probe at the time, folded in here as permanent
 # coverage rather than left as a one-off check).
+# Deliberately NOT a hard language (mr/ky/...) — those now use
+# MAX_ROWS_PER_AI_CALL_HARD (1 row per call, see excel_multi.py) instead of
+# MAX_ROWS_PER_AI_CALL, which would turn this into 17 single-row chunks
+# instead of the 2 chunks this test is actually about ("es" isn't on
+# HARD_LANGUAGE_BASES, so it still gets the normal chunk size).
 _gchunk_rows = [
     {"excel_row": 200 + i, "context": f"row {i}", "max_length": None,
-     "values": {"en": f"Item {i}", "mr": f"आयटम {i}"}}
+     "values": {"en": f"Item {i}", "es": f"Producto {i}"}}
     for i in range(MAX_ROWS_PER_AI_CALL + 2)  # spills into a second, smaller chunk
 ]
-_gchunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "mr"], "rows": _gchunk_rows}
+_gchunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "es"], "rows": _gchunk_rows}
 _gchunk_gemini_calls: list[list[dict]] = []
 
 
@@ -4251,7 +4366,7 @@ settings.GEMINI_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_no_findings
 gemini_client_mod._call_gemini = _fake_call_gemini_partial_failure
 _gchunk_out, _gchunk_cost, _gchunk_debug_cost, _gchunk_gemini_cost = asyncio.run(
-    _check_language_for_sheet(_gchunk_sheet, "mr", "en", ["typo"], "", asyncio.Semaphore(5), gemini_check=True)
+    _check_language_for_sheet(_gchunk_sheet, "es", "en", ["typo"], "", asyncio.Semaphore(5), gemini_check=True)
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""

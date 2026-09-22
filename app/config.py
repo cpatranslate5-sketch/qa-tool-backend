@@ -46,8 +46,13 @@ class Settings:
     # Railway. Optional: GEMINI_MODEL overrides the model id below if
     # Google renames/retires this one later (see gemini_client.py's own
     # comment on why this is worth keeping easy to change).
-    GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
+    # .strip() defensively — a real "API key not valid" from Google
+    # (2026-09-22) turned out worth guarding against a stray trailing
+    # newline/space from copy-pasting into Railway's env-var field, a
+    # classic source of exactly this error that costs nothing to rule out
+    # here rather than leaving Александр to spot it by eye in the dashboard.
+    GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "").strip()
+    GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview").strip()
 
 
 settings = Settings()

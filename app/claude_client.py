@@ -251,6 +251,59 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 (используй "rows" вместо "row" ТОЛЬКО для настоящего повторения одной и той же проблемы в нескольких парах — см.
 выше; для обычной, отдельной находки в одной паре используй "row" как всегда)"""
 
+# A leaner variant of BATCH_PROMPT for the case where a "batch" happens to
+# hold exactly ONE checkable pair — Александр's real test, 2026-09-22: the
+# SAME Marathi pair, checked as a 1-ROW document upload (so batching many
+# rows together isn't even in play here — MAX_ROWS_PER_AI_CALL_HARD already
+# makes every hard-language row its own call), was still missed through the
+# document path, while the SAME exact text through the single-pair fields
+# form (SINGLE_PROMPT below) caught it reliably. The difference isn't row
+# COUNT — it's that build_batch_prompt always used the full BATCH_PROMPT
+# text above, which spends a large block explaining cross-row duplicate
+# detection ("Повторяется по всему документу", "rows" vs "row", comparing
+# pairs against each other) — instructions that are simply meaningless with
+# only one pair to look at, but were still being sent and, it turns out,
+# apparently distracting enough to cost real accuracy on subtle findings.
+# This keeps the SAME "row"-numbered JSON response shape as BATCH_PROMPT
+# (so group_batch_findings/number_to_index need no special-casing) while
+# dropping every instruction that only makes sense with 2+ pairs to compare —
+# functionally converging on SINGLE_PROMPT's simplicity without a second,
+# differently-shaped response format to parse.
+BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качества перевода для бюро переводов. Дана одна пара (контекст, исходный текст, перевод).
+Проверяй только критерии из "Что проверять" ниже.
+
+{target_lang_line}
+
+{calibration}
+
+{source_lang_note}
+
+Особые указания к задаче (важнее общих правил, если есть):
+{extra_instructions}
+
+Контекст: {context}
+Исходный текст:
+\"\"\"{source}\"\"\"
+
+Перевод:
+\"\"\"{translation}\"\"\"
+
+Что проверять: {checks_description}
+Даже если заметишь другую проблему вне этого списка (в т.ч. очевидную и серьёзную) — не включай её в ответ вообще,
+ни под каким из перечисленных типов; для неё есть отдельная проверка, которую нужно включить отдельно. Не подгоняй
+такую находку под ближайший по смыслу разрешённый тип только потому, что это единственный доступный вариант —
+если находка не является настоящим примером именно этого критерия, её не должно быть в ответе.
+
+Важно про сам текст "message": НИКОГДА не упоминай в нём номер пары/строки — ни словом ("пара 1", "строка 1"), ни
+просто числом в скобках. Если нужно различить конкретные места (например, при нескольких предложениях в одном
+тексте) — используй ТОЛЬКО цитаты самого текста (конкретную фразу или предложение), а не номер.
+{register_instructions}
+Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
+(пустой массив [], если проблем нет{register_array_note}):
+[
+  {{"row": 1, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
+]"""
+
 
 def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
     """Client-specific rule: when the source is Russian, English words or
@@ -423,7 +476,7 @@ def _register_language_hint(target_lang: str) -> str:
     return REGISTER_LANGUAGE_HINTS.get(key, "")
 
 
-def _register_instructions(checks: list[str], batch: bool, target_lang: str = "") -> str:
+def _register_instructions(checks: list[str], batch: bool, target_lang: str = "", single_item: bool = False) -> str:
     """Empty string when "register" isn't selected, or when target_lang is
     one of NO_REGISTER_DISTINCTION_LANGS above (nothing added to the
     prompt at all either way). Otherwise, a clearly separate paragraph —
@@ -447,10 +500,21 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
 
     batch=True (BATCH_PROMPT, several pairs of one language visible
     together) asks for one entry per applicable pair, tagged by row
-    number, matching that prompt's existing "row" numbering. batch=False
+    number, matching that prompt's existing "row" numbering — referencing
+    the "Пары для проверки" list BATCH_PROMPT shows the model. batch=False
     (SINGLE_PROMPT, exactly one pair — the standalone /check endpoint)
     asks for exactly one entry (or none) with no row number, since that
     prompt's own findings don't carry one either.
+
+    single_item=True (only meaningful together with batch=True — see
+    BATCH_PROMPT_SINGLE_ITEM/build_batch_prompt) is the third, in-between
+    case: a document check with exactly one row still needs the "row": 1
+    key (its findings go through the same group_batch_findings/
+    _extract_register_values pipeline as a real multi-row batch, which
+    keys everything off "row"/"rows"), but BATCH_PROMPT_SINGLE_ITEM has no
+    "Пары для проверки" list at all to reference — added 2026-09-22 after
+    review caught that referencing a nonexistent list would confuse the
+    model for this exact case.
 
     Also appends _register_language_hint(target_lang) — normally empty,
     but a short language-specific correction for the rare case where the
@@ -458,6 +522,23 @@ def _register_instructions(checks: list[str], batch: bool, target_lang: str = ""
     (see REGISTER_LANGUAGE_HINTS)."""
     if "register" not in checks or _lacks_register_distinction(target_lang):
         return ""
+    if batch and single_item:
+        return (
+            "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, "
+            "как переведено на самом деле: если в переводе этой пары есть прямое обращение к пользователю, "
+            "добавь в тот же JSON-массив ОДНУ дополнительную запись, строго в форме "
+            f'{{"row": 1, "type": "{REGISTER_VALUE_TYPE}", "severity": "low", '
+            '"value": "formal|informal|mixed", "message": ""} — value: "formal", если в ПЕРЕВОДЕ использовано '
+            'обращение на «вы» (или аналог для этого языка); "informal", если на «ты»; "mixed", если В '
+            'ПРЕДЕЛАХ ЭТОГО ОДНОГО перевода (он может состоять из нескольких предложений или абзацев) '
+            'обращение к пользователю НЕПОСЛЕДОВАТЕЛЬНО — где-то встречается «вы», а где-то «ты», а не одна '
+            'форма единообразно на протяжении всего текста. Если в переводе НЕТ прямого обращения к '
+            'пользователю вообще (например, только название, число, техническая метка) — НЕ добавляй эту '
+            'запись вообще, не угадывай по смыслу и не пиши никакого значения. Это НЕ находка об ошибке — не '
+            "описывай её как проблему, не оценивай, правильная это форма или нет, просто зафиксируй, что "
+            "реально написано в переводе (кроме значения \"mixed\" — это описание реального факта смешения "
+            "форм внутри одного текста, а не оценка).\n"
+        ) + _register_language_hint(target_lang)
     if batch:
         return (
             "\nОтдельная задача, НЕ связанная с находками выше — не поиск ошибки, а сбор информации о том, "
@@ -666,6 +747,16 @@ HARD_LANGUAGE_BASES = {
 def _model_for_lang(target_lang: str) -> str:
     base = target_lang.strip().lower().split("-")[0]
     return settings.CLAUDE_MODEL_HARD if base in HARD_LANGUAGE_BASES else settings.CLAUDE_MODEL
+
+
+def _is_hard_language(target_lang: str) -> bool:
+    """Same base-subtag membership test as _model_for_lang, exposed on its
+    own so app.excel_multi's chunk-size decision (see
+    MAX_ROWS_PER_AI_CALL_HARD) can key off "is this language on the hard
+    list" directly, instead of comparing model id strings — which could
+    accidentally coincide if CLAUDE_MODEL and CLAUDE_MODEL_HARD are ever
+    set to the same value on Railway."""
+    return target_lang.strip().lower().split("-")[0] in HARD_LANGUAGE_BASES
 
 
 # USD per single token (not per million) — verified against
@@ -954,21 +1045,22 @@ def build_batch_prompt(
     group_batch_findings once you have the model's response.
     """
     checks_description = _checks_description(checks)
-    register_instructions = _register_instructions(checks, batch=True, target_lang=target_lang)
-    if not checks_description and not register_instructions:
+    # Just a truthiness probe here (is there anything to ask the AI at
+    # all?) — single_item doesn't affect WHETHER this is empty, only its
+    # exact wording once we know len(checkable), so the real value used in
+    # the prompt is recomputed below with the correct single_item flag.
+    if not checks_description and not _register_instructions(checks, batch=True, target_lang=target_lang):
         return None, {}
 
     checkable = [(i, it) for i, it in enumerate(items) if it["translation"].strip()]
     if not checkable:
         return None, {}
 
-    pairs_block = "\n\n".join(
-        f'{n}. Контекст: {it["context"] or "—"}\n'
-        f'Источник: """{it["source"]}"""\n'
-        f'Перевод: """{it["translation"]}"""'
-        for n, (_, it) in enumerate(checkable, start=1)
+    is_single_item = len(checkable) == 1
+    register_instructions = _register_instructions(
+        checks, batch=True, target_lang=target_lang, single_item=is_single_item,
     )
-    prompt = BATCH_PROMPT.format(
+    common_kwargs = dict(
         target_lang_line=_target_lang_line(target_lang),
         calibration=_calibration(checks, relaxed=relaxed),
         source_lang_note=_source_lang_note(source_lang, checks),
@@ -977,8 +1069,27 @@ def build_batch_prompt(
         register_instructions=register_instructions,
         register_array_note=_register_array_note(checks, target_lang=target_lang),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
-        pairs_block=pairs_block,
     )
+    if is_single_item:
+        # See BATCH_PROMPT_SINGLE_ITEM's own comment — skips the whole
+        # cross-row-duplicate instruction block, which is meaningless (and,
+        # per Александр's real test, apparently costly to accuracy) when
+        # there's only one pair to look at in the first place.
+        _, only_item = checkable[0]
+        prompt = BATCH_PROMPT_SINGLE_ITEM.format(
+            context=only_item["context"] or "—",
+            source=only_item["source"],
+            translation=only_item["translation"],
+            **common_kwargs,
+        )
+    else:
+        pairs_block = "\n\n".join(
+            f'{n}. Контекст: {it["context"] or "—"}\n'
+            f'Источник: """{it["source"]}"""\n'
+            f'Перевод: """{it["translation"]}"""'
+            for n, (_, it) in enumerate(checkable, start=1)
+        )
+        prompt = BATCH_PROMPT.format(pairs_block=pairs_block, **common_kwargs)
     number_to_index = {n: idx for n, (idx, _) in enumerate(checkable, start=1)}
     return prompt, number_to_index
 

@@ -16,6 +16,7 @@ from app.claude_client import (
     REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
+    _is_hard_language,
     _model_for_lang,
     _register_mixed_finding,
     _truncation_warning,
@@ -86,6 +87,26 @@ BATCH_THRESHOLD_CHARS = 10_000
 # document. Still far better than one finding per row, just not perfect
 # document-wide dedup any more.
 MAX_ROWS_PER_AI_CALL = 15
+
+# Александр's real-world test, 2026-09-22: the SAME Marathi pair ("फ्रибет
+# без отыгрыша"), through the SAME model (Opus — mr is on HARD_LANGUAGE_BASES,
+# see claude_client._is_hard_language), with the SAME prompt/instructions —
+# was MISSED when checked as part of a normal batch, but CAUGHT when checked
+# alone via the single-pair form. Confirms the exact mechanism
+# MAX_ROWS_PER_AI_CALL above already exists to fight (splitting attention
+# across many rows in one call), just that 15 rows is still too many for the
+# hardest languages specifically — only ever tested/proven down to 1 row at
+# a time, so that's what this uses rather than guessing an untested middle
+# value like 3 or 5. Costs noticeably more per hard-language row (each call
+# repeats the full instruction text for just one row instead of sharing it
+# across up to 15) — a deliberate quality-over-cost trade-off, same spirit
+# as MAX_ROWS_PER_AI_CALL's own. Easy/normal languages are unaffected —
+# still MAX_ROWS_PER_AI_CALL as before.
+MAX_ROWS_PER_AI_CALL_HARD = 1
+
+
+def _chunk_size_for_lang(target_lang: str) -> int:
+    return MAX_ROWS_PER_AI_CALL_HARD if _is_hard_language(target_lang) else MAX_ROWS_PER_AI_CALL
 
 
 def _chunk_list(items: list, size: int) -> list[list]:
@@ -1052,8 +1073,12 @@ async def _check_language_for_sheet(
     # language is split into several smaller ones instead, each still
     # bounded by the same shared semaphore (so the total number of AI calls
     # in flight at once across the whole upload is unaffected by chunking,
-    # only how many rows any single call has to hold at once).
-    item_chunks = _chunk_list(ai_items, MAX_ROWS_PER_AI_CALL)
+    # only how many rows any single call has to hold at once). A hard
+    # language (see MAX_ROWS_PER_AI_CALL_HARD) gets an even smaller chunk
+    # size — proven necessary, not just theoretical, by a real Marathi miss
+    # that a single-pair check caught but a same-model, same-prompt batched
+    # check didn't.
+    item_chunks = _chunk_list(ai_items, _chunk_size_for_lang(lang))
 
     ai_findings_by_idx, cost_usd, truncated = await _run_ai_chunks(
         item_chunks, checks, extra_instructions, lang, source_lang, semaphore, relaxed=False,
@@ -1433,10 +1458,13 @@ def build_batch_plan(
             # See MAX_ROWS_PER_AI_CALL — one Message Batch REQUEST per
             # chunk of this language's rows, not one for the whole
             # language, for the same per-row-attention reason as the live
-            # path (_check_language_for_sheet).
+            # path (_check_language_for_sheet) — including the smaller
+            # MAX_ROWS_PER_AI_CALL_HARD chunk size for a hard language, so
+            # a large upload doesn't get worse per-row attention than a
+            # small one just because it happened to cross BATCH_THRESHOLD_CHARS.
             chunks_skeleton = []
             offset = 0
-            for chunk_idx, chunk_items in enumerate(_chunk_list(ai_items, MAX_ROWS_PER_AI_CALL)):
+            for chunk_idx, chunk_items in enumerate(_chunk_list(ai_items, _chunk_size_for_lang(lang))):
                 custom_id = f"s{s_idx}-t{lang_idx}-c{chunk_idx}"
                 prompt, number_to_index = build_batch_prompt(
                     chunk_items, checks, extra_instructions, lang, source_lang,
