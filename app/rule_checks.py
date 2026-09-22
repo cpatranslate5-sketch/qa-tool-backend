@@ -5,6 +5,7 @@ long text. These catch exactly the things regex is good at: numbers not
 matching between source/translation, and placeholders/tags getting lost
 or corrupted in translation.
 """
+import bisect
 import re
 from collections import Counter
 
@@ -110,6 +111,104 @@ def _near_currency_marker(text: str, start: int, end: int) -> bool:
         or _CURRENCY_CODE_RE.search(before) or _CURRENCY_CODE_RE.search(after)
     )
 
+
+# A second real collision with the short-date shape, caught live on
+# Александр's actual production content (2026-09-22, a real betting-odds
+# promo cell): odds are routinely written as a min-max RANGE of two
+# decimals ("odds from 1.25 to 4.0" / "Quoten von 1,25 bis 4,0") — and
+# "1.25" alone has exactly the same day.month shape as a real short date
+# (both halves are 1-31), so it was being silently split into '1' and
+# '25' and compared that way, while the correctly-localized translation
+# ("1,25", normalized to "1.25") stayed one atom — a spurious mismatch on
+# every single odds range in every language, in a business whose content
+# is overwhelmingly gambling/casino promos full of exactly this pattern.
+# Same fix strategy as the currency-marker case above: disambiguate by
+# CONTEXT, not shape — a genuine date is essentially never paired with a
+# SECOND decimal-shaped number nearby, while a range always is. Checked
+# generically (any nearby "\d+\.\d+", not a specific connector word)
+# since "to"/"bis"/"至"/"до"/... varies by language and this same check
+# runs across every target language in the file.
+#
+# First version of this fix used a flat character-window (15 chars) —
+# subagent review caught two real problems with that: (1) a translation
+# that runs noticeably longer than the English source (German/Russian
+# routinely do) can push the actual range partner outside a fixed small
+# window, silently reopening the exact bug this was meant to fix; (2) an
+# unrelated decimal a few characters from a genuine date (a stray
+# multiplier right before a date in the same clause) could wrongly
+# suppress that date's legitimate reorder-tolerant comparison. Scoping
+# the search to the current SENTENCE instead of a fixed window fixes (1)
+# outright — the partner is found no matter how verbose the phrasing, as
+# long as it's still part of the same sentence — and narrows (2): only a
+# genuinely same-sentence collision can still misfire, which is a much
+# rarer, more defensible edge case than "anything within N characters".
+# Reuses the same sentence-boundary regex and bisect-based scoping
+# already established and tested for check_hyphen_for_dash below, for
+# consistency and because that boundary definition (a real
+# ./!/?/ellipsis, deliberately NOT a bare newline — see the notes above
+# _SENTENCE_BOUNDARY_RE) is exactly the right granularity here too. A
+# generous absolute cap keeps this bounded on pathological content with
+# no real sentence punctuation at all (e.g. one giant unpunctuated cell).
+#
+# Matches EITHER a period or a comma as the decimal separator (like
+# NUMBER_RE itself does) — not just a period. A period-only pattern here
+# would only ever recognize an English-style "1.25" partner and silently
+# miss a German/Russian-style "1,25" one, so a comma-decimal translation's
+# own genuine date could wrongly be treated as having no partner nearby
+# (and get split) while the period-decimal source correctly detects its
+# partner (and doesn't) — a real asymmetry caught while stress-testing
+# this exact fix against a source/translation pair mixing both styles.
+#
+# A THIRD real gap, caught by a second independent review pass: the other
+# bound of a range is very often written as a plain WHOLE number with no
+# decimal point at all ("odds from 1.25 to 4", not "...to 4.0") — normal,
+# common phrasing. _DECIMAL_TOKEN_RE alone never matches that bound, so
+# "1.25" was judged to have no partner and got split into ['1','25'] on
+# the (period-decimal) source, while a comma-decimal translation's own
+# "1,25" — which never even reaches this logic; see _decompose_grouped's
+# early-return for a normalization-changed token — stayed one atom
+# regardless of context, reproducing the exact original bug via that
+# asymmetry. A bare integer is a much weaker signal than a second decimal
+# (ordinary text is full of incidental integers — quantities, years, day
+# counts — that have nothing to do with the candidate number, especially
+# once the search reaches sentence-wide via the window above), so it's
+# only accepted as a partner within a MUCH tighter window: a genuine
+# range bound written as a bare integer is essentially always immediately
+# adjacent, separated only by a short connector ("to 4", "-4", "до 4");
+# an incidental unrelated integer landing that close is a much rarer
+# coincidence than landing somewhere within the whole sentence.
+#
+# Excludes a colon-adjacent digit run ("23" in "23:59") on top of the
+# obvious "already part of a bigger number" exclusion — a pre-existing,
+# already-tested case ("Confirm by 09/20, 23:59" / "Подтверди до 20.09,
+# 23:59") pairs a short date directly with a clock time one comma away,
+# well within this tight window, and a bare time component is exactly
+# the kind of coincidentally-nearby integer this heuristic must NOT treat
+# as a range bound.
+_DECIMAL_TOKEN_RE = re.compile(r"\d+[.,]\d+")
+_INTEGER_TOKEN_RE = re.compile(r"(?<![\d.,:])\d+(?![\d.,:])")
+_RANGE_PARTNER_WINDOW = 200
+_RANGE_PARTNER_TIGHT_WINDOW = 15
+
+
+def _near_range_partner(text: str, start: int, end: int, boundary_ends: list) -> bool:
+    sent_start_idx = bisect.bisect_right(boundary_ends, start) - 1
+    sent_start = boundary_ends[sent_start_idx] if sent_start_idx >= 0 else 0
+    sent_end_idx = bisect.bisect_right(boundary_ends, end)
+    sent_end = boundary_ends[sent_end_idx] if sent_end_idx < len(boundary_ends) else len(text)
+
+    wide_start = max(sent_start, start - _RANGE_PARTNER_WINDOW)
+    wide_end = min(sent_end, end + _RANGE_PARTNER_WINDOW)
+    if _DECIMAL_TOKEN_RE.search(text, wide_start, start) or _DECIMAL_TOKEN_RE.search(text, end, wide_end):
+        return True
+
+    tight_start = max(sent_start, start - _RANGE_PARTNER_TIGHT_WINDOW)
+    tight_end = min(sent_end, end + _RANGE_PARTNER_TIGHT_WINDOW)
+    return bool(
+        _INTEGER_TOKEN_RE.search(text, tight_start, start)
+        or _INTEGER_TOKEN_RE.search(text, end, tight_end)
+    )
+
 # A plain space (regular, non-breaking, or thin) is ALSO a standard
 # thousands separator — it's how Russian formats a big number ("1 500 000"),
 # while the same value shows up comma-grouped in English/Spanish
@@ -207,10 +306,17 @@ def _decompose_grouped(tok: str, allow_short_date: bool = True) -> list[str]:
 
 def _flatten_number_matches(text: str) -> list[str]:
     merged = _merge_space_thousands(text)
+    # Sentence-boundary positions, computed once per call and reused for every
+    # number in this text — see _near_range_partner's comment for why this
+    # (not a flat character window) is what actually scopes "nearby" here.
+    boundary_ends = [m.end() for m in _SENTENCE_BOUNDARY_RE.finditer(merged)]
     out: list[str] = []
     for m in NUMBER_RE.finditer(merged):
         tok = m.group(0)
-        allow_short_date = not _near_currency_marker(merged, m.start(), m.end())
+        allow_short_date = not (
+            _near_currency_marker(merged, m.start(), m.end())
+            or _near_range_partner(merged, m.start(), m.end(), boundary_ends)
+        )
         out.extend(_decompose_grouped(tok, allow_short_date=allow_short_date))
     return out
 
@@ -765,8 +871,157 @@ def check_em_dash_spacing(translation: str) -> list[dict]:
 # (see check_sms_charset, gated the same way in run_rule_checks below),
 # where Александр's own spec requires the OPPOSITE — a plain ASCII hyphen
 # and never an em dash — so this rule would be actively wrong there.
+#
+# Real bug caught live (Александр's report, 2026-09-22): a bulleted rules/
+# T&C list flattened into one cell ("Правила: - пункт один; - пункт два;
+# - пункт три.") uses "- " as a LIST MARKER, not a dash, and every bullet
+# still sits between two ordinary spaces — the first version of this
+# check just excluded a hyphen whenever the nearest character behind it
+# was itself clause-closing punctuation (colon/semicolon/period/etc.).
+# That fixed the reported case but review caught it cutting both ways
+# wrong: (a) it also silently missed a genuine dash typo that happens to
+# START a new sentence ("Ты гений! - воскликнул он." — a real typo, not a
+# list), since "!" is exactly that kind of punctuation; and (b) it still
+# misfired on a list whose OWN items aren't separated by punctuation at
+# all ("Не действует на: - ставки А - ставки Б - возврат.") — only the
+# first bullet sits right after the colon, so every later one was still
+# flagged.
+#
+# The actual distinguishing signal isn't "what's the one character right
+# before this hyphen" — it's "is this hyphen part of a colon-introduced
+# enumeration at all": does a colon appear anywhere between the START of
+# the CURRENT sentence and this hyphen (a colon that opened a list stays
+# in scope until the sentence actually ends — a real sentence boundary,
+# ".", "!", "?", "。", "！", "？", or a line break, not just any
+# punctuation)? Or is the hyphen the very first thing in the whole cell
+# at all (the list's own intro colon lives in a separate column/context,
+# so there's nothing to find here)?
+#
+# And once EITHER of those has recognized one hyphen in this cell as a
+# bullet, every LATER "- " in the same cell is treated as continuing that
+# same list too ("sticky"), regardless of what punctuation (if any)
+# separates one bullet from the next — otherwise a list whose own items
+# aren't semicolon-separated ("Не действует на: - ставки А - ставки Б -
+# возврат.") still only had its very first bullet recognized, and every
+# later one was still wrongly flagged (caught in review). A genuine dash
+# typo unrelated to an established list later in the very same cell is
+# the one residual case this can miss — accepted, since it needs an
+# unusual "list, then unrelated prose dash" combination in one cell, and
+# this check is already advisory/low-severity, not a hard error.
+#
+# "Sentence boundary" here needs care — caught in review, three times:
+# (1) a bare "\." also matched a DECIMAL point ("1.5", "4.0" — an odds
+# value, exactly the kind of number this gambling-promo content is full
+# of), which falsely ended the "sentence" early and dropped an earlier
+# list-opening colon out of scope, flagging a perfectly normal bulleted
+# list all over again. Excluded with digit lookaround on both sides.
+# (2) an ellipsis "..." didn't match at all (each "." is directly
+# adjacent to another one, so the original "not preceded/followed by a
+# dot" exclusion silently ate the whole run) — matched as one unit here
+# instead of not matching, so it still counts as a real sentence boundary
+# rather than letting an earlier colon stay "in scope" indefinitely.
+# (3) an abbreviation period ("т.н.", "e.g.", "U.S.") isn't adjacent to a
+# digit, so the digit guard alone didn't catch it — same false-"sentence
+# ended" effect as the decimal case. A genuine sentence-ending period is
+# followed by whitespace/end-of-string AND does not continue straight
+# into a lowercase word — an abbreviation period is either followed
+# immediately by another letter with no space at all ("т.н."'s first
+# dot), or by a space and then a lowercase continuation of the same
+# phrase ("т.н." 's second dot, before "бонусные"). Real sentence starts
+# overwhelmingly begin with a capital letter or the string simply ends,
+# so this is a solid (if not airtight) practical signal — a lowercase
+# letter starting a new, unrelated real sentence is the one case this
+# still can't tell apart, accepted for the same reason as the sticky
+# list_mode trade-off above: this check is advisory/low-severity.
+# (4) the whitespace-or-end check in (3) was too literal — a period
+# followed by a closing quote/bracket BEFORE the actual whitespace
+# ('Он сказал: "Всё готово." Играй - выигрывай.') failed it outright, so
+# the period was excluded entirely rather than recognized as ending the
+# sentence, again leaving an earlier colon "in scope" for a later,
+# unrelated genuine typo. Fixed the same way _real_last_char handles
+# trailing wrapper content elsewhere in this file: a run of whitespace
+# and/or closing quote/bracket characters right after the period is
+# skipped over before judging what comes next.
+# The run of whitespace/wrapper characters to skip, and the character
+# class used afterwards to decide "did we land on real content, or just
+# another lowercase letter continuing the same word" MUST be mutually
+# exclusive sets — caught in review: with a plain "[\s...]*" followed by
+# "[^a-zа-яё]", the engine could backtrack to matching ZERO wrapper
+# characters and let a SPACE itself satisfy "[^a-zа-яё]" (a space isn't a
+# lowercase letter either), short-circuiting past the real word that
+# follows without ever looking at it — silently defeating the whole
+# skip-then-check idea for exactly the "quote, then space, then a real
+# word" case this was meant to fix. _TERMINATOR excludes whitespace and
+# wrapper characters too, so it can only match by actually reaching past
+# them to real content.
+_CLOSING_WRAP_OR_SPACE = r"[\s\"'»”’)\]]"
+_TERMINATOR = r"[^a-zа-яё\s\"'»”’)\]]"
+_SENTENCE_BOUNDARY_RE = re.compile(
+    r"\.{2,}"
+    r"|(?<!\d)(?<!\.)\.(?!\.)(?!\d)(?=" + _CLOSING_WRAP_OR_SPACE + r"*(?:$|" + _TERMINATOR + r"))"
+    r"|[!?？！。]"
+)
+_COLON_RE = re.compile(r"[:：]")
+
+# NOTE: a bare newline is deliberately NOT a sentence boundary — caught
+# live on Александр's real production content (2026-09-22): a bulleted
+# list flattened into one Excel cell is very often laid out with a BLANK
+# LINE between the colon-introducing header and each bullet, and between
+# the bullets themselves ("правила:\n\n- пункт один;\n\n- пункт два;..."),
+# purely as visual spacing — not as separate "sentences". Treating each
+# newline as its own boundary reset the current-sentence scope right
+# before every single bullet, dropping the list's own intro colon out of
+# scope every time and reflagging the whole list all over again — this
+# was the exact false positive that reopened the original production bug
+# despite it already being "fixed" for the flat, no-newline version of
+# the same list. A period/exclamation/question mark (or ellipsis) is
+# already a strong enough signal on its own; a plain line break within
+# one cell is just formatting.
+
+
 def check_hyphen_for_dash(translation: str) -> list[dict]:
-    count = len(re.findall(r"(?<=\s)-(?=\s)", translation))
+    hyphen_positions = [m.start() for m in re.finditer(r"(?<=\s)-(?=\s)", translation)]
+    if not hyphen_positions:
+        return []
+
+    # A single pass over the whole string collects every boundary/colon
+    # position up front (each O(n)); each hyphen is then resolved against
+    # them with a binary search instead of re-slicing and re-scanning the
+    # ever-growing prefix from scratch for every single hyphen — caught in
+    # review as an O(n²) blowup on a long cell with many hyphens (exactly
+    # the flattened FAQ/T&C blocks this check exists for).
+    boundary_ends = [m.end() for m in _SENTENCE_BOUNDARY_RE.finditer(translation)]
+    colon_positions = [m.start() for m in _COLON_RE.finditer(translation)]
+    first_nonws = re.search(r"\S", translation)
+    first_nonws_pos = first_nonws.start() if first_nonws else len(translation)
+
+    count = 0
+    # A hyphen that opens the cell with NO leading space at all ("- First
+    # item...") never matches the (?<=\s) lookbehind above in the first
+    # place — it isn't preceded by anything, let alone whitespace — so it
+    # would otherwise be entirely invisible to this function and never set
+    # list_mode, leaving a later, punctuation-less bullet in the same list
+    # wrongly flagged. Checked directly instead.
+    list_mode = translation.lstrip().startswith("- ")
+    for pos in hyphen_positions:
+        if list_mode:
+            continue
+        if pos <= first_nonws_pos:
+            list_mode = True
+            continue  # nothing at all before this hyphen in the whole cell — a bullet, not a typo
+        # bisect_right - 1 can legitimately come out to -1 (no boundary at
+        # all before this hyphen yet) — Python then happily indexes from
+        # the END of the list instead of raising, silently treating the
+        # LAST boundary in the whole string as if it were the start of
+        # the current sentence. Guarded explicitly instead of relying on
+        # negative-index wraparound.
+        boundary_idx = bisect.bisect_right(boundary_ends, pos) - 1
+        sentence_start = boundary_ends[boundary_idx] if boundary_idx >= 0 else 0
+        colon_idx = bisect.bisect_left(colon_positions, sentence_start)
+        if colon_idx < len(colon_positions) and colon_positions[colon_idx] < pos:
+            list_mode = True
+            continue  # this hyphen is inside a colon-introduced enumeration — a list marker, not a dash typo
+        count += 1
     if not count:
         return []
     return [{

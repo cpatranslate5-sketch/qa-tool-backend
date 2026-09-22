@@ -3193,4 +3193,306 @@ assert check_punctuation("Fast.", "Быстро - просто.", checks=["punct
 print("[OK] check_punctuation: new rules require spaces around an em dash and flag a lone hyphen standing in "
       "for one, both skipped for SMS content (where a plain hyphen is required and an em dash is forbidden)")
 
+# Real bug caught live in production (Александр's report, 2026-09-22): a
+# bulleted rules/T&C list flattened into one cell uses "- " as a list
+# marker after a colon/semicolon/period, and the first version of
+# check_hyphen_for_dash flagged every single bullet as a dash typo. Fixed
+# by only flagging a hyphen whose preceding non-whitespace character is
+# ordinary text, never one that just closed the previous clause/bullet
+# (colon, semicolon, period, question/exclamation mark, line break, or the
+# very start of the string).
+from app.rule_checks import check_hyphen_for_dash
+
+bulleted_rules = (
+    "以下情况不发放免费赌注： - 使用奖励账户进行的赌注； - 使用免费赌注进行的赌注； - 退还的赌注； - 在结算前出售的赌注。"
+)
+assert check_hyphen_for_dash(bulleted_rules) == [], (
+    "a bulleted rules list using \"- \" as a list marker after a colon/semicolon must NOT be flagged as a "
+    "dash typo — this is the exact real-world text that surfaced the bug in production"
+)
+assert check_hyphen_for_dash("- First item. - Second item.") == [], (
+    "a bullet at the very start of the string (nothing before it at all) must also not be flagged"
+)
+assert check_hyphen_for_dash("Играйте сейчас - выигрывайте призы.") != [], (
+    "a genuine mid-sentence dash typo (ordinary text right before the hyphen, not a clause-closing mark) "
+    "must still be caught — the bullet-list fix must not silence real cases"
+)
+print("[OK] check_hyphen_for_dash: a bulleted list (\"...правила: - пункт один; - пункт два;\") is no longer "
+      "misread as a run of dash typos, while a genuine mid-sentence \" - \" typo is still caught")
+
+# Two more real gaps caught in a second round of review of the same fix:
+# (a) excluding a hyphen whenever the single character right before it was
+# clause-closing punctuation also silently missed a genuine dash typo that
+# happens to open a NEW sentence/clause ("Ты гений! - воскликнул он." is a
+# real typo, not a list); (b) a bulleted list whose OWN items aren't
+# separated by semicolons/periods at all ("Не действует на: - ставки А -
+# ставки Б - возврат.") still only had its very first bullet recognized —
+# every later one was still flagged. Fixed with a "sentence-scoped colon,
+# then sticky" rule: a hyphen is a list marker if a colon appears anywhere
+# since the current sentence started (or the hyphen opens the whole cell),
+# and once ONE hyphen in a cell is recognized as a bullet, every later one
+# in the same cell is treated as continuing that list too.
+assert check_hyphen_for_dash("Ты гений! - воскликнул он.") != [], (
+    "a genuine dash typo that happens to open a new sentence/clause (dialogue attribution, no colon anywhere "
+    "in that sentence) must still be caught, not swallowed by the bullet-list exception"
+)
+assert check_hyphen_for_dash(
+    "Не действует на: - ставки со счета А - ставки со счета Б - возвращенные ставки."
+) == [], (
+    "every bullet in a colon-introduced list must be recognized as a list marker, even when the bullets "
+    "themselves aren't separated by semicolons/periods — not just the very first one"
+)
+assert check_hyphen_for_dash("- Первый пункт. - Второй пункт.") == [], (
+    "a list with no leading space before its very first bullet (so the extraction regex's own whitespace "
+    "lookbehind can't even see that first hyphen) must still have its later bullets recognized as a list, "
+    "not flagged as typos"
+)
+print("[OK] check_hyphen_for_dash: a genuine dash typo opening a new sentence is still caught (not swallowed "
+      "by the bullet-list exception), and every bullet of a colon-introduced list is recognized — not just "
+      "the first one — regardless of what (if anything) separates the bullets themselves")
+
+# Three more real bugs caught in a third round of review of the same fix:
+# (a) a Python negative-index pitfall — bisect_right(...) - 1 can come out
+# to -1 (no sentence boundary at all before this hyphen yet), and
+# indexing a non-empty list at -1 silently wraps to its LAST element
+# instead of meaning "none found", which made the very first colon check
+# in a cell use the LAST boundary in the whole string as if it were the
+# current sentence's start — this alone reopened the original production
+# bug (the exact colon+semicolon list was wrongly flagged again once the
+# O(n²) rewrite introduced it); (b) a decimal point in an odds value
+# ("1.5", "4.0" — extremely common in this gambling-promo content) was
+# treated as a sentence-ending period, dropping an earlier list-opening
+# colon out of scope; (c) an ellipsis "..." didn't register as a sentence
+# boundary at all, letting a colon from an much earlier, unrelated
+# sentence stay "in scope" across it and mask a genuine later dash typo.
+translation_again = (
+    "以下情况不发放免费赌注： - 使用奖励账户进行的赌注； - 使用免费赌注进行的赌注； - 退还的赌注； - 在结算前出售的赌注。"
+)
+assert check_hyphen_for_dash(translation_again) == [], (
+    "the exact production bulleted-list text must still be recognized as a list after the performance "
+    "rewrite — a negative-index bug in the rewrite silently reopened the original false positive"
+)
+assert check_hyphen_for_dash(
+    "Не действует на: - ставки с коэф. менее 1.5 - ставки более 4.0."
+) == [], "a decimal odds value (\"1.5\", \"4.0\") inside a colon-introduced list must not be mistaken for a " \
+    "sentence-ending period and drop the list's own colon out of scope"
+assert check_hyphen_for_dash("Услуга недоступна: подробности... Играй - выигрывай.") != [], (
+    "an ellipsis must count as a real sentence boundary — a colon from an earlier, unrelated sentence must "
+    "not stay \"in scope\" across it and mask a genuine later dash typo"
+)
+print("[OK] check_hyphen_for_dash: a negative-index bug that had silently reopened the original production "
+      "false positive is fixed, a decimal odds value inside a list no longer breaks the list's own colon "
+      "scope, and an ellipsis correctly ends a sentence instead of letting an unrelated earlier colon linger")
+
+# Performance: the position-based rewrite must stay roughly linear, not
+# quadratic, on a long cell with many hyphens (the flattened FAQ/T&C
+# blocks this check exists for can run to tens of thousands of characters).
+import time as _hyphen_perf_time
+
+_perf_text = "Правила: " + " - пункт правила номер такой-то, с длинным текстом внутри" * 3000
+_perf_start = _hyphen_perf_time.time()
+check_hyphen_for_dash(_perf_text)
+assert _hyphen_perf_time.time() - _perf_start < 2.0, (
+    "check_hyphen_for_dash must stay fast on a long cell with many hyphens, not blow up quadratically"
+)
+print("[OK] check_hyphen_for_dash: stays fast on a long cell with many hyphens (position-based, not "
+      "re-scanning the whole prefix for every single hyphen)")
+
+# A fourth real gap caught in a fourth review round: an abbreviation
+# period ("т.н.", "e.g.") isn't adjacent to a digit, so the decimal guard
+# alone didn't stop it from being mistaken for a sentence-ending period,
+# which dropped an earlier list-opening colon out of scope the same way
+# the decimal bug did. Fixed by also requiring a genuine sentence-ending
+# period to be followed by whitespace/end-of-string and NOT continue
+# straight into a lowercase word.
+assert check_hyphen_for_dash("Не действует на: т.н. бонусные игры - слоты - джекпоты.") == [], (
+    "a Russian abbreviation (\"т.н.\") inside a colon-introduced list must not be mistaken for a "
+    "sentence-ending period and drop the list's own colon out of scope"
+)
+assert check_hyphen_for_dash("Not valid for: e.g. bonus games - slots - jackpots.") == [], (
+    "the same must hold for a Latin abbreviation (\"e.g.\")"
+)
+print("[OK] check_hyphen_for_dash: an abbreviation period (\"т.н.\", \"e.g.\") inside a colon-introduced list "
+      "is no longer mistaken for a sentence-ending period")
+
+# A fifth real gap caught in a fifth review round, and it was a genuine
+# regex-backtracking trap, not just a missing case: the abbreviation fix
+# above skipped a run of whitespace/closing-quote characters after a
+# period before checking whether a lowercase letter followed — but the
+# "skip" class and the "is this a lowercase letter" check class
+# overlapped (both matched plain whitespace), so the engine could
+# backtrack to skip ZERO characters and let the space itself satisfy
+# "not a lowercase letter", short-circuiting past the real following word
+# without ever reaching it. Concretely: a period followed by a closing
+# quote mark before the actual sentence-ending space+capital-letter
+# ('Он сказал: "Всё готово." Играй - выигрывай.') was wrongly excluded
+# as a boundary, leaving the earlier colon "in scope" for the later,
+# unrelated genuine typo. Fixed by making the "skip" and "terminator"
+# character classes mutually exclusive so the skip can't be shortchanged.
+assert check_hyphen_for_dash('Он сказал: "Всё готово." Играй - выигрывай.') != [], (
+    "a sentence-ending period followed by a closing quote before the actual whitespace must still be "
+    "recognized as ending the sentence, so an unrelated earlier colon doesn't stay \"in scope\" and mask a "
+    "genuine later dash typo"
+)
+print("[OK] check_hyphen_for_dash: a period followed by a closing quote/bracket before the real whitespace "
+      "is still correctly recognized as ending the sentence, not swallowed by a regex-backtracking gap in "
+      "the abbreviation-detection logic")
+
+# A sixth real gap, caught live on Александр's actual production content
+# (a real casino free-bet promo cell, 2026-09-22): his bulleted lists are
+# very often laid out with a BLANK LINE between the colon-introducing
+# header and each bullet, and between the bullets themselves — purely as
+# visual spacing within one Excel cell, not as separate "sentences". A
+# bare newline was still one of the sentence-boundary characters at the
+# time, so it reset the current-sentence scope right before every single
+# bullet, dropping the list's own intro colon out of scope every time and
+# reflagging the whole list all over again — even though the flat,
+# no-newline version of the exact same list already worked correctly.
+# Fixed by dropping the bare newline from the boundary set entirely (a
+# real sentence-ending mark is already a strong enough signal on its own).
+real_production_row = (
+    "以下情况不发放免费赌注：\n\n"
+    "- 使用奖励账户进行的赌注；\n\n"
+    "- 使用免费赌注进行的赌注；\n\n"
+    "- 退还的赌注；\n\n"
+    "- 在结算前出售的赌注。"
+)
+assert check_hyphen_for_dash(real_production_row) == [], (
+    "a colon-introduced bulleted list laid out with a blank line between the header and each bullet (real "
+    "production content) must be recognized as a list, not reflagged as four separate dash typos"
+)
+assert check_hyphen_for_dash("Играй сейчас - выигрывай.\nПозже - смотри.") != [], (
+    "two genuinely separate dash typos on different lines (no period between them) must still both be "
+    "caught — dropping the newline boundary must not make this check blind to typos separated only by a "
+    "line break"
+)
+print("[OK] check_hyphen_for_dash: a bulleted list laid out with a blank line between the colon header and "
+      "each bullet (real production content) is correctly recognized as a list, while genuine typos "
+      "separated only by a line break are still both caught")
+
+# A real numbers-check false positive, also caught live on Александр's
+# actual production content (the same 2026-09-22 casino free-bet promo
+# cell): betting-odds ranges like "с коэффициентом от 1.25 до 4.0" are
+# extremely common in his gambling/casino content, and "1.25" alone has
+# exactly the same day.month shape as a genuine short date (both halves
+# are 1-31) — so it was being silently split into '1'/'25' by the
+# short-date decomposition, causing a spurious numbers-mismatch finding
+# even though every target language carried the exact same odds range.
+# Fixed with _near_range_partner: a real date is essentially never paired
+# with a SECOND decimal-shaped number nearby, while a range always is.
+odds_source = "Available on bets with odds from 1.25 to 4.0."
+odds_translation_de = "Verfügbar bei Wetten mit Quoten von 1,25 bis 4,0."
+assert check_numbers(odds_source, odds_translation_de) == [], (
+    "a betting-odds decimal range ('1.25 to 4.0') must not be misread as a short date and split into "
+    "separate digits — this must not produce a spurious numbers mismatch"
+)
+# Control: a genuine short date (only ONE decimal-shaped token nearby, no
+# range partner) must still be freely reorderable/normalizable exactly as
+# before this fix — _near_range_partner must not over-suppress real dates.
+assert check_numbers("Promo runs until 20.09.", "Акция до 09.20.") == [], (
+    "a genuine short date with no nearby range partner must still compare order-agnostically as before"
+)
+# Control: a real numbers mismatch on an isolated decimal (no range
+# partner, no currency marker) must still be caught.
+assert check_numbers("The price is 1.25.", "Цена составляет 1.35.") != [], (
+    "an isolated decimal mismatch with no nearby range partner must still be flagged as a real difference"
+)
+print("[OK] check_numbers: a betting-odds decimal range ('1.25 to 4.0', real production content) is no "
+      "longer misidentified as a short date and split into separate digits, while genuine short dates and "
+      "genuine isolated decimal mismatches are still handled correctly")
+
+# Independent subagent review of the fix above caught two further real gaps
+# in its first version (a flat 15-character window around the candidate
+# number): (1) a translation phrased more verbosely than the English source
+# (very common for German/Russian) can push the actual range partner
+# outside a small fixed window, reopening the exact bug just fixed; (2) the
+# partner-detection regex only recognized a PERIOD as a decimal separator,
+# so a comma-decimal translation's own genuine date could be judged to have
+# "no partner nearby" (and get split) while the period-decimal source
+# correctly found its partner (and didn't) — an asymmetry that produced a
+# fresh spurious mismatch of its own. Fixed by scoping the partner search to
+# the current sentence (reusing the same _SENTENCE_BOUNDARY_RE/bisect
+# machinery already hardened for check_hyphen_for_dash) instead of a flat
+# window, and by recognizing both "." and "," as decimal separators.
+odds_source_verbose = (
+    "Available on selected bets with odds starting from as low as 1.25 and going "
+    "all the way up to 4.0 for select events."
+)
+odds_translation_verbose_de = (
+    "Verfügbar bei ausgewählten Wetten mit Quoten von mindestens 1,25 bis hin zu "
+    "4,0 für bestimmte Events."
+)
+assert check_numbers(odds_source_verbose, odds_translation_verbose_de) == [], (
+    "an odds range phrased verbosely enough to push the two numbers more than 15 characters apart must "
+    "still be recognized as a range, not reflagged as a short-date mismatch"
+)
+assert check_numbers(
+    "Promo runs until 20.09. Odds range from 1.25 to 4.0.",
+    "Акция до 20.09. Коэффициенты от 1,25 до 4,0.",
+) == [], (
+    "a comma-decimal odds range ('1,25 до 4,0') must be recognized as a range partner exactly like a "
+    "period-decimal one — before this fix, only the period-decimal source found its partner and kept its "
+    "date as one atom, while the comma-decimal translation found none and split its (identical) date into "
+    "separate digits, producing a mismatch out of two literally identical dates"
+)
+# NOTE (accepted trade-off, same principle as the pre-existing currency-marker
+# case): a date that shares a sentence with a range/currency partner forgoes
+# order-agnostic date comparison entirely (both sides stay as one exact-match
+# atom) — so if the SAME date is genuinely written in a different digit order
+# between source and translation while sharing a sentence with a range, it
+# still surfaces as a mismatch. This is rare (a date and a decimal range
+# coexisting in one sentence at all is uncommon) and matches how the
+# currency-marker case already behaves; making it fully order-agnostic AND
+# context-aware would need real date parsing, not a text heuristic.
+assert check_numbers(
+    "Promo runs until 20.09. Odds range from 1.25 to 4.0.",
+    "Акция до 09.20. Коэффициенты от 1,25 до 4,0.",
+) != [], (
+    "documenting the accepted trade-off: a date reordered between source/translation while sharing a "
+    "sentence with a range partner is still flagged, since suppressing short-date treatment near a range "
+    "partner means the date is compared as one exact atom, not order-agnostically"
+)
+print("[OK] check_numbers: _near_range_partner scopes its search to the current sentence (not a flat "
+      "character window), so a verbosely-phrased odds range is still recognized no matter how far apart "
+      "the two numbers land, and a comma-decimal range partner is recognized exactly like a period-decimal "
+      "one")
+
+# A THIRD real gap, caught by a second independent review pass: a range's
+# other bound is very often written as a plain WHOLE number with no decimal
+# point at all ("odds from 1.25 to 4", not "...to 4.0") — normal, common
+# phrasing. _DECIMAL_TOKEN_RE alone never matches that bound, so "1.25" was
+# judged to have no partner and split into ['1','25'] on the period-decimal
+# source, while the comma-decimal translation's "1,25" — which bypasses this
+# logic entirely regardless of context (see _decompose_grouped's early
+# return) — stayed one atom, reproducing the original bug via that
+# asymmetry. Fixed by also accepting a bare integer as a partner, but only
+# within a much tighter window (a real range bound is essentially always
+# immediately adjacent; an unrelated integer is common enough in ordinary
+# text that a loose, sentence-wide search for it would misfire constantly).
+assert check_numbers(
+    "Odds from 1.25 to 4 on this match.",
+    "Коэффициенты от 1,25 до 4 в этом матче.",
+) == [], (
+    "a whole-number range bound ('1.25 to 4', no decimal point on the second number) must still be "
+    "recognized as a range partner for the decimal-shaped bound, not just a second decimal-shaped number"
+)
+assert check_numbers(
+    "Odds from 4 to 1.25 on this match.",
+    "Коэффициенты от 4 до 1,25 в этом матче.",
+) == [], "the integer-bound partner must be recognized on either side of the decimal-shaped token, not just after it"
+# Regression guard: the tight integer-partner window must NOT swallow the
+# pre-existing "short date directly followed by a clock time" case just
+# above ("Confirm by 09/20, 23:59" / "Подтверди до 20.09, 23:59") — a time
+# like "23:59" sits well within the tight window of a comma-separated date,
+# and a first version of this fix broke exactly that already-tested case by
+# treating "23" as a stray range partner. Colon-adjacent digits are always
+# a time/ratio component, never a bare range bound, so they're excluded.
+assert check_numbers("Confirm by 09/20, 23:59", "Подтверди до 20.09, 23:59") == [], (
+    "a short date immediately followed by a clock time must still compare order-agnostically — a "
+    "colon-joined number ('23:59') must never be mistaken for an integer range partner"
+)
+print("[OK] check_numbers: a whole-number range bound ('1.25 to 4') is recognized via a tight-proximity "
+      "integer partner check, without breaking the pre-existing short-date-followed-by-a-clock-time case "
+      "(a colon-adjacent number is never mistaken for a range bound)")
+
 print("\nALL SMOKETEST CHECKS PASSED")
