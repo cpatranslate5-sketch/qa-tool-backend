@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 
@@ -485,6 +486,86 @@ async def _search_findings(
     model = model_override or _model_for_lang(target_lang)
     text_block, usage, _stop_reason = await _call_claude(prompt, model=model)
     return _parse_search_findings(text_block, checkable), _usage_cost(model, usage)
+
+
+async def _search_findings_degrading_on_outage(
+    items: list[dict], target_lang: str, source_lang: str, model_override: str,
+) -> tuple[dict[int, list[str]], float]:
+    """Same as _search_findings, but a transient Anthropic-side failure
+    (httpx.HTTPError — rate limit, timeout, network error, an outage —
+    the exact same exception type app.main's own outage-vs-bug distinction
+    already keys off elsewhere) on THIS model's call degrades to "found
+    nothing, cost $0" instead of raising. Used only by
+    _ensemble_search_findings, so one of the two models having a bad
+    moment doesn't sink the other model's already-good candidates along
+    with it. A genuine bug (not an HTTP error) still propagates normally —
+    this only widens what already degrades gracefully, it doesn't hide
+    real problems."""
+    try:
+        return await _search_findings(
+            items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
+        )
+    except httpx.HTTPError:
+        return {}, 0.0
+
+
+async def _ensemble_search_findings(
+    items: list[dict], target_lang: str = "", source_lang: str = "",
+) -> tuple[dict[int, list[str]], float]:
+    """Step 1, but under TWO models at once — Александр's ask, 2026-09-23,
+    after the plain two-step pipeline (one Sonnet search + one Sonnet
+    check) already fixed the two known Kyrgyz/French misses but he still
+    occasionally found "some" real errors slipping through on other real
+    files. Runs _search_findings under CLAUDE_MODEL (the same model Step 2
+    itself uses) and CLAUDE_MODEL_FAST (Haiku) CONCURRENTLY (asyncio.gather
+    — not one after the other, so this doesn't add real wait time to a
+    check, only cost) and pools both models' candidates per pair before
+    Step 2 ever sees them. Rationale: different models keep noticing
+    different real errors throughout this whole investigation (e.g. the
+    "отыгрыш" case, where Haiku caught something Sonnet initially missed),
+    so a candidate found by EITHER model reaches Step 2 — which still does
+    its own independent judgment on every candidate (and still looks for
+    things neither model's search step caught), exactly as before. Haiku
+    being roughly half CLAUDE_MODEL's per-token price (see
+    MODEL_PRICING_PER_TOKEN) keeps the added cost of this second search
+    call modest relative to Step 2's own cost.
+
+    Only used when the caller hasn't forced a specific model via
+    model_override (see run_ai_checks_batch) — a caller asking for one
+    exact model (currently only smoketest's own model_override coverage)
+    wants a single, predictable model for every call it makes, not a
+    second, hidden Haiku call added on top.
+
+    Each model's call is individually degraded to "found nothing" (not
+    raised) on a transient Anthropic-side failure — see
+    _search_findings_degrading_on_outage's own comment. Before this
+    ensemble, Step 1 was a single call, so a transient failure there had
+    only one place to happen; now there are two independent network calls
+    that could each fail the whole check on their own if left to propagate,
+    for no good reason — Step 2 already handles an empty prior_findings
+    block gracefully and does its own independent judgment regardless of
+    what Step 1 found."""
+    (sonnet_findings, sonnet_cost), (haiku_findings, haiku_cost) = await asyncio.gather(
+        _search_findings_degrading_on_outage(
+            items, target_lang=target_lang, source_lang=source_lang, model_override=_model_for_lang(target_lang),
+        ),
+        _search_findings_degrading_on_outage(
+            items, target_lang=target_lang, source_lang=source_lang, model_override=settings.CLAUDE_MODEL_FAST,
+        ),
+    )
+    merged: dict[int, list[str]] = {}
+    for idx in sorted(set(sonnet_findings) | set(haiku_findings)):
+        # De-duped by exact text (both models occasionally phrase the same
+        # real issue identically) while keeping first-seen order — Sonnet's
+        # own phrasing wins a literal tie, Haiku's candidates still follow.
+        seen: set[str] = set()
+        combined: list[str] = []
+        for candidate in sonnet_findings.get(idx, []) + haiku_findings.get(idx, []):
+            if candidate not in seen:
+                seen.add(candidate)
+                combined.append(candidate)
+        merged[idx] = combined
+    return merged, sonnet_cost + haiku_cost
 
 
 def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
@@ -1221,21 +1302,23 @@ async def run_ai_checks(
         return [], 0.0
 
     # Step 1 of the two-step pipeline (see FINDINGS_SEARCH_PROMPT's own
-    # comment) — a single-pair "items" list of one, so _search_findings'
+    # comment) — a single-pair "items" list of one, so _ensemble_search_findings'
     # shared plumbing (same one run_ai_checks_batch below uses) works
-    # unchanged here too. Costs an extra API call every time, which is the
-    # whole point (Александр's ask, 2026-09-23) — summed into this
-    # function's own returned cost_usd below. Only worth running when
-    # there's an actual "Что проверять" list to search against — a
-    # register-ONLY run (checks_description empty, register_instructions
-    # not) has nothing for a free error search to even look for, so it's
-    # skipped there rather than spending a whole extra call finding nothing
-    # relevant, exactly like build_batch_prompt/_search_findings's own
-    # "nothing checkable" early-outs.
+    # unchanged here too. Runs under TWO models at once (Sonnet + Haiku —
+    # see _ensemble_search_findings's own comment, Александр's ask,
+    # 2026-09-23) and costs two extra API calls every time, which is the
+    # whole point — summed into this function's own returned cost_usd
+    # below. Only worth running when there's an actual "Что проверять"
+    # list to search against — a register-ONLY run (checks_description
+    # empty, register_instructions not) has nothing for a free error
+    # search to even look for, so it's skipped there rather than spending
+    # whole extra calls finding nothing relevant, exactly like
+    # build_batch_prompt/_search_findings's own "nothing checkable"
+    # early-outs.
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
     if checks_description:
-        prior_findings, search_cost = await _search_findings(
+        prior_findings, search_cost = await _ensemble_search_findings(
             [{"context": "", "source": source, "translation": translation}],
             target_lang=target_lang, source_lang=source_lang,
         )
@@ -1444,16 +1527,23 @@ async def run_ai_checks_batch(
     # Step 1 — same rationale as run_ai_checks's own call to this,
     # including skipping it entirely for a register-only run (nothing for
     # a free error search to look for — see run_ai_checks's own comment on
-    # this same guard). Passed the same model_override as Step 2 below, so
-    # a caller forcing a specific model gets that model for both steps
-    # rather than Step 1 quietly running under _model_for_lang's normal
-    # pick instead.
+    # this same guard). Uses the Sonnet+Haiku ensemble (see
+    # _ensemble_search_findings's own comment) UNLESS this specific call
+    # forced a single model via model_override — that override exists so a
+    # caller (currently only smoketest's own coverage) gets exactly one
+    # predictable model for every call it makes, not a second, hidden
+    # Haiku call added on top of its own choice.
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
     if checks_description:
-        prior_findings, search_cost = await _search_findings(
-            items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
-        )
+        if model_override:
+            prior_findings, search_cost = await _search_findings(
+                items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
+            )
+        else:
+            prior_findings, search_cost = await _ensemble_search_findings(
+                items, target_lang=target_lang, source_lang=source_lang,
+            )
 
     prompt, number_to_index = build_batch_prompt(
         items, checks, extra_instructions, target_lang, source_lang, prior_findings=prior_findings,
