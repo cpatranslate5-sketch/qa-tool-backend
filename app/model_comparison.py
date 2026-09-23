@@ -89,8 +89,38 @@ DEFAULT_COMPARISON_MODELS = ["sonnet", "haiku"]
 MAX_RUNS_PER_MODEL = 10
 
 
+async def _run_search_step(
+    item: dict, target_lang: str, source_lang: str, model_id: str, semaphore: asyncio.Semaphore,
+) -> tuple[dict[int, list[str]], float]:
+    """Step 1 of the two-step pipeline (claude_client.FINDINGS_SEARCH_PROMPT
+    — see that constant's own comment), run under THIS specific candidate
+    model_id rather than claude_client._search_findings' own
+    _model_for_lang(target_lang) choice — this diagnostic exists precisely
+    to compare Opus/Sonnet/Haiku against each other, so Step 1 needs to run
+    under whichever model this particular comparison run is testing, not
+    always production's own choice. Rebuilt from claude_client's own
+    internal pieces (module-attribute access, not `from` imports — see
+    this module's own top-of-file comment for why) rather than calling
+    _search_findings directly, same reasoning as _one_run below."""
+    checkable = _claude_client._checkable_items([item])
+    if not checkable:
+        return {}, 0.0
+    prompt = _claude_client.FINDINGS_SEARCH_PROMPT.format(
+        target_lang_line=_claude_client._target_lang_line(target_lang),
+        source_lang_note=_claude_client._source_lang_note(source_lang),
+        pairs_block=_claude_client._pairs_block(checkable),
+    )
+    async with semaphore:
+        text_block, usage, _stop_reason = await _claude_client._call_claude(prompt, model=model_id)
+    return (
+        _claude_client._parse_search_findings(text_block, checkable),
+        _claude_client._usage_cost(model_id, usage),
+    )
+
+
 async def _one_run(
     item: dict, checks: list[str], target_lang: str, source_lang: str, model_id: str, semaphore: asyncio.Semaphore,
+    two_step: bool = False,
 ) -> tuple[list[dict], float, bool, list]:
     """Same (context, source, translation) row, same prompt, same model call
     as production's run_ai_checks_batch([item], ...) — rebuilt by hand
@@ -98,12 +128,24 @@ async def _one_run(
     be the model's RAW parsed JSON array, exactly as it came back, before
     _filter_findings_by_checks silently drops anything whose "type" isn't
     one this run is actually allowed to return. See this module's own
-    top-of-file comment for why that distinction matters."""
+    top-of-file comment for why that distinction matters.
+
+    two_step: when true, runs claude_client's Step 1 (_run_search_step
+    above) first, under this same model_id, and feeds its candidates into
+    the structured prompt exactly as production's run_ai_checks_batch now
+    does — so this diagnostic can show whether the two-step pipeline
+    actually closes a real, previously-missed gap for a given model,
+    before that pipeline is trusted in production. Search cost is folded
+    into this run's own returned cost_usd, same as production does."""
+    search_cost = 0.0
+    prior_findings: dict[int, list[str]] | None = None
+    if two_step:
+        prior_findings, search_cost = await _run_search_step(item, target_lang, source_lang, model_id, semaphore)
     prompt, number_to_index = _claude_client.build_batch_prompt(
-        [item], checks, target_lang=target_lang, source_lang=source_lang,
+        [item], checks, target_lang=target_lang, source_lang=source_lang, prior_findings=prior_findings,
     )
     if prompt is None:
-        return [], 0.0, False, []
+        return [], search_cost, False, []
     async with semaphore:
         text_block, usage, stop_reason = await _claude_client._call_claude(prompt, model=model_id)
     raw = _claude_client.parse_json_array(text_block)
@@ -113,7 +155,7 @@ async def _one_run(
     # register-reporting side-channel (see claude_client.REGISTER_VALUE_TYPE),
     # unrelated to whether this run spotted the actual problem being tested.
     findings = [f for f in checked if f.get("type") != REGISTER_VALUE_TYPE]
-    cost_usd = _claude_client._usage_cost(model_id, usage)
+    cost_usd = search_cost + _claude_client._usage_cost(model_id, usage)
     return findings, cost_usd, stop_reason == "max_tokens", raw
 
 
@@ -192,6 +234,7 @@ async def run_model_comparison(
     checks: list[str] | None = None,
     runs_per_model: int = 5,
     bare: bool = False,
+    two_step: bool = False,
     models: list[str] | None = None,
 ) -> dict:
     """Runs the exact same (context, source, translation) row through each
@@ -215,6 +258,18 @@ async def run_model_comparison(
     get a correct answer). Tests whether it's our prompt's sheer
     length/complexity — not the confidence bar — costing a model the
     nuance.
+
+    two_step: runs claude_client's two-step search-then-check pipeline
+    (see FINDINGS_SEARCH_PROMPT's own comment) instead of the plain
+    structured prompt — an open, schema-free search pass first, whose
+    candidates then feed into the same structured prompt `bare=False`
+    already uses. Mutually exclusive with `bare` in practice (bare skips
+    the structured prompt entirely, so there's nothing for a search step
+    to feed into) — if both are set, `bare` wins and two_step is ignored,
+    since bare's whole point is testing the structured prompt's machinery
+    in isolation. Added 2026-09-23 to verify the pipeline for real, on the
+    same known Kyrgyz/French examples this investigation has been using,
+    before it's wired into production's own run_ai_checks/run_ai_checks_batch.
 
     models: which of MODEL_COMPARISON_CANDIDATES to actually run, by name
     ("opus"/"sonnet"/"haiku"). Defaults to DEFAULT_COMPARISON_MODELS
@@ -248,7 +303,7 @@ async def run_model_comparison(
             ])
         else:
             runs = await asyncio.gather(*[
-                _one_run(item, checks, target_lang, source_lang, model_id, semaphore)
+                _one_run(item, checks, target_lang, source_lang, model_id, semaphore, two_step=two_step)
                 for _ in range(runs_per_model)
             ])
         catches = 0
@@ -300,6 +355,7 @@ async def run_model_comparison(
         "target_lang": target_lang,
         "checks": checks,
         "bare": bare,
+        "two_step": two_step and not bare,
         "models": selected_names,
         "total_cost_usd": round(total_cost, 4),
         "results": results,
@@ -319,7 +375,12 @@ def _format_summary_ru(report: dict) -> str:
     """A ready-to-read Russian summary of the comparison, so the result can
     be understood at a glance in the /docs response without translating
     JSON field names by hand."""
-    mode = " (🧪 упрощённый прямой вопрос, без нашего обычного промпта)" if report.get("bare") else ""
+    if report.get("bare"):
+        mode = " (🧪 упрощённый прямой вопрос, без нашего обычного промпта)"
+    elif report.get("two_step"):
+        mode = " (🔎 в два шага: сначала свободный поиск, потом обычная проверка)"
+    else:
+        mode = ""
     lines = [f"Сравнение моделей для языка {report['target_lang']}{mode}:"]
     for name, r in report["results"].items():
         label = _NAMES_RU.get(name, name)

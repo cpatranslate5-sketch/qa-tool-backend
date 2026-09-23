@@ -204,7 +204,7 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 
 Перевод:
 \"\"\"{translation}\"\"\"
-
+{prior_findings}
 Особые указания к задаче (важнее общих правил, если есть):
 {extra_instructions}
 
@@ -306,7 +306,7 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 
 Перевод:
 \"\"\"{translation}\"\"\"
-
+{prior_findings}
 Что проверять: {checks_description}
 {other_type_instruction}
 
@@ -319,6 +319,172 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 [
   {{"row": 1, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
 ]"""
+
+
+# ------------------------------------------------------- two-step pipeline ---
+# Step 1 ("search"): FINDINGS_SEARCH_PROMPT below, an intentionally
+# UNCONSTRAINED first pass — no CHECK_LABELS category schema, no
+# calibration/confidence-bar wording at all. Александр's ask, 2026-09-23,
+# after the Kyrgyz/French investigation (see CALIBRATION_STRICT_OPENING's
+# own comment for the full backstory): all session, an unstructured/bare
+# prompt kept catching real errors that the structured, calibrated prompt
+# missed — not because the model lacked the knowledge, but because the
+# structured prompt's own type list and calibration wording quietly steer
+# it toward staying quiet about anything that doesn't cleanly fit a named
+# category or clear a confidence bar. Patching that prompt's wording
+# error-type by error-type doesn't scale (Александр's own words) — so
+# instead of teaching the structured prompt every individual shape of
+# mistake by hand, this runs a first, completely open pass to surface
+# candidates, then hands them to the EXISTING, already-tuned structured
+# prompt as extra per-pair context (see _prior_findings_block) for Step 2.
+# All the real filtering/categorizing logic (CHECK_LABELS, calibration,
+# _filter_findings_by_checks, the type enum) stays exactly as it already
+# is and does double duty: it drops whatever Step 1 got wrong (style,
+# false leads) AND still independently catches whatever Step 1 missed,
+# exactly as it always could on its own. This is also why Opus was retired
+# the same day (see HARD_LANGUAGE_BASES's own comment) — two Sonnet calls
+# turned out cheap enough, and together effective enough, to replace what
+# one Opus call alone was covering.
+#
+# Reuses the same numbered "N. Контекст/Источник/Перевод" pairs_block shape
+# BATCH_PROMPT uses (via _pairs_block) so ONE code path (_search_findings)
+# covers both run_ai_checks's single pair and run_ai_checks_batch's many —
+# no separate "single item" variant is needed here the way
+# BATCH_PROMPT_SINGLE_ITEM exists for the structured prompt, since there's
+# no cross-row-duplicate machinery to strip out of a free-text search pass
+# in the first place.
+FINDINGS_SEARCH_PROMPT = """Ты — опытный редактор переводов. Даны пары (контекст, исходный текст, перевод).
+Прочитай их совершенно свободно, БЕЗ заранее заданного списка типов ошибок и БЕЗ формальной шкалы уверенности —
+просто внимательно сверь каждую пару и отметь всё, что кажется тебе неправильным, сомнительным, нелогичным или
+просто заслуживающим внимания редактора: опечатки, грамматика, искажение смысла, пропуски, странности стиля —
+что угодно, вплоть до мелочей. Отметить лишнее не страшно (это перепроверят и при необходимости отсеют на
+следующем шаге) — а вот промолчать о том, что реально не так, нежелательно.
+
+{target_lang_line}
+
+{source_lang_note}
+
+Пары для проверки:
+{pairs_block}
+
+Для каждой пары, где ты что-то заметил, напиши отдельную строку в формате:
+NUMBER: короткое, но конкретное описание проблемы
+где NUMBER — номер пары из списка выше (можно несколько строк на одну и ту же пару, если проблем в ней несколько).
+Пары, где всё в порядке, просто пропусти — не пиши по ним ничего. Если проблем нет вообще нигде — верни ровно одну
+строку: "проблем не найдено". Не используй JSON, markdown, вступления или заключения — только такие строки, по
+одной на строку."""
+
+
+def _checkable_items(items: list[dict]) -> list[tuple[int, dict]]:
+    """Items with a non-empty translation, paired with their ORIGINAL index
+    into `items` — shared by build_batch_prompt and _search_findings so
+    both number pairs identically, which matters because prior_findings
+    (Step 1's output, keyed by this same original index) has to line up
+    with build_batch_prompt's own numbering when Step 2's prompt is built."""
+    return [(i, it) for i, it in enumerate(items) if it["translation"].strip()]
+
+
+def _prior_findings_block(candidates: list[str] | None) -> str:
+    """Turns Step 1's raw, unconstrained candidate list for ONE pair into
+    the block embedded in Step 2's (already-tuned, structured) prompt right
+    next to that same pair — empty string when Step 1 found nothing there,
+    so a pair with no candidates reads exactly as it did before the
+    two-step pipeline existed. Deliberately tells the model these are
+    unverified leads, not confirmed findings — Step 2's own criteria still
+    decide what actually gets reported; this only makes sure nothing Step 1
+    noticed gets silently lost before Step 2 even sees it."""
+    if not candidates:
+        return ""
+    lines = "\n".join(f"- {c}" for c in candidates)
+    return (
+        "\nЧерновой, ничем не ограниченный просмотр уже заметил в этой паре следующее (это не готовые находки, "
+        "а просто наводки — оцени каждую по критериям выше и ниже, отбрось то, что при внимательной проверке "
+        "окажется просто стилем или не относится ни к одному критерию, и по-прежнему сам ищи всё, что этот "
+        f"черновой просмотр мог пропустить):\n{lines}\n"
+    )
+
+
+def _pairs_block(checkable: list[tuple[int, dict]], prior_findings: dict[int, list[str]] | None = None) -> str:
+    """Numbered 'N. Контекст/Источник/Перевод' block shared by BATCH_PROMPT
+    and FINDINGS_SEARCH_PROMPT — checkable is [(original_item_index, item),
+    ...] (see _checkable_items); N is assigned by POSITION here (1, 2, 3,
+    ...), not by original_item_index. prior_findings, when given, is keyed
+    by that original_item_index (the same key space run_ai_checks_batch and
+    _search_findings both use for their own return values) — each pair
+    gets its own Step 1 candidates embedded right after it, via
+    _prior_findings_block."""
+    parts = []
+    for n, (idx, it) in enumerate(checkable, start=1):
+        block = (
+            f'{n}. Контекст: {it["context"] or "—"}\n'
+            f'Источник: """{it["source"]}"""\n'
+            f'Перевод: """{it["translation"]}"""'
+        )
+        if prior_findings:
+            block += _prior_findings_block(prior_findings.get(idx))
+        parts.append(block)
+    return "\n\n".join(parts)
+
+
+_SEARCH_LINE_RE = re.compile(r"^(\d+)\s*[:.]\s*(.+)$")
+
+
+def _parse_search_findings(text_block: str | None, checkable: list[tuple[int, dict]]) -> dict[int, list[str]]:
+    """Parses FINDINGS_SEARCH_PROMPT's plain "NUMBER: description" lines
+    back into {original_item_index: [description, ...]}, using the same
+    checkable list (see _checkable_items) _search_findings numbered the
+    pairs with — mirrors what group_batch_findings does for the structured
+    prompt's "row" field, just for free text instead of JSON. A line that
+    doesn't parse (wrong shape, an out-of-range number, the "проблем не
+    найдено" sentinel, stray commentary) is silently skipped rather than
+    raising — this is free text, not JSON, so it's expected to be looser
+    than the structured response ever is."""
+    if not text_block:
+        return {}
+    number_to_index = {n: idx for n, (idx, _) in enumerate(checkable, start=1)}
+    found: dict[int, list[str]] = {}
+    for line in text_block.splitlines():
+        line = line.strip().lstrip("-•* ").strip()
+        if not line:
+            continue
+        m = _SEARCH_LINE_RE.match(line)
+        if not m:
+            continue
+        idx = number_to_index.get(int(m.group(1)))
+        if idx is None:
+            continue
+        desc = m.group(2).strip()
+        if desc:
+            found.setdefault(idx, []).append(desc)
+    return found
+
+
+async def _search_findings(
+    items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
+) -> tuple[dict[int, list[str]], float]:
+    """Step 1 of the two-step pipeline — see FINDINGS_SEARCH_PROMPT's own
+    comment above for the full rationale. Returns ({}, 0.0) with NO API
+    call at all when there's nothing checkable (mirrors build_batch_prompt's
+    own early-outs) — no point spending a whole extra call to find nothing.
+
+    Resolves its model via model_override or _model_for_lang(target_lang) —
+    same precedence run_ai_checks_batch itself uses for Step 2 — so a
+    caller that forces a specific model (currently only
+    app.model_comparison's diagnostic, indirectly, and
+    run_ai_checks_batch's own model_override passthrough) gets that same
+    model for BOTH steps, not Step 1 silently running under whatever
+    _model_for_lang would have picked instead."""
+    checkable = _checkable_items(items)
+    if not checkable:
+        return {}, 0.0
+    prompt = FINDINGS_SEARCH_PROMPT.format(
+        target_lang_line=_target_lang_line(target_lang),
+        source_lang_note=_source_lang_note(source_lang),
+        pairs_block=_pairs_block(checkable),
+    )
+    model = model_override or _model_for_lang(target_lang)
+    text_block, usage, _stop_reason = await _call_claude(prompt, model=model)
+    return _parse_search_findings(text_block, checkable), _usage_cost(model, usage)
 
 
 def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
@@ -794,36 +960,50 @@ def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[
     return [f for f in findings if f.get("type") in allowed]
 
 
-# Languages that get the stronger CLAUDE_MODEL_HARD instead of the default
-# CLAUDE_MODEL. Replaced wholesale on 2026-09-18 (Александр's ask, after
-# comparing real Opus vs Sonnet reports for several languages side by
-# side): arabic/bengali/greek/hindi/hinglish/indonesian/kyrgyz/korean/
-# marathi/malay/romanian/telugu/thai/tajik/urdu now get the stronger model;
-# kazakh/uzbek/swahili/azerbaijani (on the OLD list) are deliberately
-# dropped from it — Sonnet is good enough for those, so they now get
-# CLAUDE_MODEL like every other "normal" language. Matched against the
-# BASE language subtag of whatever target_lang a check actually runs with,
-# so "ko-KR", "ko", or any other region variant of Korean all get it alike.
-# "hing" (Hinglish) isn't a real ISO code at all — it's this platform's own
-# code for Hindi-English code-mixed text (see parse_workbook) — but the
-# base-subtag match doesn't care, an exact "hing" simply matches itself.
+# Languages that get the smaller MAX_ROWS_PER_AI_CALL_HARD chunk size (one
+# row per AI call instead of batching several together — see
+# app.excel_multi._chunk_size_for_lang) rather than a stronger model.
+#
+# Used to also route to CLAUDE_MODEL_HARD (Opus) instead of CLAUDE_MODEL —
+# replaced wholesale on 2026-09-18 after comparing real Opus vs Sonnet
+# reports side by side, dropping kazakh/uzbek/swahili/azerbaijani from the
+# old list since Sonnet was already good enough for those. That per-language
+# model split was RETIRED 2026-09-23 (Александр's ask): the two-step
+# search-then-check pipeline below (_search_findings + the existing
+# structured prompt as a second pass) turned out to close most of the real
+# gap Opus was covering, for a fraction of Opus's per-token price even
+# counting the extra call — see _search_findings's own comment for the
+# investigation that led here. _model_for_lang now always returns
+# CLAUDE_MODEL for every language; this set and _is_hard_language are kept
+# only for the chunk-size decision, which is a separate, still-useful lever
+# (proven necessary by the original Marathi miss) unrelated to which model
+# runs. Matched against the BASE language subtag of whatever target_lang a
+# check actually runs with, so "ko-KR", "ko", or any other region variant of
+# Korean all get it alike. "hing" (Hinglish) isn't a real ISO code at all —
+# it's this platform's own code for Hindi-English code-mixed text (see
+# parse_workbook) — but the base-subtag match doesn't care, an exact "hing"
+# simply matches itself.
 HARD_LANGUAGE_BASES = {
     "ar", "bn", "el", "hi", "hing", "id", "ky", "ko", "mr", "ms", "ro", "te", "th", "tg", "ur",
 }
 
 
 def _model_for_lang(target_lang: str) -> str:
-    base = target_lang.strip().lower().split("-")[0]
-    return settings.CLAUDE_MODEL_HARD if base in HARD_LANGUAGE_BASES else settings.CLAUDE_MODEL
+    """Always CLAUDE_MODEL (Sonnet) now — see HARD_LANGUAGE_BASES's own
+    comment for why the old per-language Opus routing was retired. Kept as
+    its own function (rather than inlining settings.CLAUDE_MODEL at every
+    call site) so every real caller stays unaffected if a per-language
+    model split is ever reintroduced, and so model_comparison's
+    model_override tests still have a normal baseline to compare against."""
+    return settings.CLAUDE_MODEL
 
 
 def _is_hard_language(target_lang: str) -> bool:
-    """Same base-subtag membership test as _model_for_lang, exposed on its
-    own so app.excel_multi's chunk-size decision (see
+    """Same base-subtag membership test HARD_LANGUAGE_BASES documents,
+    exposed on its own so app.excel_multi's chunk-size decision (see
     MAX_ROWS_PER_AI_CALL_HARD) can key off "is this language on the hard
-    list" directly, instead of comparing model id strings — which could
-    accidentally coincide if CLAUDE_MODEL and CLAUDE_MODEL_HARD are ever
-    set to the same value on Railway."""
+    list" directly. No longer tied to model choice — see
+    HARD_LANGUAGE_BASES's own comment."""
     return target_lang.strip().lower().split("-")[0] in HARD_LANGUAGE_BASES
 
 
@@ -1040,12 +1220,33 @@ async def run_ai_checks(
     if not checks_description and not register_instructions:
         return [], 0.0
 
+    # Step 1 of the two-step pipeline (see FINDINGS_SEARCH_PROMPT's own
+    # comment) — a single-pair "items" list of one, so _search_findings'
+    # shared plumbing (same one run_ai_checks_batch below uses) works
+    # unchanged here too. Costs an extra API call every time, which is the
+    # whole point (Александр's ask, 2026-09-23) — summed into this
+    # function's own returned cost_usd below. Only worth running when
+    # there's an actual "Что проверять" list to search against — a
+    # register-ONLY run (checks_description empty, register_instructions
+    # not) has nothing for a free error search to even look for, so it's
+    # skipped there rather than spending a whole extra call finding nothing
+    # relevant, exactly like build_batch_prompt/_search_findings's own
+    # "nothing checkable" early-outs.
+    prior_findings: dict[int, list[str]] = {}
+    search_cost = 0.0
+    if checks_description:
+        prior_findings, search_cost = await _search_findings(
+            [{"context": "", "source": source, "translation": translation}],
+            target_lang=target_lang, source_lang=source_lang,
+        )
+
     prompt = SINGLE_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
         calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang, checks),
         source=source,
         translation=translation,
+        prior_findings=_prior_findings_block(prior_findings.get(0)),
         extra_instructions=extra_instructions.strip() or "нет",
         checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
         other_type_instruction=_other_type_instruction(checks_description),
@@ -1080,7 +1281,7 @@ async def run_ai_checks(
                     "register_majority": report["majority"],
                 })
 
-    return findings, _usage_cost(model, usage)
+    return findings, search_cost + _usage_cost(model, usage)
 
 
 def build_batch_prompt(
@@ -1089,6 +1290,7 @@ def build_batch_prompt(
     extra_instructions: str = "",
     target_lang: str = "",
     source_lang: str = "",
+    prior_findings: dict[int, list[str]] | None = None,
 ) -> tuple[str | None, dict[int, int]]:
     """
     Builds the prompt for one language's batch of (context, source,
@@ -1100,6 +1302,17 @@ def build_batch_prompt(
     items: list of {"context": str, "source": str, "translation": str}, all
     in the same target language. Items with an empty translation are
     skipped (handled by rule checks as "missing translation" instead).
+
+    prior_findings: optional Step 1 candidates (see _search_findings),
+    keyed by the ORIGINAL index into `items` — the same key space
+    run_ai_checks_batch's own return value and _search_findings's return
+    value both use. Embedded per-pair via _pairs_block/_prior_findings_block
+    (multi-item case) or as this call's own {prior_findings} placeholder
+    (single-item case, via BATCH_PROMPT_SINGLE_ITEM). None/omitted keeps
+    the prompt byte-for-byte what it was before the two-step pipeline
+    existed — every non-two-step caller (excel_multi.build_batch_plan's
+    Message Batches path, still single-step — see its own module comment)
+    is unaffected by this parameter's existence.
 
     Returns (prompt, number_to_index) — prompt is None when there's nothing
     to ask the AI (no AI check types selected, or nothing checkable).
@@ -1115,7 +1328,7 @@ def build_batch_prompt(
     if not checks_description and not _register_instructions(checks, batch=True, target_lang=target_lang):
         return None, {}
 
-    checkable = [(i, it) for i, it in enumerate(items) if it["translation"].strip()]
+    checkable = _checkable_items(items)
     if not checkable:
         return None, {}
 
@@ -1139,20 +1352,16 @@ def build_batch_prompt(
         # cross-row-duplicate instruction block, which is meaningless (and,
         # per Александр's real test, apparently costly to accuracy) when
         # there's only one pair to look at in the first place.
-        _, only_item = checkable[0]
+        only_idx, only_item = checkable[0]
         prompt = BATCH_PROMPT_SINGLE_ITEM.format(
             context=only_item["context"] or "—",
             source=only_item["source"],
             translation=only_item["translation"],
+            prior_findings=_prior_findings_block((prior_findings or {}).get(only_idx)),
             **common_kwargs,
         )
     else:
-        pairs_block = "\n\n".join(
-            f'{n}. Контекст: {it["context"] or "—"}\n'
-            f'Источник: """{it["source"]}"""\n'
-            f'Перевод: """{it["translation"]}"""'
-            for n, (_, it) in enumerate(checkable, start=1)
-        )
+        pairs_block = _pairs_block(checkable, prior_findings)
         prompt = BATCH_PROMPT.format(pairs_block=pairs_block, **common_kwargs)
     number_to_index = {n: idx for n, (idx, _) in enumerate(checkable, start=1)}
     return prompt, number_to_index
@@ -1217,18 +1426,46 @@ async def run_ai_checks_batch(
     Findings keyed by index here still include any REGISTER_VALUE_TYPE
     entries mixed in with real findings — app.excel_multi extracts and
     summarizes those itself (it's the one with the excel_row numbers to
-    label them with), not this function."""
+    label them with), not this function.
+
+    This is the LIVE path — app.excel_multi's _run_ai_chunks calls this for
+    every upload under the Message Batches size threshold, and run_ai_checks
+    above calls the single-pair equivalent — so it's the one that got the
+    two-step pipeline (see FINDINGS_SEARCH_PROMPT's own comment). The async
+    Message Batches path (excel_multi.build_batch_plan, for large uploads)
+    still calls build_batch_prompt directly with no prior_findings — Step 1
+    needing its own full submit-and-poll round there too (on top of Step
+    2's) makes that a separate, bigger change, deliberately deferred."""
+    checks_description = _checks_description(checks)
+    register_instructions = _register_instructions(checks, batch=True, target_lang=target_lang)
+    if not checks_description and not register_instructions:
+        return {}, 0.0, False
+
+    # Step 1 — same rationale as run_ai_checks's own call to this,
+    # including skipping it entirely for a register-only run (nothing for
+    # a free error search to look for — see run_ai_checks's own comment on
+    # this same guard). Passed the same model_override as Step 2 below, so
+    # a caller forcing a specific model gets that model for both steps
+    # rather than Step 1 quietly running under _model_for_lang's normal
+    # pick instead.
+    prior_findings: dict[int, list[str]] = {}
+    search_cost = 0.0
+    if checks_description:
+        prior_findings, search_cost = await _search_findings(
+            items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
+        )
+
     prompt, number_to_index = build_batch_prompt(
-        items, checks, extra_instructions, target_lang, source_lang,
+        items, checks, extra_instructions, target_lang, source_lang, prior_findings=prior_findings,
     )
     if prompt is None:
-        return {}, 0.0, False
+        return {}, search_cost, False
     model = model_override or _model_for_lang(target_lang)
     text_block, usage, stop_reason = await _call_claude(prompt, model=model)
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
-    return filtered, _usage_cost(model, usage), stop_reason == "max_tokens"
+    return filtered, search_cost + _usage_cost(model, usage), stop_reason == "max_tokens"
 
 
 # --------------------------------------------------- Message Batches API ---

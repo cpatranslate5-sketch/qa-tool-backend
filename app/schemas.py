@@ -178,6 +178,10 @@ class ModelComparisonIn(BaseModel):
     # "bare" — set true to bypass our whole normal prompt in favor of a
     # minimal, direct question (no calibration wording, no JSON schema).
     bare: bool = False
+    # See app.model_comparison.run_model_comparison's own docstring on
+    # "two_step" — set true to run the two-step search-then-check pipeline
+    # instead of the plain structured prompt. Ignored when bare=True.
+    two_step: bool = False
     # Which models to compare, by name ("opus"/"sonnet"/"haiku") — see
     # app.model_comparison.DEFAULT_COMPARISON_MODELS. Defaults to sonnet +
     # haiku only (Александр's ask, 2026-09-23 — no Opus spend for a routine

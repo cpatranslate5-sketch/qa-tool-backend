@@ -1083,6 +1083,7 @@ async def debug_model_comparison(payload: schemas.ModelComparisonIn):
         checks=payload.checks,
         runs_per_model=payload.runs_per_model,
         bare=payload.bare,
+        two_step=payload.two_step,
         models=payload.models,
     )
     if not result:

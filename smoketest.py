@@ -1454,13 +1454,15 @@ print("[OK] pick_source_lang: resolves the manager's chosen source language agai
       "a differently-granular spelling of the same language in the file, instead of "
       "silently falling back to English")
 
-# --- model tiering: confirmed "hard" languages get the stronger model,
-# matched by base subtag so any region variant of them qualifies too.
-# List replaced wholesale 2026-09-18 (Александр's ask, after comparing
-# real Opus vs Sonnet reports): kk/uz/sw/az moved OFF the hard list (they
-# now get CLAUDE_MODEL like everything else), replaced by a new set of
-# 15 languages including the non-ISO "hing" (Hinglish) code. ---
-from app.claude_client import _model_for_lang
+# --- model tiering: RETIRED 2026-09-23 (Александр's ask — see
+# claude_client.HARD_LANGUAGE_BASES's own comment) — _model_for_lang now
+# always returns CLAUDE_MODEL (Sonnet) for every language, hard or not; the
+# two-step search-then-check pipeline replaced the old per-language Opus
+# routing. _is_hard_language (matched by base subtag, so any region variant
+# qualifies too) is kept ONLY for the chunk-size decision
+# (MAX_ROWS_PER_AI_CALL_HARD) — confirmed below that it's unaffected by the
+# model-routing retirement and still recognizes the same 15-language list. ---
+from app.claude_client import _model_for_lang, _is_hard_language
 from app.config import settings
 
 for hard in [
@@ -1468,12 +1470,15 @@ for hard in [
     "ky-KG", "ko", "ko-KR", "mr-IN", "ms", "ms-MY", "ro", "ro-RO", "te-IN", "th", "th-TH",
     "tg-TJ", "ur", "ur-PK",
 ]:
-    assert _model_for_lang(hard) == settings.CLAUDE_MODEL_HARD, hard
+    assert _is_hard_language(hard), hard
+    assert _model_for_lang(hard) == settings.CLAUDE_MODEL, hard
 for normal in ["ru", "es-mx", "en", "de-DE", "fr", "kk", "kk-KZ", "uz", "sw-KE", "az-AZ"]:
+    assert not _is_hard_language(normal), normal
     assert _model_for_lang(normal) == settings.CLAUDE_MODEL, normal
-print("[OK] _model_for_lang: confirmed the current hard-language list (ar/bn/el/hi/hing/id/ky/ko/mr/ms/"
-      "ro/te/th/tg/ur) routes to CLAUDE_MODEL_HARD by base subtag, and that kk/uz/sw/az — on the OLD list "
-      "— now route to CLAUDE_MODEL like every other 'normal' language")
+print("[OK] _model_for_lang: confirmed EVERY language (hard or not) now routes to CLAUDE_MODEL (Opus retired, "
+      "2026-09-23) — and that _is_hard_language still separately recognizes the same 15-language list "
+      "(ar/bn/el/hi/hing/id/ky/ko/mr/ms/ro/te/th/tg/ur) for the chunk-size decision, unaffected by the "
+      "model-routing change")
 
 # --- MODEL_PRICING_PER_TOKEN / _usage_cost: Александр's real bug
 # (2026-09-17) — CLAUDE_MODEL on Railway had already moved on to
@@ -2041,10 +2046,16 @@ asyncio.get_event_loop().run_until_complete(
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
 
-assert "не подгоняй" in _squeeze_test_prompts["typo"][0], (
+# run_ai_checks now makes TWO calls per invocation (the two-step pipeline's
+# Step 1 search pass, then Step 2's structured SINGLE_PROMPT — see
+# claude_client.FINDINGS_SEARCH_PROMPT's own comment), both through this
+# same fake, so index [-1] (Step 2, the actual structured prompt) rather
+# than [0] (Step 1's free-text search prompt, which never carries
+# other_type_instruction at all).
+assert "не подгоняй" in _squeeze_test_prompts["typo"][-1], (
     "with a real check selected, the formatted prompt must actually carry the out-of-scope instruction"
 )
-assert "не подгоняй" not in _squeeze_test_prompts["register"][0], (
+assert "не подгоняй" not in _squeeze_test_prompts["register"][-1], (
     "a register-only run has no real \"Что проверять\" list to be outside of, so the out-of-scope "
     "instruction must be absent entirely, not just unused"
 )
@@ -2328,11 +2339,23 @@ print(f"[OK] _chunk_list: splits into consecutive chunks of at most the given si
 # merged with it, because that chunk's own AI call never saw the first
 # chunk's rows at all (the trade-off documented on MAX_ROWS_PER_AI_CALL).
 _chunk_call_prompts: list[str] = []
+# run_ai_checks_batch now makes TWO calls per chunk (the two-step
+# pipeline's Step 1 search pass, then Step 2's structured BATCH_PROMPT —
+# see claude_client.FINDINGS_SEARCH_PROMPT's own comment), both through
+# this same fake. This test only cares about Step 2's response shape per
+# chunk, so Step 1 calls (identified by FINDINGS_SEARCH_PROMPT's own
+# distinctive opening line, since interleaving between the two
+# concurrently-dispatched chunks makes raw call order unreliable) always
+# report nothing, and a SEPARATE counter tracks Step 2 calls only.
+_chunk_structured_call_count = {"n": 0}
 
 
 async def _fake_call_claude_chunked(prompt, model=None):
     _chunk_call_prompts.append(prompt)
-    if len(_chunk_call_prompts) == 1:
+    if prompt.startswith("Ты — опытный редактор переводов"):
+        return "проблем не найдено", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
+    _chunk_structured_call_count["n"] += 1
+    if _chunk_structured_call_count["n"] == 1:
         # first chunk: local rows 1 and 3 share the same repeated problem
         return (
             '[{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
@@ -2363,7 +2386,8 @@ _chunk_out, _chunk_cost = asyncio.get_event_loop().run_until_complete(
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_chunk_call_prompts) == 2, "expected exactly 2 AI calls — one per chunk"
+assert len(_chunk_call_prompts) == 4, "expected exactly 4 AI calls — 2 chunks x (search step + structured step)"
+assert _chunk_structured_call_count["n"] == 2, "expected exactly 2 structured-step AI calls — one per chunk"
 _chunk_by_row = {r["excel_row"]: r["findings"] for r in _chunk_out}
 # first chunk's repeat: local rows 1 and 3 -> global indices 0 and 2 -> excel_row 100 and 102
 assert _chunk_by_row[100][0]["message"] == (
@@ -2420,9 +2444,11 @@ asyncio.get_event_loop().run_until_complete(
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert _hard_chunk_calls["n"] == 3, (
-    f"a hard language (mr) with 3 rows must make 3 SEPARATE AI calls (1 row each, MAX_ROWS_PER_AI_CALL_HARD), "
-    f"not 1 batched call — got {_hard_chunk_calls['n']} calls"
+assert _hard_chunk_calls["n"] == 6, (
+    f"a hard language (mr) with 3 rows must make 3 SEPARATE AI chunks (1 row each, MAX_ROWS_PER_AI_CALL_HARD), "
+    f"not 1 batched call — and each chunk now makes 2 AI calls (the two-step pipeline's search step, then its "
+    f"structured step — see claude_client.FINDINGS_SEARCH_PROMPT's own comment), so 3 chunks x 2 = 6 total "
+    f"calls — got {_hard_chunk_calls['n']} calls"
 )
 print("[OK] MAX_ROWS_PER_AI_CALL_HARD: a hard-list language (mr, ky, ...) is checked ONE row at a time — proven "
       "necessary by a real Marathi miss that a single-pair check caught but a same-model, same-prompt batched "
@@ -2642,9 +2668,12 @@ findings, ai_cost = asyncio.get_event_loop().run_until_complete(
 assert findings == [raw_findings[0]], findings
 assert ai_cost > 0, ai_cost
 # The JSON schema shown to the model is also scoped down to just the
-# requested check(s), not a fixed always-all list.
+# requested check(s), not a fixed always-all list. captured_prompts[-1] —
+# not [0] — since run_ai_checks now makes an extra Step 1 search call
+# first (see FINDINGS_SEARCH_PROMPT's own comment), which carries no JSON
+# schema line at all.
 type_enum_line = next(
-    line for line in captured_prompts[0].splitlines() if '"type":' in line and '"severity":' in line
+    line for line in captured_prompts[-1].splitlines() if '"type":' in line and '"severity":' in line
 )
 assert "typo" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
 print("[OK] AI findings hard-filtered to requested checks even when the model reports "
@@ -3975,6 +4004,138 @@ print("[OK] parse_workbook: 3+ duplicate columns resolve correctly in every blan
       "whitespace-only duplicate column is treated as blank for arbitration without breaking the "
       "all-blank-row skip")
 
+# --- two-step pipeline (search then check) — Александр's ask, 2026-09-23,
+# see claude_client.FINDINGS_SEARCH_PROMPT's own comment for the full
+# story. _parse_search_findings must correctly turn Step 1's free-text
+# "NUMBER: description" lines back into {original_item_index: [...]},
+# tolerant of a leading bullet/dash, skipping unparseable lines and the
+# "проблем не найдено" sentinel, and an out-of-range number. ---
+from app.claude_client import _parse_search_findings, _checkable_items, _pairs_block, _prior_findings_block
+
+_search_checkable = _checkable_items([
+    {"context": "", "source": "a", "translation": "b"},
+    {"context": "", "source": "c", "translation": "d"},
+])
+assert _parse_search_findings(None, _search_checkable) == {}
+assert _parse_search_findings("проблем не найдено", _search_checkable) == {}
+_parsed_search = _parse_search_findings(
+    "1: пропущено отрицание\n"
+    "- 2: странный порядок слов\n"
+    "not a valid line at all\n"
+    "1. вторая находка в первой паре\n"
+    "5: номер за пределами списка, должен быть отброшен\n",
+    _search_checkable,
+)
+assert _parsed_search == {
+    0: ["пропущено отрицание", "вторая находка в первой паре"],
+    1: ["странный порядок слов"],
+}, _parsed_search
+print("[OK] _parse_search_findings: turns Step 1's free-text 'NUMBER: description' lines back into "
+      "{original item index: [candidates]}, tolerant of a leading bullet/dash and a '.' separator, several "
+      "lines for the same pair, and silently skips an unparseable line, the 'проблем не найдено' sentinel, "
+      "and an out-of-range pair number")
+
+# _prior_findings_block/_pairs_block: empty candidates produce no block at
+# all (a pair with nothing from Step 1 reads exactly as it did before the
+# two-step pipeline existed); real candidates are embedded right after
+# that pair, keyed by the SAME original item index _search_findings and
+# run_ai_checks_batch both return.
+assert _prior_findings_block(None) == ""
+assert _prior_findings_block([]) == ""
+_block = _prior_findings_block(["пропущено отрицание"])
+assert "пропущено отрицание" in _block and "наводки" in _block, _block
+_pb_with_prior = _pairs_block(_search_checkable, {0: ["пропущено отрицание"]})
+assert "пропущено отрицание" in _pb_with_prior
+# only pair 1 (original index 0) carries the block — pair 2 (index 1) has
+# no candidates in this example, so its own text must be unaffected
+_pb_pair2_only = _pb_with_prior.split("2. ")[1]
+assert "пропущено отрицание" not in _pb_pair2_only, _pb_with_prior
+print("[OK] _prior_findings_block/_pairs_block: Step 1 candidates are embedded right after their own pair "
+      "only, keyed by original item index — empty/no candidates leaves a pair's text byte-for-byte "
+      "unaffected, exactly as before the two-step pipeline existed")
+
+# End-to-end through run_ai_checks_batch: a fake _call_claude that behaves
+# differently depending on whether it's being asked FINDINGS_SEARCH_PROMPT
+# (Step 1) or the structured BATCH_PROMPT_SINGLE_ITEM (Step 2) — confirms
+# Step 1 actually runs first, its candidate reaches Step 2's own prompt
+# text (not just internal plumbing), and the final findings/cost reflect
+# BOTH calls, not just Step 2's.
+from app.claude_client import run_ai_checks_batch as _run_ai_checks_batch_direct
+
+_two_step_prompts: list[str] = []
+
+
+async def _fake_call_claude_two_step(prompt, model=None):
+    _two_step_prompts.append(prompt)
+    if prompt.startswith("Ты — опытный редактор переводов"):
+        return "1: пропущено отрицание в переводе", {"input_tokens": 30, "output_tokens": 10}, "end_turn"
+    return (
+        '[{"row": 1, "type": "typo", "severity": "medium", "message": "подтверждено: пропущено отрицание"}]',
+        {"input_tokens": 50, "output_tokens": 20}, "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_two_step
+_two_step_findings, _two_step_cost, _two_step_trunc = asyncio.run(_run_ai_checks_batch_direct(
+    [{"context": "", "source": "He did not agree.", "translation": "Он согласился."}],
+    ["typo"], target_lang="ky", source_lang="en",
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert len(_two_step_prompts) == 2, "expected exactly 2 calls — the search step, then the structured step"
+assert _two_step_prompts[0].startswith("Ты — опытный редактор переводов"), "Step 1 (search) must run FIRST"
+assert "пропущено отрицание в переводе" in _two_step_prompts[1], (
+    "Step 1's candidate must actually reach Step 2's own structured prompt text, not just be computed and "
+    "then thrown away"
+)
+assert _two_step_findings == {0: [{"type": "typo", "severity": "medium",
+                                    "message": "подтверждено: пропущено отрицание"}]}, _two_step_findings
+assert not _two_step_trunc
+assert _two_step_cost > 0, _two_step_cost
+# cost must reflect BOTH calls, not just Step 2's — Step 1 alone (30 in +
+# 10 out tokens at Sonnet's own per-token rate) is a real, non-trivial
+# slice of the total.
+from app.claude_client import _usage_cost as _usage_cost_direct
+_step1_only_cost = _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 30, "output_tokens": 10})
+assert _two_step_cost > _step1_only_cost, (
+    f"total cost ({_two_step_cost}) must exceed Step 1's own cost alone ({_step1_only_cost}) — both calls "
+    f"must be billed, not just the structured step"
+)
+print("[OK] run_ai_checks_batch: the two-step pipeline actually runs Step 1 (free search) before Step 2 "
+      "(the structured/calibrated prompt), Step 1's candidate reaches Step 2's own prompt text as a real "
+      "embedded line (not just internal state), the final findings come from Step 2 as always, and cost_usd "
+      "sums both calls rather than only the structured one")
+
+# A register-only run has nothing for a free error search to look for, so
+# Step 1 must be skipped entirely — same reasoning as the register-only
+# skip already proven for run_ai_checks itself above.
+_reg_only_prompts: list[str] = []
+
+
+async def _fake_call_claude_reg_only_two_step(prompt, model=None):
+    _reg_only_prompts.append(prompt)
+    return (
+        '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]',
+        {"input_tokens": 10, "output_tokens": 5}, "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_reg_only_two_step
+asyncio.run(_run_ai_checks_batch_direct(
+    [{"context": "", "source": "Play now.", "translation": "Играйте."}], ["register"], target_lang="ru",
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert len(_reg_only_prompts) == 1, (
+    f"a register-only run has no real \"Что проверять\" list for Step 1 to search against, so it must skip "
+    f"straight to the single structured call — got {len(_reg_only_prompts)} calls"
+)
+print("[OK] run_ai_checks_batch: a register-only run skips the two-step pipeline's search step entirely "
+      "(nothing for a free error search to look for) and makes exactly one AI call, same as before the "
+      "two-step pipeline existed")
+
 # --- run_ai_checks_batch: model_override bypasses _model_for_lang -------
 # app.model_comparison (2026-09-22, Александр's "run a cheaper model
 # several times" investigation) needs to force a SPECIFIC model regardless
@@ -3993,20 +4154,26 @@ async def _fake_call_claude_records_model(prompt, model=None):
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_records_model
 # "mr" is a hard language — _model_for_lang would normally pick
-# CLAUDE_MODEL_HARD (Opus) here. model_override must win instead.
+# CLAUDE_MODEL_HARD (Opus) here (well, before the 2026-09-23 retirement —
+# see HARD_LANGUAGE_BASES's own comment — but the point of this test is
+# still model_override winning over whatever _model_for_lang WOULD have
+# picked, so it's still worth confirming with a hard language). Two calls
+# now, not one — the two-step pipeline's own Step 1 (search) plus Step 2
+# (the structured prompt) — both must see the override, not just Step 2.
 asyncio.run(_run_ai_checks_batch_direct(
     [{"context": "x", "source": "y", "translation": "z"}], ["typo"], target_lang="mr", source_lang="ru",
     model_override="claude-haiku-4-5-20251001",
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert _override_seen_models == ["claude-haiku-4-5-20251001"], (
-    f"model_override must be sent to _call_claude verbatim, overriding _model_for_lang's normal hard-language "
-    f"pick (Opus) for 'mr' — got {_override_seen_models}"
+assert _override_seen_models == ["claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"], (
+    f"model_override must be sent to _call_claude verbatim for BOTH steps of the two-step pipeline (search "
+    f"then structured check), overriding _model_for_lang's normal pick for 'mr' in both — got "
+    f"{_override_seen_models}"
 )
-print("[OK] run_ai_checks_batch: model_override forces a specific model regardless of what "
-      "_model_for_lang would normally choose for the target language — every real production caller still "
-      "leaves this unset and is unaffected")
+print("[OK] run_ai_checks_batch: model_override forces a specific model for both steps of the two-step "
+      "pipeline, regardless of what _model_for_lang would otherwise choose for the target language — every "
+      "real production caller still leaves this unset and is unaffected")
 
 # --- app.model_comparison: the standalone model-comparison diagnostic ---
 # Built in direct response to Александр's "1 раз на sonnet и после 3 на
@@ -4317,6 +4484,56 @@ assert "🧪" in _bare_report["summary_ru"]
 print("[OK] run_model_comparison: bare=True sends a genuinely minimal prompt (no calibration wording, no "
       "JSON schema) instead of the normal pipeline's, correctly parses free-text 'ПРОБЛЕМА: да/нет' answers")
 
+# two_step=True: this diagnostic's own mode for verifying the two-step
+# pipeline (search then check) actually helps a given model — the whole
+# reason to extend it before wiring the pipeline into production for real.
+# Each run must make 2 calls (search, then structured), Step 1's model_id
+# must be the SAME candidate model this run is testing (not always
+# _model_for_lang's own pick), and its candidate must reach Step 2's own
+# prompt text.
+_two_step_cmp_prompts: dict[str, list[str]] = {"opus": [], "sonnet": [], "haiku": []}
+
+
+async def _fake_call_claude_two_step_cmp(prompt, model=None):
+    name = _cmp_name_for(model)
+    _two_step_cmp_prompts[name].append(prompt)
+    if prompt.startswith("Ты — опытный редактор переводов"):
+        return "1: возможно пропущено условие по вейджеру", {"input_tokens": 20, "output_tokens": 10}, "end_turn"
+    if "возможно пропущено условие по вейджеру" in prompt:
+        return (
+            '[{"row": 1, "type": "typo", "severity": "medium", "message": "подтверждено моделью"}]',
+            {"input_tokens": 40, "output_tokens": 15}, "end_turn",
+        )
+    # Should never be reached — Step 2 must always see Step 1's candidate.
+    return "[]", {"input_tokens": 40, "output_tokens": 2}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_two_step_cmp
+_two_step_cmp_report = asyncio.run(_run_model_comparison_direct(
+    context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट",
+    target_lang="mr", source_lang="ru", checks=["typo"], runs_per_model=2, two_step=True,
+    models=["sonnet"],
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _two_step_cmp_report["two_step"] is True
+assert len(_two_step_cmp_prompts["sonnet"]) == 4, (
+    f"2 runs x (search + structured) = 4 calls, all under the SAME candidate model this run is testing — "
+    f"got {len(_two_step_cmp_prompts['sonnet'])}"
+)
+assert _two_step_cmp_report["results"]["sonnet"]["catches"] == 2 and (
+    _two_step_cmp_report["results"]["sonnet"]["hit_rate"] == 1.0
+), _two_step_cmp_report["results"]["sonnet"]
+assert _two_step_cmp_report["results"]["sonnet"]["example_messages"] == ["подтверждено моделью"]
+assert "🔎" in _two_step_cmp_report["summary_ru"]
+print("[OK] run_model_comparison: two_step=True runs Step 1 (free search) under the SAME candidate model "
+      "being compared (not always production's own _model_for_lang pick), feeds its candidate into Step 2's "
+      "structured prompt exactly like production's run_ai_checks_batch now does, and correctly tallies the "
+      "resulting catches — letting the pipeline be verified on real known examples before it's trusted in "
+      "production")
+
 # runs_per_model must be capped at MAX_RUNS_PER_MODEL — this hits the real,
 # billed Anthropic API on every call, reachable without any of the usual
 # project/manager plumbing, so an oversized request can't fire off an
@@ -4446,5 +4663,19 @@ assert _ep_bare_body["bare"] is True, _ep_bare_body
 assert _ep_bare_body["results"]["sonnet"]["catches"] == 2, _ep_bare_body
 print("[OK] POST /debug/model-comparison: the bare=true field reaches run_model_comparison end-to-end "
       "through the request schema, not just when called directly in Python")
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_two_step_cmp
+r = check("POST /debug/model-comparison with two_step=true", client.post(
+    "/debug/model-comparison", json={"runs_per_model": 2, "two_step": True, "models": ["sonnet"]},
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+_ep_two_step_body = r.json()
+assert _ep_two_step_body["two_step"] is True, _ep_two_step_body
+assert _ep_two_step_body["results"]["sonnet"]["catches"] == 2, _ep_two_step_body
+print("[OK] POST /debug/model-comparison: the two_step=true field reaches run_model_comparison end-to-end "
+      "through the request schema — Александр can now trigger this from the interactive /docs page to "
+      "verify the two-step pipeline for real, on known examples, before trusting it in production")
 
 print("\nALL SMOKETEST CHECKS PASSED")
