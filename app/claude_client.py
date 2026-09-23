@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 
 import httpx
@@ -585,6 +586,9 @@ def _model_branch_search_warning(model_label: str) -> dict:
     }
 
 
+GPT_GRACE_SECONDS = float(os.environ.get("GPT_GRACE_SECONDS", "10"))
+
+
 async def _ensemble_search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
 ) -> tuple[dict[int, list[str]], float, list[dict]]:
@@ -633,10 +637,28 @@ async def _ensemble_search_findings(
     sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
     gpt_expected = bool(settings.OPENAI_API_KEY)
 
-    ((sonnet_findings, sonnet_cost), sonnet_error), ((gpt_findings, gpt_cost), gpt_error) = await asyncio.gather(
-        _run_search_branch(_search_findings(items, target_lang, source_lang)),
-        _run_search_branch(_search_findings_openai(items, target_lang, source_lang)),
-    )
+    # Same 2026-09-23 speed fix as OPENAI_REASONING_EFFORT: Sonnet's branch
+    # is the one Step 1 must have; GPT is a bonus second opinion. Once
+    # Sonnet is done, GPT gets at most GPT_GRACE_SECONDS more — if it's
+    # still thinking, Step 2 goes ahead on Sonnet's candidates alone
+    # instead of the whole check waiting on the slowest vendor. Deliberately
+    # NOT a visible warning (it's an intended skip, not a broken branch) —
+    # only logged. If Sonnet itself failed, GPT is the only source left, so
+    # it gets waited for in full as before.
+    sonnet_task = asyncio.ensure_future(_run_search_branch(_search_findings(items, target_lang, source_lang)))
+    gpt_task = asyncio.ensure_future(_run_search_branch(_search_findings_openai(items, target_lang, source_lang)))
+    (sonnet_findings, sonnet_cost), sonnet_error = await sonnet_task
+    if sonnet_error is None and gpt_expected:
+        done, _pending = await asyncio.wait({gpt_task}, timeout=GPT_GRACE_SECONDS)
+        if not done:
+            gpt_task.cancel()
+            logger.info("GPT Step 1 branch still running %ss after Sonnet finished — proceeding without it",
+                        GPT_GRACE_SECONDS)
+            (gpt_findings, gpt_cost), gpt_error = ({}, 0.0), None
+        else:
+            (gpt_findings, gpt_cost), gpt_error = gpt_task.result()
+    else:
+        (gpt_findings, gpt_cost), gpt_error = await gpt_task
 
     merged: dict[int, list[str]] = {idx: list(candidates) for idx, candidates in sonnet_findings.items()}
     for idx, candidates in gpt_findings.items():
@@ -1328,6 +1350,27 @@ async def _call_claude_once(prompt: str, resolved_model: str) -> tuple[str | Non
     return text, data.get("usage", {}), data.get("stop_reason")
 
 
+# 2026-09-23 (Александр: "одна фраза раньше 10 сек, теперь в 3-4 раза
+# дольше"): gpt-5-mini is a reasoning model and, at OpenAI's default
+# (medium) effort, was routinely the slowest part of Step 1 — and Step 1
+# waits for its slowest branch before Step 2 can even start. Step 1 is
+# only a candidate-gathering pass (Step 2 does the real judging), so low
+# effort is enough there. Override with OPENAI_REASONING_EFFORT on Railway
+# ("minimal"/"low"/"medium"/"high"; empty = don't send it at all).
+OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "low").strip()
+
+
+def _openai_payload(model: str, prompt: str, with_effort: bool) -> dict:
+    payload = {
+        "model": model,
+        "max_completion_tokens": AI_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if with_effort and OPENAI_REASONING_EFFORT:
+        payload["reasoning_effort"] = OPENAI_REASONING_EFFORT
+    return payload
+
+
 async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | None, dict, str | None]:
     """OpenAI equivalent of _call_claude, called via plain REST (same style
     as the Anthropic calls in this file) rather than the openai SDK — no
@@ -1350,12 +1393,19 @@ async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | Non
                 "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
                 "content-type": "application/json",
             },
-            json={
-                "model": resolved_model,
-                "max_completion_tokens": AI_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            json=_openai_payload(resolved_model, prompt, with_effort=True),
         )
+        # Some OpenAI models don't accept reasoning_effort — rather than
+        # breaking the whole GPT branch over it, retry once without it.
+        if resp.status_code == 400 and "reasoning_effort" in resp.text:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                    "content-type": "application/json",
+                },
+                json=_openai_payload(resolved_model, prompt, with_effort=False),
+            )
         resp.raise_for_status()
         data = resp.json()
 
