@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 
@@ -11,7 +12,7 @@ from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import run_ai_checks
 from app.config import settings
-from app.database import get_db, init_db
+from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
     BATCH_THRESHOLD_CHARS,
     _label_to_code,
@@ -104,9 +105,71 @@ async def anthropic_call_failed(request: Request, exc: httpx.HTTPError):
     return JSONResponse(status_code=502, content={"detail": detail})
 
 
+
+# Strong references to running background checks — asyncio only keeps a
+# weak one, so an unreferenced task can be garbage-collected mid-run.
+_BACKGROUND_TASKS: set = set()
+
+
+async def _run_urgent_in_background(
+    record_id: int, sheets, resolved_source, selected_checks, extra_instructions, target_filter,
+) -> None:
+    """See the urgent branch in multi_check for why this exists. Writes the
+    finished result into the record the frontend is already polling. One
+    whole-run retry on an unexpected crash (per-language AI failures don't
+    crash it — excel_multi turns those into visible warnings); if it still
+    crashes, the placeholder record is removed so polling gets a clear
+    "not found" instead of spinning on "processing" forever."""
+    results = None
+    for attempt in range(2):
+        try:
+            results = await run_multi_check(
+                sheets, resolved_source, selected_checks, extra_instructions, target_filter,
+            )
+            break
+        except Exception:
+            logger.exception("Background urgent multi-check %s failed (attempt %d/2)", record_id, attempt + 1)
+    db = SessionLocal()
+    try:
+        record = db.get(models.MultiCheck, record_id)
+        if record is None:
+            return  # deleted by the manager while it was running
+        if results is None:
+            db.delete(record)
+        else:
+            record.results = results
+            record.summary = results["summary"]
+            record.status = "completed"
+            record.cost_usd = results["summary"].get("cost_usd", 0.0)
+            record.completed_at = datetime.datetime.now(datetime.timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _cleanup_orphaned_urgent_checks() -> None:
+    """A server restart (e.g. Railway redeploying after a GitHub upload)
+    kills any background urgent check mid-run. Those placeholders (status
+    "processing" but no Anthropic batch_id behind them) can never finish,
+    so they're removed on startup rather than spinning forever."""
+    db = SessionLocal()
+    try:
+        orphans = db.query(models.MultiCheck).filter(
+            models.MultiCheck.status == "processing",
+            models.MultiCheck.batch_id.is_(None),
+        ).all()
+        for r in orphans:
+            db.delete(r)
+        if orphans:
+            logger.warning("Removed %d orphaned background urgent check(s) after restart", len(orphans))
+        db.commit()
+    finally:
+        db.close()
+
 @app.on_event("startup")
 def on_startup():
     init_db()
+    _cleanup_orphaned_urgent_checks()
 
 
 @app.get("/health")
@@ -785,6 +848,49 @@ async def multi_check(
     # unless the manager ticked "Срочно", which forces the live path (and
     # its full, non-discounted price) regardless of size.
     volume = estimate_check_volume(sheets, resolved_source, target_filter)
+
+    if urgent and volume > BATCH_THRESHOLD_CHARS:
+        # 2026-09-23 (Александр: an urgent 30+-language upload → "Failed to
+        # fetch", no error in the log at all): a big urgent job used to run
+        # the whole AI check inside this ONE HTTP request, which can take
+        # many minutes — long enough for the connection between browser and
+        # server to be dropped before the answer ever came back. Now a big
+        # urgent job answers right away with status="processing" (the exact
+        # shape the batch path below already returns, so the frontend's
+        # existing "processing → poll multi_check_detail" flow handles it
+        # unchanged) and keeps running the same live, full-price check in
+        # the background. Small jobs still run inline, as before.
+        record = models.MultiCheck(
+            project_id=project_id,
+            filename=file.filename or "upload.xlsx",
+            source_lang=resolved_source,
+            checks_run=selected_checks,
+            summary={},
+            results={},
+            status="processing",
+            batch_id=None,
+            performed_by_name=manager_name.strip(),
+            manager_id=manager_id,
+            cost_usd=0.0,
+            batch_volume_chars=volume,
+            created_at=started_at,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        task = asyncio.create_task(_run_urgent_in_background(
+            record.id, sheets, resolved_source, selected_checks, extra_instructions, target_filter,
+        ))
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
+        return {
+            "multi_check_id": record.id,
+            "status": "processing",
+            "source_lang": resolved_source,
+            "progress": None,
+            "created_at": record.created_at.isoformat(),
+            "estimated_minutes": None,
+        }
 
     if urgent or volume <= BATCH_THRESHOLD_CHARS:
         results = await run_multi_check(
