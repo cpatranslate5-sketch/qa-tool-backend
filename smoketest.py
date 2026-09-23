@@ -4090,6 +4090,76 @@ print("[OK] run_model_comparison: runs the same real row through Opus/Sonnet/Hai
       "correctly tallies a per-model hit rate/cost/example findings from real (here, faked) per-model "
       "responses, including a ready-to-read Russian summary")
 
+# --- run_model_comparison: raw_responses / silently-dropped-type warning ---
+# Added 2026-09-23 during the Kyrgyz/French investigation: a model can
+# genuinely respond with a finding, just under a "type" the run didn't ask
+# for (e.g. it says "grammar" when only "typo" was requested) — that finding
+# then gets silently removed by _filter_findings_by_checks, and from
+# outside this looked EXACTLY like the model finding nothing at all. Every
+# run's raw, unfiltered JSON now rides along in raw_responses so the two
+# cases can finally be told apart.
+_cmp_raw_counts = {"opus": 0}
+
+
+async def _fake_call_claude_wrong_type(prompt, model=None):
+    _cmp_raw_counts["opus"] += 1
+    # The model DID notice something real — it just used a type name
+    # ("grammar") outside the "typo"/"other" enum this run actually asked
+    # for, so _filter_findings_by_checks must drop it from `findings`
+    # while it still shows up untouched in the raw response.
+    return (
+        '[{"row": 1, "type": "grammar", "severity": "medium", "message": "модель сказала не то"}]',
+        {"input_tokens": 40, "output_tokens": 20}, "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_wrong_type
+_cmp_raw_report = asyncio.run(_run_model_comparison_direct(
+    context="", source="исходник", translation="перевод",
+    target_lang="ky", source_lang="ru", checks=["typo"], runs_per_model=2,
+    models=["opus"],
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _cmp_raw_report["results"]["opus"]["catches"] == 0, (
+    "a \"type\": \"grammar\" finding is outside the \"typo\"/\"other\" enum this run asked for, so it must "
+    "never count as a catch — the whole point of this test is that this looks like a miss from `findings` alone"
+)
+_raw_entries = _cmp_raw_report["results"]["opus"]["raw_responses"]
+assert len(_raw_entries) == 2, f"one raw entry per run (runs_per_model=2) — got {_raw_entries}"
+assert all(entry == [{"row": 1, "type": "grammar", "severity": "medium", "message": "модель сказала не то"}]
+           for entry in _raw_entries), (
+    f"raw_responses must carry the model's response exactly as parsed, untouched by the type filter — got {_raw_entries}"
+)
+assert "⚠ модель что-то ответила, но это не прошло фильтр по типу" in _cmp_raw_report["summary_ru"], (
+    "0 catches with non-empty raw_responses must be flagged in the Russian summary, not look like a silent, "
+    "unremarkable miss"
+)
+print("[OK] run_model_comparison: raw_responses carries the model's unfiltered JSON even when "
+      "_filter_findings_by_checks drops every finding for using a type outside this run's enum, and the "
+      "Russian summary flags that specific situation instead of it looking like an ordinary 0/N miss")
+
+# bare mode makes no schema/type promise to filter against, so there's
+# nothing meaningful to put in raw_responses there — must stay an empty
+# list per run rather than silently missing the key (a caller checking
+# `report["results"][name]["raw_responses"]` must never KeyError just
+# because this particular run happened to be bare).
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_wrong_type
+_cmp_raw_bare_report = asyncio.run(_run_model_comparison_direct(
+    context="", source="исходник", translation="перевод",
+    target_lang="ky", source_lang="ru", checks=["typo"], runs_per_model=1,
+    models=["opus"], bare=True,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _cmp_raw_bare_report["results"]["opus"]["raw_responses"] == [], (
+    "bare mode has no type filter to look behind, so raw_responses must be present but empty, never missing"
+)
+print("[OK] run_model_comparison: bare mode always carries an (empty) raw_responses list, never a missing key")
+
 # models= subset selection — Александр's ask, 2026-09-23: a routine
 # comparison should default to Sonnet + Haiku only (no Opus spend), while
 # an explicit models=[...] can still include Opus when actually needed.
