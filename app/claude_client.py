@@ -27,13 +27,20 @@ CHECK_LABELS = {
     # so it kept missing/mislabeling things for no good reason. See git
     # history for the removal.)
     "typo": (
-        "опечатки/ошибки — это ДВЕ разные вещи, обе входят сюда: (1) обычные опечатки и орфографические ошибки в "
-        "самом переводе — неправильно написанное слово, даже если смысл всё равно понятен из контекста (например "
-        "«resulits» вместо «results») — это опечатка, и её нужно найти; (2) ошибки, искажающие смысл (пропущенное "
-        "отрицание, спутанные число/род, потеря смысла, грамматика, ломающая понимание). Не путай это со СТИЛЕМ: "
-        "другой синоним с тем же смыслом, другой порядок слов, другая, но тоже корректная формулировка — это НЕ "
-        "опечатка и не ошибка, о таком сообщать не нужно. Сюда же относится ДРУГАЯ ВАЛЮТА, чем в исходнике "
-        "(например, евро вместо доллара, или другой ISO-код) — это меняет смысл суммы, а не просто стиль"
+        "опечатки/ошибки — сюда входят ТРИ разные вещи: (1) обычные опечатки и орфографические ошибки в самом "
+        "переводе — неправильно написанное слово, даже если смысл всё равно понятен из контекста (например "
+        "«resulits» вместо «results»); (2) ЛЮБАЯ объективная грамматическая ошибка целевого языка — неправильный "
+        "падеж, управление, согласование, число, род, форма слова, предлог/послелог, синтаксис и т.п. Для этого "
+        "пункта НЕ требуется, чтобы ошибка «ломала» понимание — если форма объективно неправильная по грамматике "
+        "целевого языка, это находка, даже когда смысл всё равно можно понять; (3) ошибки смысла — перевод "
+        "означает не то, что исходник: пропущенное отрицание, спутанные число/род, неверно переданный термин, "
+        "неверно переданное условие/количество/отношение между частями фразы, потерянный или добавленный смысл. "
+        "Сюда же относится ДРУГАЯ ВАЛЮТА, чем в исходнике (например, евро вместо доллара, или другой ISO-код) — "
+        "это меняет смысл суммы, а не просто стиль. Не считай находкой стилистические предпочтения (другой "
+        "синоним с тем же смыслом, другой порядок слов, другая формулировка) — но ТОЛЬКО когда одновременно "
+        "выполнены ОБА условия: перевод грамматически корректен И полностью сохраняет смысл исходника. Если "
+        "нарушено хотя бы одно из этих двух условий — это уже не стиль, а настоящая находка по одному из пунктов "
+        "выше, и о ней нужно сообщить"
     ),
     "untranslatable": (
         "непереводимые термины — имена турниров/событий/игр/брендов/продуктов/акций, а также устоявшиеся "
@@ -88,12 +95,34 @@ CHECK_LABELS = {
 # this confidence bar filtering out a correct-but-uncertain finding.
 # Removed 2026-09-23 after the real Marathi test settled the question: the
 # relaxed opening made ZERO difference to Sonnet's result (still missed the
-# same error), so the confidence bar was never the cause — the actual fix
-# was BATCH_PROMPT_SINGLE_ITEM below. See the translation-QA catalog doc
-# (section 2) for the full writeup Александр reviewed before this removal.
+# same error), so the confidence bar alone was never the cause — the actual
+# fix at the time was BATCH_PROMPT_SINGLE_ITEM below. See the translation-QA
+# catalog doc (section 2) for the full writeup Александр reviewed before
+# that removal.
+#
+# Reworded again 2026-09-23, later the same day, once the Kyrgyz/French
+# investigation (model-comparison diagnostic, see app.model_comparison)
+# found the real mechanism: the OLD wording here ("сообщай, если уверен(а),
+# что это ошибка, а НЕ другой допустимый вариант") told the model to lean
+# toward silence on doubt, and CHECK_LABELS["typo"]'s old "грамматика,
+# ломающая понимание" phrase went further and told it outright that an
+# understandable-but-wrong grammatical form doesn't even qualify as a
+# finding to be uncertain ABOUT in the first place — confirmed live: the
+# real "{{amount}} баштап" case-ending miss returned a genuinely EMPTY raw
+# response (not a filtered-out one — see model_comparison.raw_responses)
+# from both Sonnet and Haiku under the old wording, every single run, while
+# a bare, unstructured version of the same question caught it. This opening
+# now says what TO report (every objective finding) rather than gating on
+# confidence about what NOT to report — the actual "don't flag pure style"
+# guardrail moved into CHECK_LABELS["typo"]'s own two-condition test
+# instead (grammatically correct AND fully meaning-preserving), which is
+# harder to satisfy by accident than the old one-line "tell them apart"
+# instruction was.
 CALIBRATION_STRICT_OPENING = (
-    "Общее правило: сообщай о находке, если после проверки уверен(а), что это настоящая ошибка, а не другой, "
-    "тоже допустимый вариант перевода."
+    "Общее правило: сообщай обо всех объективных находках по каждому выбранному критерию — не обязательно быть "
+    "стопроцентно уверенным(ой), чтобы сообщить о реальной проблеме. Не сообщай только о том, что является другим, "
+    "тоже полностью допустимым и корректным вариантом перевода — критерии ниже сами объясняют, когда именно "
+    "находка считается таким допустимым вариантом, а когда нет."
 )
 _CALIBRATION_SHARED_TAIL = (
     "Порядок символа валюты относительно числа, "
@@ -376,14 +405,26 @@ def _checks_description(checks: list[str]) -> str | None:
 # Not added to CHECK_LABELS itself (that dict is what the manager opts
 # INTO via checkboxes — "other" isn't opt-in, it rides along automatically
 # whenever at least one real check is running, see _allowed_ai_types).
+#
+# Reworded 2026-09-23 alongside CALIBRATION_STRICT_OPENING/CHECK_LABELS
+# above: "явно серьёзную" (explicitly SERIOUS) asked the model to clear an
+# extra, undefined severity bar before it was even allowed to consider
+# reporting something outside the selected checks — one more "sounds
+# careful, actually just adds another reason to stay quiet" filter, in the
+# same spirit as the confidence-bar wording that turned out to be
+# suppressing real findings elsewhere. Replaced with "объективную" (an
+# OBJECTIVE problem), matching the same objective/stylistic line
+# CHECK_LABELS["typo"] now draws, rather than a separate, vaguer judgment
+# call about how serious it feels.
 OTHER_TYPE = "other"
 _OTHER_TYPE_INSTRUCTION = (
-    "Если увидишь другую, явно серьёзную проблему вне этого списка (например очевидную ошибку смысла, не "
+    "Если увидишь другую объективную проблему вне этого списка (например очевидную ошибку смысла, не "
     "относящуюся ни к одному из перечисленных типов) — не подгоняй её под ближайший по смыслу разрешённый тип "
     "выше только потому, что это единственный доступный вариант: если находка не является настоящим примером "
     'именно этого критерия, её не должно быть под этим типом. Вместо этого добавь её в ответ отдельной записью '
-    'с "type": "other" — так она не потеряется, но и не исказит статистику по основным критериям. Мелкие или '
-    "сомнительные наблюдения вне списка проверок пропускай — не сообщай о них вообще."
+    'с "type": "other" — так она не потеряется, но и не исказит статистику по основным критериям. Стилистические '
+    "предпочтения или сомнительные наблюдения (не объективная ошибка) вне списка проверок пропускай — не сообщай "
+    "о них вообще."
 )
 
 
