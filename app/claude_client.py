@@ -254,11 +254,16 @@ def _calibration(checks: list[str]) -> str:
 SINGLE_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
 Проверяй только критерии из "Что проверять" ниже.
 
-{target_lang_line}
-
 {calibration}
 
 {source_lang_note}
+
+Особые указания к задаче (важнее общих правил, если есть):
+{extra_instructions}
+
+Что проверять: {checks_description}
+{other_type_instruction}
+<<CACHE_SPLIT>>{target_lang_line}
 
 Исходный текст:
 \"\"\"{source}\"\"\"
@@ -266,11 +271,6 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 Перевод:
 \"\"\"{translation}\"\"\"
 {prior_findings}
-Особые указания к задаче (важнее общих правил, если есть):
-{extra_instructions}
-
-Что проверять: {checks_description}
-{other_type_instruction}
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
@@ -281,8 +281,6 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 BATCH_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны пары (контекст, исходный текст, перевод) на один целевой язык.
 Проверяй только критерии из "Что проверять" ниже. По умолчанию оценивай каждую пару отдельно от остальных — но если
 описание конкретного критерия ниже прямо просит сравнить пары между собой, следуй этому описанию для этого критерия.
-
-{target_lang_line}
 
 {calibration}
 
@@ -318,6 +316,7 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 сама программа (через "row"/"rows" и, для повторов, автоматическую пометку вида "также в строках: …", которую ты
 не пишешь сам). Если нужно различить конкретные места — используй ТОЛЬКО цитаты самого текста (например, конкретную
 фразу или предложение из перевода), а не номера пар.
+<<CACHE_SPLIT>>{target_lang_line}
 
 Пары для проверки:
 {pairs_block}
@@ -352,14 +351,20 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качества перевода для бюро переводов. Дана одна пара (контекст, исходный текст, перевод).
 Проверяй только критерии из "Что проверять" ниже.
 
-{target_lang_line}
-
 {calibration}
 
 {source_lang_note}
 
 Особые указания к задаче (важнее общих правил, если есть):
 {extra_instructions}
+
+Что проверять: {checks_description}
+{other_type_instruction}
+
+Важно про сам текст "message": НИКОГДА не упоминай в нём номер пары/строки — ни словом ("пара 1", "строка 1"), ни
+просто числом в скобках. Если нужно различить конкретные места (например, при нескольких предложениях в одном
+тексте) — используй ТОЛЬКО цитаты самого текста (конкретную фразу или предложение), а не номер.
+<<CACHE_SPLIT>>{target_lang_line}
 
 Контекст: {context}
 Исходный текст:
@@ -368,12 +373,6 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 Перевод:
 \"\"\"{translation}\"\"\"
 {prior_findings}
-Что проверять: {checks_description}
-{other_type_instruction}
-
-Важно про сам текст "message": НИКОГДА не упоминай в нём номер пары/строки — ни словом ("пара 1", "строка 1"), ни
-просто числом в скобках. Если нужно различить конкретные места (например, при нескольких предложениях в одном
-тексте) — используй ТОЛЬКО цитаты самого текста (конкретную фразу или предложение), а не номер.
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
@@ -1301,7 +1300,16 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
     rates = MODEL_PRICING_PER_TOKEN.get(model)
     if not rates or not usage:
         return 0.0
-    cost = usage.get("input_tokens", 0) * rates["input"] + usage.get("output_tokens", 0) * rates["output"]
+    # Prompt caching (see CACHE_SPLIT): Anthropic reports cached tokens
+    # separately from input_tokens — writes bill at 1.25x input price,
+    # reads at 0.1x. Both MUST be counted or the shown cost would drop
+    # below the real bill.
+    cost = (
+        usage.get("input_tokens", 0) * rates["input"]
+        + (usage.get("cache_creation_input_tokens") or 0) * rates["input"] * 1.25
+        + (usage.get("cache_read_input_tokens") or 0) * rates["input"] * 0.10
+        + usage.get("output_tokens", 0) * rates["output"]
+    )
     return cost * BATCH_PRICE_DISCOUNT if batch else cost
 
 
@@ -1381,7 +1389,7 @@ async def _call_claude_once(prompt: str, resolved_model: str) -> tuple[str | Non
                 # model's behavior instead" — there's no replacement
                 # determinism knob, so consistency now has to come from
                 # clear prompt wording, not a request parameter.
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": _prompt_content(prompt)}],
             },
         )
         resp.raise_for_status()
@@ -1434,7 +1442,7 @@ async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | Non
                 "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
                 "content-type": "application/json",
             },
-            json=_openai_payload(resolved_model, prompt, with_effort=True),
+            json=_openai_payload(resolved_model, strip_cache_marker(prompt), with_effort=True),
         )
         # Some OpenAI models don't accept reasoning_effort — rather than
         # breaking the whole GPT branch over it, retry once without it.
@@ -1445,7 +1453,7 @@ async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | Non
                     "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
                     "content-type": "application/json",
                 },
-                json=_openai_payload(resolved_model, prompt, with_effort=False),
+                json=_openai_payload(resolved_model, strip_cache_marker(prompt), with_effort=False),
             )
         resp.raise_for_status()
         data = resp.json()
@@ -1836,6 +1844,39 @@ async def run_ai_checks_batch(
 BATCHES_URL = "https://api.anthropic.com/v1/messages/batches"
 
 
+# ------------------------------------------------------ prompt caching ---
+# 2026-09-24 (Александр: "можем ли удешевить без потери качества?"). Over
+# 99% of every Step-2 prompt is the same fixed instructions (calibration,
+# CHECK_LABELS, formatting rules) — ~13.5K chars for a 70-char phrase —
+# and hard languages send one call PER ROW, so a 30-language upload paid
+# for those identical instructions hundreds of times. The three Step-2
+# templates were reordered so everything that's constant within one task
+# (instructions, checks, extra_instructions, source-language note) comes
+# first, and everything per-language/per-row (target language, the pairs,
+# Step-1 leads, register block) comes after CACHE_SPLIT. _prompt_content
+# turns that into two content blocks with Anthropic's prompt caching on the
+# first: re-reading a cached prefix within 5 minutes costs 10% of normal
+# input price (the first write costs 125%). The model sees exactly the same
+# text either way — only the billing changes. Prefixes below the model's
+# minimum cacheable length simply aren't cached (no error).
+CACHE_SPLIT = "<<CACHE_SPLIT>>"
+
+
+def strip_cache_marker(prompt: str) -> str:
+    """For non-Anthropic callers (Gemini diagnostics etc.) and logging."""
+    return prompt.replace(CACHE_SPLIT, "")
+
+
+def _prompt_content(prompt: str):
+    if CACHE_SPLIT not in prompt:
+        return prompt
+    prefix, suffix = prompt.split(CACHE_SPLIT, 1)
+    return [
+        {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": suffix},
+    ]
+
+
 def _headers() -> dict:
     return {
         "x-api-key": settings.ANTHROPIC_API_KEY,
@@ -1864,7 +1905,7 @@ async def create_message_batch(requests: list[dict]) -> str | None:
                 # 400 on newer models (confirmed live against Sonnet), and
                 # recommends prompting instead of a temperature parameter
                 # for consistent output on these models.
-                "messages": [{"role": "user", "content": r["prompt"]}],
+                "messages": [{"role": "user", "content": _prompt_content(r["prompt"])}],
             },
         }
         for r in requests
