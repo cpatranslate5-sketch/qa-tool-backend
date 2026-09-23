@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 # _prior_findings_block — but ONLY the source-vs-translation comparison:
 # the register_value entry (incl. "mixed" within one cell) is explicitly
 # kept, since that's how the register check itself gets its data.
+# 2026-09-24 (Александр, recurring): the model kept demanding plural
+# agreement with game/tournament names that merely LOOK plural in English
+# ("Haunted Hell Fire Treats आ रहा है" → "should be आ रहे हैं"), even when
+# the source itself uses singular ("Treats is coming"). A name is one
+# entity — singular agreement is correct. Rule added to CHECK_LABELS["typo"].
 CHECK_LABELS = {
     # (A "glossary" check used to live here too — required-term matching
     # against an uploaded glossary document. Removed: unlike the other AI
@@ -55,7 +60,12 @@ CHECK_LABELS = {
         "адаптация под жанр (мемы, маркетинг, игровые и рекламные тексты) — это НЕ ошибка смысла, даже если "
         "дословно слова различаются. Сообщай об ошибке смысла, только если можешь назвать, что КОНКРЕТНО читатель "
         "перевода поймёт иначе (другой факт, действие, число, условие, адресат, отрицание); если разница видна "
-        "только при дословном сравнении слов — это не находка. Форма обращения (ты/вы, tú/usted, du/Sie и т.п.) — "
+        "только при дословном сравнении слов — это не находка. Названия игр, турниров, акций, брендов и т.п. "
+        "(например «Haunted Hell Fire Treats», «Sweet Bonanza», «Gates of Olympus») — это ОДИН объект, даже если "
+        "по форме название выглядит как множественное число: согласование с ним в единственном числе (глагол, "
+        "прилагательное, местоимение) — НЕ ошибка, требовать множественное число из-за формы слова в названии "
+        "нельзя. Особенно если и в исходнике с этим названием согласовано единственное число («... Treats is "
+        "coming»). Ошибкой согласования с названием считай только явный разнобой внутри самого перевода. Форма обращения (ты/вы, tú/usted, du/Sie и т.п.) — "
         "НЕ предмет этого критерия вообще: её проверяет отдельная проверка, а требования к ней зависят от языка "
         "и задачи и могут не совпадать с исходником — никогда не сообщай о несовпадении обращения с исходником "
         "как о находке этого критерия. Это НЕ отменяет отдельную запись об обращении (register_value, включая "
