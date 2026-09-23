@@ -752,13 +752,6 @@ async def multi_check(
     # an hour. Costs 2x (the batch queue is exactly half price — see
     # claude_client.BATCH_PRICE_DISCOUNT — so skipping it is full price).
     urgent: bool = Form(False),
-    # "🌐 Проверить также через Gemini" checkbox — see
-    # excel_multi.run_multi_check's own comment and app.gemini_client.
-    # Needs GEMINI_API_KEY configured on Railway (settings.GEMINI_API_KEY)
-    # or it silently finds nothing for this pass, same graceful
-    # degradation as a missing ANTHROPIC_API_KEY. Also forces the live
-    # path, like "urgent".
-    gemini_check: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     # Captured up front (rather than relying on created_at's own
@@ -793,10 +786,9 @@ async def multi_check(
     # its full, non-discounted price) regardless of size.
     volume = estimate_check_volume(sheets, resolved_source, target_filter)
 
-    if urgent or gemini_check or volume <= BATCH_THRESHOLD_CHARS:
+    if urgent or volume <= BATCH_THRESHOLD_CHARS:
         results = await run_multi_check(
-            sheets, resolved_source, selected_checks, extra_instructions,
-            target_filter, gemini_check=gemini_check,
+            sheets, resolved_source, selected_checks, extra_instructions, target_filter,
         )
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(

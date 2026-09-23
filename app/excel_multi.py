@@ -10,9 +10,7 @@ import re
 
 import openpyxl
 
-from app.gemini_client import run_gemini_checks_batch
 from app.claude_client import (
-    REGISTER_MIXED_TYPE,
     REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
@@ -946,73 +944,6 @@ async def _run_ai_chunks(
     return ai_findings_by_idx, cost_usd, truncated
 
 
-async def _run_gemini_chunks(
-    item_chunks: list[list[dict]],
-    checks: list[str],
-    extra_instructions: str,
-    lang: str,
-    source_lang: str,
-    semaphore: asyncio.Semaphore,
-) -> tuple[dict[int, list[dict]], float, bool, bool, str | None]:
-    """Same chunking/merging/"_also_idx"-shifting as _run_ai_chunks above,
-    but against Gemini (see app.gemini_client.run_gemini_checks_batch) —
-    kept as its own function rather than a shared one because Gemini's
-    per-chunk call returns two extra elements (errored, error_detail) that
-    Claude's doesn't. Returns (findings keyed by item index, cost_usd,
-    whether ANY chunk was truncated, whether ANY chunk failed to get a
-    usable answer at all, a short reason why — from whichever failed chunk
-    hit the problem first) — a language split across several chunks
-    (MAX_ROWS_PER_AI_CALL) must still surface a warning even if only one of
-    several chunks had a problem, not have it silently swallowed by the
-    others that succeeded."""
-    async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool, bool, str | None]:
-        async with semaphore:
-            return await run_gemini_checks_batch(chunk_items, checks, extra_instructions, lang, source_lang)
-
-    chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
-
-    findings_by_idx: dict[int, list[dict]] = {}
-    cost_usd = 0.0
-    truncated = False
-    errored = False
-    error_detail = None
-    offset = 0
-    for (chunk_findings, chunk_cost, chunk_truncated, chunk_errored, chunk_error_detail), chunk_items in zip(
-        chunk_results, item_chunks
-    ):
-        for local_idx, findings in chunk_findings.items():
-            remapped = []
-            for f in findings:
-                if "_also_idx" in f:
-                    f = {**f, "_also_idx": [offset + i for i in f["_also_idx"]]}
-                remapped.append(f)
-            findings_by_idx[offset + local_idx] = remapped
-        cost_usd += chunk_cost
-        truncated = truncated or chunk_truncated
-        errored = errored or chunk_errored
-        error_detail = error_detail or chunk_error_detail
-        offset += len(chunk_items)
-
-    return findings_by_idx, cost_usd, truncated, errored, error_detail
-
-
-def _mark_gemini_findings(findings: list[dict]) -> list[dict]:
-    """Tags each finding from the optional "🌐 Проверить также через
-    Gemini" pass (see gemini_check below) — a machine-readable
-    "gemini_check": True field plus a "🌐 [Gemini] " message prefix. These
-    ARE meant to be real, actionable findings — Александр explicitly chose
-    to keep them counted in the headline "N проблем" (see
-    run_multi_check/_count_real_findings, which only excludes
-    register_summary, not this). The tag says WHICH engine found it."""
-    out = []
-    for f in findings:
-        f = dict(f)
-        f["gemini_check"] = True
-        f["message"] = "🌐 [Gemini] " + str(f.get("message", ""))
-        out.append(f)
-    return out
-
-
 async def _check_language_for_sheet(
     sheet: dict,
     lang: str,
@@ -1020,10 +951,8 @@ async def _check_language_for_sheet(
     checks: list[str],
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
-    gemini_check: bool = False,
-) -> tuple[list[dict], float, float]:
-    """Returns (rows-with-findings, production cost_usd, extra cost_usd
-    spent on the gemini_check pass — always 0.0 when that feature is off)."""
+) -> tuple[list[dict], float]:
+    """Returns (rows-with-findings, production cost_usd)."""
     relevant_rows = []
     ai_items = []
     for row in sheet["rows"]:
@@ -1037,7 +966,7 @@ async def _check_language_for_sheet(
         ai_items.append({"context": row["context"], "source": src, "translation": tgt})
 
     if not relevant_rows:
-        return [], 0.0, 0.0, 0.0
+        return [], 0.0
 
     # See MAX_ROWS_PER_AI_CALL above — one big AI call covering the whole
     # language is split into several smaller ones instead, each still
@@ -1056,45 +985,12 @@ async def _check_language_for_sheet(
     ai_findings_by_idx = _resolve_repeated_findings(ai_findings_by_idx, relevant_rows)
     ai_findings_by_idx, register_values_by_idx = _extract_register_values(ai_findings_by_idx)
 
-    # "🌐 Проверить также через Gemini" — Александр's ask, 2026-09-22, after
-    # a blind test (same prompt, no hints) showed Gemini independently
-    # caught a real Marathi meaning error that Opus missed, while correctly
-    # staying silent on a genuinely-fine control example. Runs for EVERY
-    # checked language when on (his own choice — not scoped to "hard"
-    # languages only), and its findings are shown as real, actionable
-    # findings, just clearly tagged with which engine found them, since
-    # trust in a second provider is still being built.
-    gemini_cost_usd = 0.0
-    gemini_findings_by_idx: dict[int, list[dict]] = {}
-    gemini_truncated = False
-    gemini_errored = False
-    gemini_error_detail = None
-    if gemini_check:
-        (
-            gemini_findings_by_idx, gemini_cost_usd, gemini_truncated, gemini_errored, gemini_error_detail,
-        ) = await _run_gemini_chunks(
-            item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
-        )
-        gemini_findings_by_idx = _resolve_repeated_findings(gemini_findings_by_idx, relevant_rows)
-        gemini_findings_by_idx, _ = _extract_register_values(gemini_findings_by_idx)
-        # Gemini gets sent the exact same prompt, including the
-        # register-instructions block when "register" is selected, so it
-        # can return the same register_mixed
-        # noise, which isn't what this second-opinion pass is for.
-        gemini_findings_by_idx = {
-            idx: [f for f in findings if f.get("type") != REGISTER_MIXED_TYPE]
-            for idx, findings in gemini_findings_by_idx.items()
-        }
-        gemini_findings_by_idx = {idx: fs for idx, fs in gemini_findings_by_idx.items() if fs}
-
     out = []
     for idx, row in enumerate(relevant_rows):
         src = row["values"].get(source_lang, "")
         tgt = row["values"].get(lang, "")
         findings = run_rule_checks(src, tgt, checks, max_length=row["max_length"], lang_code=lang)
         findings += ai_findings_by_idx.get(idx, [])
-        if gemini_check:
-            findings += _mark_gemini_findings(gemini_findings_by_idx.get(idx, []))
         if findings:
             out.append({
                 "excel_row": row["excel_row"],
@@ -1116,43 +1012,6 @@ async def _check_language_for_sheet(
             "translation": "",
             "findings": [_truncation_warning()],
         })
-    if gemini_check and gemini_truncated:
-        out.append({
-            "excel_row": 0,
-            "context": "⚠ Системное предупреждение",
-            "source": "",
-            "translation": "",
-            "findings": [{
-                "type": "system",
-                "severity": "low",
-                "message": (
-                    "🌐 Проверка через Gemini для этого языка была обрезана из-за большого объёма — часть "
-                    "строк могла остаться непроверенной именно этой дополнительной проверкой. На обычную "
-                    "проверку через Claude это не повлияло."
-                ),
-            }],
-        })
-    if gemini_check and gemini_errored:
-        # Added 2026-09-22 after a real Railway run only showed the generic
-        # "ошибка сети, ключа или модели" text with no way to tell which of
-        # the three it actually was — now names the specific reason
-        # (_gemini_error_detail) right in the report itself, so Александр
-        # doesn't need to check Railway's own logs to know what to fix.
-        _gemini_reason = gemini_error_detail or "ошибка сети, ключа или модели"
-        out.append({
-            "excel_row": 0,
-            "context": "⚠ Системное предупреждение",
-            "source": "",
-            "translation": "",
-            "findings": [{
-                "type": "system",
-                "severity": "low",
-                "message": (
-                    f"🌐 Проверка через Gemini для этого языка не выполнилась: {_gemini_reason}. Не повлияло "
-                    f"на обычную проверку через Claude, но эта дополнительная проверка не сработала."
-                ),
-            }],
-        })
     if "register" in checks:
         by_excel_row = {relevant_rows[idx]["excel_row"]: v for idx, v in register_values_by_idx.items()}
         texts_by_excel_row = {
@@ -1162,7 +1021,7 @@ async def _check_language_for_sheet(
         block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
         if block is not None:
             out.append(block)
-    return out, cost_usd, gemini_cost_usd
+    return out, cost_usd
 
 
 async def run_multi_check(
@@ -1171,7 +1030,6 @@ async def run_multi_check(
     checks: list[str],
     extra_instructions: str = "",
     target_langs_filter: set[str] | None = None,
-    gemini_check: bool = False,
 ) -> dict:
     """
     Each target language gets its own AI call, so the prompt for e.g.
@@ -1180,50 +1038,32 @@ async def run_multi_check(
     target_langs_filter: when given, only these languages are checked even
     if the file has more columns — lets a manager check a subset of a
     large upload instead of every language every time.
-
-    gemini_check: see _check_language_for_sheet's own comment and
-    app.gemini_client — runs every language's AI check ALSO through Google
-    Gemini (same prompt/calibration, different model provider) and adds
-    whatever it catches as "🌐"-tagged findings, counted as real findings
-    (see _mark_gemini_findings)
-    since a blind test showed it independently catches real errors ours
-    misses. Also roughly doubles AI cost (summary["gemini_cost_usd"]) —
-    off by default, opt-in per run.
     """
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
     total_findings = 0
-    total_gemini_findings = 0
     total_rows_checked = 0
     total_cost_usd = 0.0
-    total_gemini_cost_usd = 0.0
 
     for sheet in sheets:
         target_langs = [l for l in sheet["languages"] if l != source_lang]
         if target_langs_filter is not None:
             target_langs = [l for l in target_langs if _lang_selected(l, target_langs_filter)]
         tasks = [
-            _check_language_for_sheet(
-                sheet, lang, source_lang, checks, extra_instructions, semaphore,
-                gemini_check=gemini_check,
-            )
+            _check_language_for_sheet(sheet, lang, source_lang, checks, extra_instructions, semaphore)
             for lang in target_langs
         ]
         per_lang_results = await asyncio.gather(*tasks) if tasks else []
 
         dup_cols = sheet.get("duplicate_language_columns") or {}
         languages_out = {}
-        for lang, (findings_list, lang_cost, lang_gemini_cost) in zip(target_langs, per_lang_results):
+        for lang, (findings_list, lang_cost) in zip(target_langs, per_lang_results):
             findings_list = _apply_duplicate_language_warnings(
                 findings_list, lang, dup_cols, source_lang, show_source_warning=(lang == target_langs[0]),
             )
             languages_out[lang] = findings_list
             total_findings += _count_real_findings(findings_list)
-            total_gemini_findings += sum(
-                1 for row in findings_list for f in row["findings"] if f.get("gemini_check")
-            )
-            total_cost_usd += lang_cost + lang_gemini_cost
-            total_gemini_cost_usd += lang_gemini_cost
+            total_cost_usd += lang_cost
 
         total_rows_checked += len(sheet["rows"])
         result_sheets.append({
@@ -1241,9 +1081,6 @@ async def run_multi_check(
         "total_findings": total_findings,
         "cost_usd": total_cost_usd,
     }
-    if gemini_check:
-        summary["gemini_cost_usd"] = total_gemini_cost_usd
-        summary["gemini_findings"] = total_gemini_findings
     return {"sheets": result_sheets, "summary": summary}
 
 
