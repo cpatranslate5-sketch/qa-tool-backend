@@ -2339,16 +2339,14 @@ print(f"[OK] _chunk_list: splits into consecutive chunks of at most the given si
 # merged with it, because that chunk's own AI call never saw the first
 # chunk's rows at all (the trade-off documented on MAX_ROWS_PER_AI_CALL).
 _chunk_call_prompts: list[str] = []
-# run_ai_checks_batch now makes THREE calls per chunk (the two-step
-# pipeline's Step 1 search pass, run under BOTH Sonnet AND Haiku — see
-# claude_client._ensemble_search_findings's own comment — then Step 2's
-# structured BATCH_PROMPT), all through this same fake. This test only
-# cares about Step 2's response shape per chunk, so Step 1 calls
-# (identified by FINDINGS_SEARCH_PROMPT's own distinctive opening line,
-# since interleaving between the two concurrently-dispatched chunks AND
-# the two concurrently-dispatched search models makes raw call order
-# unreliable) always report nothing, and a SEPARATE counter tracks Step 2
-# calls only.
+# run_ai_checks_batch now makes TWO calls per chunk (the two-step
+# pipeline's Step 1 search pass, then Step 2's structured BATCH_PROMPT —
+# see claude_client.FINDINGS_SEARCH_PROMPT's own comment), both through
+# this same fake. This test only cares about Step 2's response shape per
+# chunk, so Step 1 calls (identified by FINDINGS_SEARCH_PROMPT's own
+# distinctive opening line, since interleaving between the two
+# concurrently-dispatched chunks makes raw call order unreliable) always
+# report nothing, and a SEPARATE counter tracks Step 2 calls only.
 _chunk_structured_call_count = {"n": 0}
 
 
@@ -2388,9 +2386,7 @@ _chunk_out, _chunk_cost = asyncio.get_event_loop().run_until_complete(
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_chunk_call_prompts) == 6, (
-    "expected exactly 6 AI calls — 2 chunks x (2 search calls, Sonnet+Haiku ensemble, + 1 structured call)"
-)
+assert len(_chunk_call_prompts) == 4, "expected exactly 4 AI calls — 2 chunks x (search step + structured step)"
 assert _chunk_structured_call_count["n"] == 2, "expected exactly 2 structured-step AI calls — one per chunk"
 _chunk_by_row = {r["excel_row"]: r["findings"] for r in _chunk_out}
 # first chunk's repeat: local rows 1 and 3 -> global indices 0 and 2 -> excel_row 100 and 102
@@ -2448,11 +2444,11 @@ asyncio.get_event_loop().run_until_complete(
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert _hard_chunk_calls["n"] == 9, (
+assert _hard_chunk_calls["n"] == 6, (
     f"a hard language (mr) with 3 rows must make 3 SEPARATE AI chunks (1 row each, MAX_ROWS_PER_AI_CALL_HARD), "
-    f"not 1 batched call — and each chunk now makes 3 AI calls (the two-step pipeline's search step, run under "
-    f"BOTH Sonnet and Haiku — see claude_client._ensemble_search_findings's own comment — then the structured "
-    f"step), so 3 chunks x 3 = 9 total calls — got {_hard_chunk_calls['n']} calls"
+    f"not 1 batched call — and each chunk now makes 2 AI calls (the two-step pipeline's search step, then its "
+    f"structured step — see claude_client.FINDINGS_SEARCH_PROMPT's own comment), so 3 chunks x 2 = 6 total "
+    f"calls — got {_hard_chunk_calls['n']} calls"
 )
 print("[OK] MAX_ROWS_PER_AI_CALL_HARD: a hard-list language (mr, ky, ...) is checked ONE row at a time — proven "
       "necessary by a real Marathi miss that a single-pair check caught but a same-model, same-prompt batched "
@@ -4058,119 +4054,20 @@ print("[OK] _prior_findings_block/_pairs_block: Step 1 candidates are embedded r
       "only, keyed by original item index — empty/no candidates leaves a pair's text byte-for-byte "
       "unaffected, exactly as before the two-step pipeline existed")
 
-# _ensemble_search_findings itself (unit level, below the full
-# run_ai_checks_batch integration tested further down): the two search
-# calls (Sonnet + Haiku) must run CONCURRENTLY (not one waiting for the
-# other — checked here via a fake that sleeps on one branch, so a
-# sequential implementation would take noticeably longer), each model's
-# DIFFERENT real candidates must all survive into the merged result, an
-# exact-text duplicate between the two models must collapse to one line,
-# and the returned cost must be the sum of both calls'.
-import time as _ensemble_perf_time
-from app.claude_client import _ensemble_search_findings
-from app.claude_client import _usage_cost as _usage_cost_direct
-
-_ensemble_items = [{"context": "", "source": "He did not agree.", "translation": "Он согласился."}]
-
-
-async def _fake_call_claude_ensemble(prompt, model=None):
-    # BOTH branches sleep the same amount — if run concurrently, total
-    # elapsed is ~0.12s (one wait); if run sequentially, ~0.24s (both
-    # waits back to back). Only sleeping ONE branch wouldn't distinguish
-    # the two, since the other would return instantly either way.
-    await asyncio.sleep(0.12)
-    if model == settings.CLAUDE_MODEL_FAST:
-        return (
-            "1: пропущено отрицание\n1: странная пунктуация в конце",
-            {"input_tokens": 15, "output_tokens": 8}, "end_turn",
-        )
-    # Sonnet — the same candidate Haiku also found (exact text match, must
-    # de-dupe) plus one Sonnet-only candidate.
-    return (
-        "1: пропущено отрицание\n1: подозрительный порядок слов",
-        {"input_tokens": 20, "output_tokens": 10}, "end_turn",
-    )
-
-
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_ensemble
-_ensemble_start = _ensemble_perf_time.monotonic()
-_ensemble_result, _ensemble_cost = asyncio.run(
-    _ensemble_search_findings(_ensemble_items, target_lang="ky", source_lang="en")
-)
-_ensemble_elapsed = _ensemble_perf_time.monotonic() - _ensemble_start
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-
-assert _ensemble_elapsed < 0.2, (
-    f"the two search calls must run CONCURRENTLY (asyncio.gather) — took {_ensemble_elapsed:.3f}s, close to "
-    f"double the single 0.12s sleep, which suggests they were awaited sequentially instead of in parallel"
-)
-assert _ensemble_result == {
-    0: ["пропущено отрицание", "подозрительный порядок слов", "странная пунктуация в конце"],
-}, _ensemble_result
-assert _ensemble_cost == (
-    _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 20, "output_tokens": 10})
-    + _usage_cost_direct(settings.CLAUDE_MODEL_FAST, {"input_tokens": 15, "output_tokens": 8})
-), _ensemble_cost
-print("[OK] _ensemble_search_findings: runs Step 1 under Sonnet and Haiku CONCURRENTLY, merges both models' "
-      "candidates for the same pair with an exact-text duplicate collapsed to one line (Sonnet's own phrasing "
-      "kept first) while each model's own distinct candidates both survive, and sums both calls' cost")
-
-# Resilience: a transient Anthropic-side failure (httpx.HTTPError) on ONE
-# of the two ensemble models must NOT sink the other model's already-good
-# candidates, or the check as a whole — before the ensemble existed, Step 1
-# was a single call, so this specific new failure mode (two independent
-# network calls, either one able to fail on its own) didn't exist yet.
-import httpx as _httpx_direct
-
-
-async def _fake_call_claude_one_model_down(prompt, model=None):
-    if model == settings.CLAUDE_MODEL_FAST:
-        raise _httpx_direct.ConnectError("simulated Haiku-side outage")
-    return "1: реальная находка от Sonnet", {"input_tokens": 20, "output_tokens": 10}, "end_turn"
-
-
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_one_model_down
-_degraded_result, _degraded_cost = asyncio.run(
-    _ensemble_search_findings(_ensemble_items, target_lang="ky", source_lang="en")
-)
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-assert _degraded_result == {0: ["реальная находка от Sonnet"]}, (
-    f"Sonnet's real candidate must survive even though Haiku's call raised — got {_degraded_result}"
-)
-assert _degraded_cost == _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 20, "output_tokens": 10}), (
-    "cost must reflect only the model that actually succeeded — the failed Haiku call contributes $0, not "
-    "an error and not a phantom charge"
-)
-print("[OK] _ensemble_search_findings: a transient Anthropic-side failure (httpx.HTTPError) on ONE of the "
-      "two ensemble models degrades that model's contribution to 'found nothing, cost $0' instead of raising "
-      "and losing the OTHER model's already-good candidates — a genuine (non-HTTP) bug would still propagate "
-      "normally, this only widens what already degraded gracefully before")
-
 # End-to-end through run_ai_checks_batch: a fake _call_claude that behaves
 # differently depending on whether it's being asked FINDINGS_SEARCH_PROMPT
 # (Step 1) or the structured BATCH_PROMPT_SINGLE_ITEM (Step 2) — confirms
 # Step 1 actually runs first, its candidate reaches Step 2's own prompt
 # text (not just internal plumbing), and the final findings/cost reflect
-# ALL THREE calls, not just Step 2's. Step 1 now runs under TWO models at
-# once (Sonnet + Haiku — see claude_client._ensemble_search_findings's own
-# comment, Александр's ask 2026-09-23) concurrently, so both search calls
-# happen before the single structured call, but not necessarily in a fixed
-# order relative to EACH OTHER — only the structured call is guaranteed to
-# be last (it awaits both search calls' results first).
+# BOTH calls, not just Step 2's.
 from app.claude_client import run_ai_checks_batch as _run_ai_checks_batch_direct
 
 _two_step_prompts: list[str] = []
-_two_step_search_models: list[str] = []
 
 
 async def _fake_call_claude_two_step(prompt, model=None):
     _two_step_prompts.append(prompt)
     if prompt.startswith("Ты — опытный редактор переводов"):
-        _two_step_search_models.append(model)
         return "1: пропущено отрицание в переводе", {"input_tokens": 30, "output_tokens": 10}, "end_turn"
     return (
         '[{"row": 1, "type": "typo", "severity": "medium", "message": "подтверждено: пропущено отрицание"}]',
@@ -4186,42 +4083,29 @@ _two_step_findings, _two_step_cost, _two_step_trunc = asyncio.run(_run_ai_checks
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_two_step_prompts) == 3, (
-    "expected exactly 3 calls — 2 search calls (Sonnet + Haiku ensemble), then the structured step"
-)
-assert _two_step_prompts[-1].startswith("Ты — модуль контроля качества перевода"), (
-    "the structured step (Step 2) must be the LAST call — it awaits both Step 1 search calls first"
-)
-assert sorted(_two_step_search_models) == sorted([settings.CLAUDE_MODEL, settings.CLAUDE_MODEL_FAST]), (
-    f"Step 1's two search calls must run under Sonnet AND Haiku specifically, not the same model twice or "
-    f"some other pair — got {_two_step_search_models}"
-)
-assert "пропущено отрицание в переводе" in _two_step_prompts[-1], (
+assert len(_two_step_prompts) == 2, "expected exactly 2 calls — the search step, then the structured step"
+assert _two_step_prompts[0].startswith("Ты — опытный редактор переводов"), "Step 1 (search) must run FIRST"
+assert "пропущено отрицание в переводе" in _two_step_prompts[1], (
     "Step 1's candidate must actually reach Step 2's own structured prompt text, not just be computed and "
-    "then thrown away — deduped to ONE line here since both models returned the identical text"
-)
-assert _two_step_prompts[-1].count("пропущено отрицание в переводе") == 1, (
-    "the ensemble must de-dupe an identical candidate text returned by BOTH models into a single embedded "
-    "line, not repeat it twice in Step 2's prompt"
+    "then thrown away"
 )
 assert _two_step_findings == {0: [{"type": "typo", "severity": "medium",
                                     "message": "подтверждено: пропущено отрицание"}]}, _two_step_findings
 assert not _two_step_trunc
 assert _two_step_cost > 0, _two_step_cost
-# cost must reflect ALL THREE calls, not just Step 2's — the two search
-# calls alone (30 in + 10 out tokens each, once at Sonnet's rate and once
-# at Haiku's, both cheaper per-token than Sonnet) are still a real,
-# non-trivial slice of the total.
+# cost must reflect BOTH calls, not just Step 2's — Step 1 alone (30 in +
+# 10 out tokens at Sonnet's own per-token rate) is a real, non-trivial
+# slice of the total.
 from app.claude_client import _usage_cost as _usage_cost_direct
-_step1_sonnet_only_cost = _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 30, "output_tokens": 10})
-assert _two_step_cost > _step1_sonnet_only_cost, (
-    f"total cost ({_two_step_cost}) must exceed even just ONE of Step 1's two search calls' cost alone "
-    f"({_step1_sonnet_only_cost}) — all three calls must be billed, not just the structured step"
+_step1_only_cost = _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 30, "output_tokens": 10})
+assert _two_step_cost > _step1_only_cost, (
+    f"total cost ({_two_step_cost}) must exceed Step 1's own cost alone ({_step1_only_cost}) — both calls "
+    f"must be billed, not just the structured step"
 )
-print("[OK] run_ai_checks_batch: the two-step pipeline's Step 1 now runs as a Sonnet+Haiku ensemble "
-      "(both concurrently) before Step 2 (the structured/calibrated prompt) — both models' candidates reach "
-      "Step 2's own prompt text as real embedded lines, de-duped when identical, the final findings come "
-      "from Step 2 as always, and cost_usd sums all three calls rather than only the structured one")
+print("[OK] run_ai_checks_batch: the two-step pipeline actually runs Step 1 (free search) before Step 2 "
+      "(the structured/calibrated prompt), Step 1's candidate reaches Step 2's own prompt text as a real "
+      "embedded line (not just internal state), the final findings come from Step 2 as always, and cost_usd "
+      "sums both calls rather than only the structured one")
 
 # A register-only run has nothing for a free error search to look for, so
 # Step 1 must be skipped entirely — same reasoning as the register-only

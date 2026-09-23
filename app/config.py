@@ -34,19 +34,6 @@ class Settings:
     # has this env var set from an earlier trial (e.g. to a Sonnet id),
     # that value wins over this default and must be updated there too.
     CLAUDE_MODEL_HARD: str = os.environ.get("CLAUDE_MODEL_HARD", "claude-opus-5")
-    # Added 2026-09-23 (Александр's ask): the two-step pipeline's Step 1
-    # ("find anything wrong", no schema/calibration — see
-    # claude_client.FINDINGS_SEARCH_PROMPT) now runs under BOTH this model
-    # AND CLAUDE_MODEL, in parallel, pooling both models' candidates for
-    # Step 2 (still CLAUDE_MODEL alone) to judge — see
-    # claude_client._ensemble_search_findings. Different models keep
-    # noticing different real errors this whole investigation, and Haiku is
-    # roughly half CLAUDE_MODEL's per-token price (see
-    # claude_client.MODEL_PRICING_PER_TOKEN), so this widens Step 1's net
-    # for a comparatively small extra cost. Override via the
-    # CLAUDE_MODEL_FAST env var on Railway if a different fast/cheap model
-    # is ever needed here without a code change.
-    CLAUDE_MODEL_FAST: str = os.environ.get("CLAUDE_MODEL_FAST", "claude-haiku-4-5-20251001")
     ALLOWED_ORIGINS: list[str] = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 

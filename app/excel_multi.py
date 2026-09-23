@@ -32,16 +32,6 @@ from app.claude_client import (
 from app.rule_checks import run_rule_checks
 
 LANG_CODE_RE = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,5})?$")
-# Bounds how many chunks' run_ai_checks_batch calls are in flight at once
-# on the live path (_run_ai_chunks below). Since 2026-09-23's Sonnet+Haiku
-# ensemble on Step 1 (see claude_client._ensemble_search_findings), each
-# chunk briefly fires TWO concurrent Anthropic calls during its own search
-# phase before settling into one for the structured step — so real peak
-# concurrent outbound requests can briefly reach roughly 2x this number,
-# not exactly this number, on a large multi-chunk/multi-language upload.
-# Left as a chunk-level bound (not tightened to compensate) since Sonnet
-# and Haiku calls aren't known to share the same rate-limit bucket at
-# Anthropic; revisit this constant if real rate-limit errors show up.
 AI_CONCURRENCY = 5
 
 # Industry-standard placeholder: a translator (or the client) can mark a

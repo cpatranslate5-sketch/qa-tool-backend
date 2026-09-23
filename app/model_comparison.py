@@ -61,17 +61,17 @@ from app.excel_multi import AI_CONCURRENCY
 # Only these three, fixed, named candidates — never an arbitrary model id
 # taken from the request — so a typo in a request can't rack up cost
 # against some unpriced/unknown model, and MODEL_PRICING_PER_TOKEN always
-# has a rate for whatever actually gets called here. All three are read
+# has a rate for whatever actually gets called here. Opus/Sonnet are read
 # from settings (not hardcoded ids) so this always compares against
 # whatever Railway is actually configured to use in production right now,
-# not a stale snapshot. "haiku" used to be hardcoded here (nothing in the
-# product pointed at it) — since 2026-09-23 it's settings.CLAUDE_MODEL_FAST,
-# the same model claude_client._ensemble_search_findings now actually uses
-# for real, alongside Sonnet, on the two-step pipeline's Step 1.
+# not a stale snapshot; "haiku" has no settings entry of its own any more
+# (nothing in the product points at it since the Sonnet switch — see
+# config.py's CLAUDE_MODEL comment), so it's named directly here, matching
+# its own key in claude_client.MODEL_PRICING_PER_TOKEN.
 MODEL_COMPARISON_CANDIDATES = {
     "opus": lambda: settings.CLAUDE_MODEL_HARD,
     "sonnet": lambda: settings.CLAUDE_MODEL,
-    "haiku": lambda: settings.CLAUDE_MODEL_FAST,
+    "haiku": lambda: "claude-haiku-4-5-20251001",
 }
 
 # Default subset of MODEL_COMPARISON_CANDIDATES a call runs when "models"
