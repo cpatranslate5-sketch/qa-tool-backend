@@ -34,6 +34,27 @@ class Settings:
     # has this env var set from an earlier trial (e.g. to a Sonnet id),
     # that value wins over this default and must be updated there too.
     CLAUDE_MODEL_HARD: str = os.environ.get("CLAUDE_MODEL_HARD", "claude-opus-5")
+    # Added 2026-09-23 (Александр's ask): a GPT model joins Sonnet on Step 1
+    # of the search (see claude_client._ensemble_search_findings) for model-
+    # family diversity — Kyrgyz detection kept feeling inconsistent even on
+    # the byte-identical, already-proven plain Sonnet+Sonnet pipeline, most
+    # likely ordinary run-to-run LLM variance rather than a code regression.
+    # A model from a different vendor is less likely to share Claude's own
+    # blind spots than another Claude model would (this is also why the
+    # earlier Sonnet+Haiku ensemble — same vendor — was reverted). Left
+    # EMPTY by default: the GPT branch silently contributes nothing when no
+    # key is set, exactly like ANTHROPIC_API_KEY's own missing-key
+    # behavior, so nothing breaks before a real key is added on Railway.
+    # Get a key from platform.openai.com.
+    OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
+    # "mini" = OpenAI's cheap/fast tier — Александр's explicit request for
+    # "простую версию" (a simple version), mirroring Haiku's old role.
+    # $0.25/$2.00 per million input/output tokens, confirmed against
+    # OpenAI's own GPT-5-for-developers pricing announcement (checked
+    # 2026-09-23) — see claude_client.OPENAI_MODEL_PRICING_PER_TOKEN.
+    # Override via the OPENAI_MODEL env var on Railway if OpenAI's
+    # naming/pricing moves on.
+    OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
     ALLOWED_ORIGINS: list[str] = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 

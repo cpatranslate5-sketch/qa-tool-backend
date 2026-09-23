@@ -4175,6 +4175,227 @@ print("[OK] run_ai_checks_batch: model_override forces a specific model for both
       "pipeline, regardless of what _model_for_lang would otherwise choose for the target language — every "
       "real production caller still leaves this unset and is unaffected")
 
+# --- Step 1 ensemble: Sonnet + GPT (Александр's ask, 2026-09-23) --------
+# A model from a different vendor (OpenAI) joins Sonnet on Step 1, purely
+# for model-family diversity — see _ensemble_search_findings's own comment
+# for why (the earlier, same-vendor Sonnet+Haiku ensemble was reverted;
+# Kyrgyz detection stayed inconsistent even on the byte-identical,
+# already-proven Sonnet-only pipeline, most likely ordinary LLM run-to-run
+# variance this ensemble is meant to hedge against — no concrete failing
+# example was available to test against this time).
+from app.claude_client import _ensemble_search_findings as _ensemble_search_findings_direct
+from app.claude_client import _openai_usage_cost as _openai_usage_cost_direct
+
+assert _openai_usage_cost_direct("gpt-5-mini", None) == 0.0
+assert _openai_usage_cost_direct("some-unpriced-model", {"prompt_tokens": 100, "completion_tokens": 50}) == 0.0
+_gpt_cost_check = _openai_usage_cost_direct("gpt-5-mini", {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000})
+assert abs(_gpt_cost_check - 2.25) < 1e-9, (
+    f"gpt-5-mini priced at $0.25/$2.00 per million input/output tokens must cost $2.25 for 1M+1M tokens, "
+    f"got {_gpt_cost_check}"
+)
+print("[OK] _openai_usage_cost: missing usage/unpriced model degrades to $0 rather than raising, and "
+      "gpt-5-mini's real per-token rate ($0.25/$2.00 per million) is applied correctly")
+
+_previous_call_openai = claude_client_mod._call_openai
+
+
+async def _fake_call_claude_ensemble_sonnet(prompt, model=None):
+    return "1: sonnet-находка", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
+
+
+async def _fake_call_openai_ensemble(prompt, model=None):
+    return "1: gpt-находка", {"prompt_tokens": 15, "completion_tokens": 6}, "stop"
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_ensemble_sonnet
+claude_client_mod._call_openai = _fake_call_openai_ensemble
+_ens_findings, _ens_cost = asyncio.run(_ensemble_search_findings_direct(
+    [{"context": "", "source": "x", "translation": "y"}], target_lang="ky", source_lang="en",
+))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _ens_findings == {0: ["sonnet-находка", "gpt-находка"]}, _ens_findings
+assert _ens_cost > 0, _ens_cost
+print("[OK] _ensemble_search_findings: Step 1 runs under Sonnet AND GPT concurrently and merges both "
+      "models' candidates for the same pair, with cost_usd summing both calls")
+
+
+async def _fake_call_claude_ensemble_dup(prompt, model=None):
+    return "1: одна и та же находка", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
+
+
+async def _fake_call_openai_ensemble_dup(prompt, model=None):
+    return (
+        "1: одна и та же находка\n1: другая находка от gpt",
+        {"prompt_tokens": 15, "completion_tokens": 6}, "stop",
+    )
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_ensemble_dup
+claude_client_mod._call_openai = _fake_call_openai_ensemble_dup
+_dup_findings, _dup_cost = asyncio.run(_ensemble_search_findings_direct(
+    [{"context": "", "source": "x", "translation": "y"}], target_lang="ky",
+))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _dup_findings == {0: ["одна и та же находка", "другая находка от gpt"]}, _dup_findings
+print("[OK] _ensemble_search_findings: an exact-duplicate candidate string reported by both models for the "
+      "same pair is merged, not listed twice — while a genuinely different GPT-only candidate still comes "
+      "through")
+
+
+async def _fake_call_openai_broken(prompt, model=None):
+    raise _httpx_for_fault_injection.ConnectError("simulated OpenAI outage")
+
+
+async def _fake_call_claude_broken(prompt, model=None):
+    raise _httpx_for_fault_injection.ConnectError("simulated Anthropic outage")
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_ensemble_sonnet
+claude_client_mod._call_openai = _fake_call_openai_broken
+_res_findings, _res_cost = asyncio.run(_ensemble_search_findings_direct(
+    [{"context": "", "source": "x", "translation": "y"}], target_lang="ky",
+))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _res_findings == {0: ["sonnet-находка"]}, _res_findings
+assert _res_cost > 0, _res_cost
+print("[OK] _ensemble_search_findings: a transient failure in the GPT branch alone (network error) degrades "
+      "to Sonnet-only results instead of sinking the whole Step 1 search")
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_broken
+claude_client_mod._call_openai = _fake_call_openai_ensemble
+_res2_findings, _res2_cost = asyncio.run(_ensemble_search_findings_direct(
+    [{"context": "", "source": "x", "translation": "y"}], target_lang="ky",
+))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _res2_findings == {0: ["gpt-находка"]}, _res2_findings
+print("[OK] _ensemble_search_findings: same resilience the other way round — a Sonnet failure degrades to "
+      "GPT-only results rather than losing Step 1 entirely")
+
+
+# A 200 response with a garbled/unexpected-shaped body (a vendor or proxy
+# hiccup) raises json.JSONDecodeError (a ValueError) or KeyError/TypeError/
+# AttributeError deeper in response parsing — NOT httpx.HTTPError. An
+# independent review of this ensemble (2026-09-23) caught that the
+# original wrapper only caught httpx.HTTPError, so this class of failure
+# would crash the WHOLE Step 1 search (losing both branches) instead of
+# degrading to just the healthy branch — fixed in
+# _search_step_degrading_on_error; this proves the fix.
+async def _fake_call_openai_malformed(prompt, model=None):
+    raise KeyError("choices")
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_ensemble_sonnet
+claude_client_mod._call_openai = _fake_call_openai_malformed
+_malf_findings, _malf_cost = asyncio.run(_ensemble_search_findings_direct(
+    [{"context": "", "source": "x", "translation": "y"}], target_lang="ky",
+))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _malf_findings == {0: ["sonnet-находка"]}, _malf_findings
+print("[OK] _ensemble_search_findings: a non-HTTP failure in one branch (a malformed/unexpected-shaped "
+      "response — KeyError/TypeError/AttributeError/JSONDecodeError, not just an httpx.HTTPError) still "
+      "degrades to just the healthy branch's results instead of crashing the whole Step 1 search")
+
+_override_openai_calls: list[str] = []
+
+
+async def _fake_call_openai_should_not_run(prompt, model=None):
+    _override_openai_calls.append(prompt)
+    return "1: should not happen", {"prompt_tokens": 1, "completion_tokens": 1}, "stop"
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_ensemble_sonnet
+claude_client_mod._call_openai = _fake_call_openai_should_not_run
+_ov_findings, _ov_cost = asyncio.run(_ensemble_search_findings_direct(
+    [{"context": "", "source": "x", "translation": "y"}], target_lang="ky",
+    model_override="claude-haiku-4-5-20251001",
+))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _override_openai_calls == [], (
+    "model_override must bypass the GPT branch entirely — a caller forcing a specific model (currently only "
+    "app.model_comparison's diagnostic) must get exactly that model, not a silent extra GPT call"
+)
+assert _ov_findings == {0: ["sonnet-находка"]}, _ov_findings
+print("[OK] _ensemble_search_findings: model_override bypasses the GPT branch entirely (falls back to plain "
+      "single-model _search_findings), matching run_ai_checks_batch's own model_override contract")
+
+claude_client_mod._call_claude = _fake_call_claude_ensemble_sonnet
+# OPENAI_API_KEY intentionally left empty/untouched here — the REAL
+# _call_openai (not a fake) must short-circuit with no network call at all
+# (see its own missing-key behavior), degrading the ensemble to exactly
+# the plain Sonnet-only pipeline.
+_nokey_findings, _nokey_cost = asyncio.run(_ensemble_search_findings_direct(
+    [{"context": "", "source": "x", "translation": "y"}], target_lang="ky",
+))
+claude_client_mod._call_claude = _previous_call_claude
+assert _nokey_findings == {0: ["sonnet-находка"]}, _nokey_findings
+print("[OK] _ensemble_search_findings: with no OPENAI_API_KEY configured, the GPT branch silently "
+      "contributes nothing (no network call) and the ensemble degrades to exactly the plain Sonnet-only "
+      "pipeline — safe to ship before a key is set on Railway")
+
+# End-to-end through run_ai_checks_batch: confirms the ensemble is really
+# wired into the real call site (not just testable in isolation) — Step 1
+# hits BOTH _call_claude and _call_openai when a GPT key is configured,
+# while Step 2 stays Sonnet-only.
+_e2e_claude_calls: list[str] = []
+_e2e_openai_calls: list[str] = []
+
+
+async def _fake_call_claude_e2e_ensemble(prompt, model=None):
+    _e2e_claude_calls.append(prompt)
+    if prompt.startswith("Ты — опытный редактор переводов"):
+        return "1: sonnet видит пропуск", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
+    return (
+        '[{"row": 1, "type": "typo", "severity": "medium", "message": "подтверждено"}]',
+        {"input_tokens": 50, "output_tokens": 20}, "end_turn",
+    )
+
+
+async def _fake_call_openai_e2e_ensemble(prompt, model=None):
+    _e2e_openai_calls.append(prompt)
+    return "1: gpt тоже видит пропуск", {"prompt_tokens": 15, "completion_tokens": 6}, "stop"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_e2e_ensemble
+claude_client_mod._call_openai = _fake_call_openai_e2e_ensemble
+_e2e_findings, _e2e_cost, _e2e_trunc = asyncio.run(_run_ai_checks_batch_direct(
+    [{"context": "", "source": "He did not agree.", "translation": "Он согласился."}],
+    ["typo"], target_lang="ky", source_lang="en",
+))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.ANTHROPIC_API_KEY = ""
+settings.OPENAI_API_KEY = ""
+assert len(_e2e_claude_calls) == 2, "Sonnet: Step 1 search + Step 2 structured check"
+assert len(_e2e_openai_calls) == 1, "GPT: only Step 1 search — Step 2 stays Sonnet-only, per Александр's ask"
+assert "sonnet видит пропуск" in _e2e_claude_calls[1] and "gpt тоже видит пропуск" in _e2e_claude_calls[1], (
+    "both models' Step 1 candidates must reach Step 2's own structured prompt text"
+)
+assert _e2e_findings == {0: [{"type": "typo", "severity": "medium", "message": "подтверждено"}]}, _e2e_findings
+assert not _e2e_trunc
+print("[OK] run_ai_checks_batch: with an OpenAI key configured, Step 1 really does run under Sonnet AND GPT "
+      "together (one Anthropic call, one OpenAI call) while Step 2 (the structured/calibrated check) stays "
+      "Sonnet-only, exactly as Александр asked")
+
 # --- app.model_comparison: the standalone model-comparison diagnostic ---
 # Built in direct response to Александр's "1 раз на sonnet и после 3 на
 # haiku" idea (2026-09-22) — before changing anything about how hard

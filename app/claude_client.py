@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 
@@ -485,6 +486,105 @@ async def _search_findings(
     model = model_override or _model_for_lang(target_lang)
     text_block, usage, _stop_reason = await _call_claude(prompt, model=model)
     return _parse_search_findings(text_block, checkable), _usage_cost(model, usage)
+
+
+async def _search_findings_openai(
+    items: list[dict], target_lang: str = "", source_lang: str = "",
+) -> tuple[dict[int, list[str]], float]:
+    """Step 1 of the two-step pipeline, run under OpenAI's model instead of
+    Claude — reuses the exact same FINDINGS_SEARCH_PROMPT and the exact
+    same free-text "NUMBER: description" parsing (_parse_search_findings)
+    as _search_findings itself; only the API call underneath differs (see
+    _call_openai). Returns ({}, 0.0) with no call at all when there's
+    nothing checkable OR no OPENAI_API_KEY is configured (see
+    _call_openai's own missing-key behavior) — a caller can treat this
+    exactly like "this branch contributed nothing this time" either way."""
+    checkable = _checkable_items(items)
+    if not checkable:
+        return {}, 0.0
+    prompt = FINDINGS_SEARCH_PROMPT.format(
+        target_lang_line=_target_lang_line(target_lang),
+        source_lang_note=_source_lang_note(source_lang),
+        pairs_block=_pairs_block(checkable),
+    )
+    text_block, usage, _stop_reason = await _call_openai(prompt)
+    return _parse_search_findings(text_block, checkable), _openai_usage_cost(settings.OPENAI_MODEL, usage)
+
+
+async def _search_step_degrading_on_error(coro) -> tuple[dict[int, list[str]], float]:
+    """Runs one Step 1 branch of the ensemble below and turns a transient
+    failure from THAT branch alone into an empty, zero-cost contribution
+    rather than letting it sink the other branch's results too — same
+    resilience fix the earlier (since-reverted) Sonnet+Haiku ensemble
+    needed; see git history for "Ensemble Step 1 search under Sonnet +
+    Haiku, resilient to a single model's outage".
+
+    Catches more than just httpx.HTTPError (a non-2xx response or a
+    lower-level connection failure) — an independent review of THIS
+    ensemble (2026-09-23) pointed out that a vendor (or a proxy in
+    between) can also return a 200 with a garbled or unexpected-shaped
+    body: resp.json() then raises json.JSONDecodeError (a ValueError, not
+    an httpx.HTTPError), and _call_openai's own response parsing
+    (choices[0]/message/content) can raise KeyError/TypeError/AttributeError
+    if that shape isn't what's expected. Any of these is exactly the same
+    kind of "this one branch had a bad moment" failure as an HTTP error,
+    and deserves the exact same degrade-to-empty treatment, not a crash
+    that takes the whole Step 1 search (both branches) down with it."""
+    try:
+        return await coro
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+        return {}, 0.0
+
+
+async def _ensemble_search_findings(
+    items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
+) -> tuple[dict[int, list[str]], float]:
+    """Step 1 of the two-step pipeline, Александр's ask (2026-09-23): run
+    it under Sonnet (Anthropic) and GPT (OpenAI) concurrently and merge
+    their candidates, instead of Sonnet alone. The two calls run via
+    asyncio.gather, hitting two entirely separate vendors at once — unlike
+    the earlier Sonnet+Haiku ensemble, this does NOT double Anthropic's own
+    concurrent-call load (see excel_multi.AI_CONCURRENCY), since only one
+    of the two calls here is ever an Anthropic call.
+
+    Motivation this time is different from that earlier, reverted
+    ensemble: Kyrgyz detection was still inconsistent even on the byte-
+    identical, already-proven plain Sonnet+Sonnet pipeline, most likely
+    ordinary run-to-run LLM variance rather than a code regression — no
+    concrete failing example was available to test against this time.
+    Haiku shares Sonnet's own training lineage and, per that earlier
+    experiment, likely shared its blind spots too; a model from a
+    genuinely different vendor is the more principled bet on catching
+    whatever Sonnet alone might occasionally miss on a given run — though,
+    same caveat as before, this is unproven and mainly trades cost for a
+    SECOND independent pass, not a guaranteed fix.
+
+    Falls back to plain _search_findings (no GPT branch at all) when
+    model_override is given — mirrors run_ai_checks_batch's own
+    model_override passthrough from before: a caller forcing a specific
+    model (currently only app.model_comparison's diagnostic) gets exactly
+    that model for Step 1, not a silent extra GPT call it never asked for.
+
+    When no OPENAI_API_KEY is configured, the GPT branch costs nothing and
+    contributes no candidates (see _search_findings_openai) — this
+    degrades to exactly the plain Sonnet-only pipeline with no code-path
+    difference, so it's safe to ship even before a key is set on Railway."""
+    if model_override is not None:
+        return await _search_findings(items, target_lang, source_lang, model_override=model_override)
+
+    (sonnet_findings, sonnet_cost), (gpt_findings, gpt_cost) = await asyncio.gather(
+        _search_step_degrading_on_error(_search_findings(items, target_lang, source_lang)),
+        _search_step_degrading_on_error(_search_findings_openai(items, target_lang, source_lang)),
+    )
+
+    merged: dict[int, list[str]] = {idx: list(candidates) for idx, candidates in sonnet_findings.items()}
+    for idx, candidates in gpt_findings.items():
+        existing = merged.setdefault(idx, [])
+        for c in candidates:
+            if c not in existing:
+                existing.append(c)
+
+    return merged, sonnet_cost + gpt_cost
 
 
 def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
@@ -1036,6 +1136,33 @@ MODEL_PRICING_PER_TOKEN = {
 # excel_multi.BATCH_THRESHOLD_CHARS) is half price on both input and output.
 BATCH_PRICE_DISCOUNT = 0.5
 
+# OpenAI's GPT-5 family pricing, USD per single token — confirmed against
+# OpenAI's own GPT-5-for-developers pricing announcement (checked
+# 2026-09-23). Same "can't compute a cost for an unpriced model, degrade to
+# $0 rather than guess" spirit as MODEL_PRICING_PER_TOKEN above — see
+# _usage_cost's own comment for the real bug (a stale pricing table showing
+# $0 while the real bill was very much not zero) that taught us to keep
+# these tables honest rather than silently stale. Update this table if
+# OPENAI_MODEL is ever pointed at a model not listed here, or when OpenAI's
+# prices change.
+OPENAI_MODEL_PRICING_PER_TOKEN = {
+    "gpt-5-mini": {"input": 0.25 / 1_000_000, "output": 2.00 / 1_000_000},
+    "gpt-5-nano": {"input": 0.05 / 1_000_000, "output": 0.40 / 1_000_000},
+    "gpt-5": {"input": 1.25 / 1_000_000, "output": 10.00 / 1_000_000},
+}
+
+
+def _openai_usage_cost(model: str, usage: dict | None) -> float:
+    """Same idea as _usage_cost above, but OpenAI's usage dict uses
+    prompt_tokens/completion_tokens instead of Anthropic's own
+    input_tokens/output_tokens — kept as its own function rather than
+    reshaping OpenAI's usage dict to fit _usage_cost, so each stays a
+    direct, readable match for its own vendor's real response shape."""
+    rates = OPENAI_MODEL_PRICING_PER_TOKEN.get(model)
+    if not rates or not usage:
+        return 0.0
+    return usage.get("prompt_tokens", 0) * rates["input"] + usage.get("completion_tokens", 0) * rates["output"]
+
 
 def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
     """USD cost of one API call from its token usage. Returns 0.0 (rather
@@ -1101,6 +1228,44 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
 
     text = next((b["text"] for b in data.get("content", []) if b.get("type") == "text"), None)
     return text, data.get("usage", {}), data.get("stop_reason")
+
+
+async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | None, dict, str | None]:
+    """OpenAI equivalent of _call_claude, called via plain REST (same style
+    as the Anthropic calls in this file) rather than the openai SDK — no
+    new dependency needed, and every other API call here already talks to
+    its vendor directly over httpx. Returns (None, {}, None) with no
+    request at all when no OPENAI_API_KEY is configured — mirrors
+    _call_claude's own missing-key behavior, so a caller can treat "no GPT
+    key" and "no Anthropic key" identically. finish_reason "length" (GPT's
+    own name for a response cut off at the token ceiling) is normalized to
+    "max_tokens" here so it reads the same as _call_claude's stop_reason,
+    even though Step 1's own caller (_search_findings_openai) doesn't
+    currently act on it — kept consistent in case a future caller does."""
+    if not settings.OPENAI_API_KEY:
+        return None, {}, None
+    resolved_model = model or settings.OPENAI_MODEL
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": resolved_model,
+                "max_completion_tokens": AI_MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    choice = (data.get("choices") or [{}])[0]
+    text = (choice.get("message") or {}).get("content")
+    finish_reason = choice.get("finish_reason")
+    stop_reason = "max_tokens" if finish_reason == "length" else finish_reason
+    return text, data.get("usage", {}), stop_reason
 
 
 def _salvage_json_objects(text: str) -> list:
@@ -1235,7 +1400,7 @@ async def run_ai_checks(
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
     if checks_description:
-        prior_findings, search_cost = await _search_findings(
+        prior_findings, search_cost = await _ensemble_search_findings(
             [{"context": "", "source": source, "translation": translation}],
             target_lang=target_lang, source_lang=source_lang,
         )
@@ -1451,7 +1616,7 @@ async def run_ai_checks_batch(
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
     if checks_description:
-        prior_findings, search_cost = await _search_findings(
+        prior_findings, search_cost = await _ensemble_search_findings(
             items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
         )
 
