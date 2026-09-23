@@ -1,10 +1,13 @@
 import asyncio
 import json
+import logging
 import re
 
 import httpx
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # "register" (tone of address) is NOT in here — as of 2026-09-16 it isn't
 # an error-finding check at all any more, so it never appears in the
@@ -1261,7 +1264,38 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
     if not settings.ANTHROPIC_API_KEY:
         return None, {}, None
     resolved_model = model or settings.CLAUDE_MODEL
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    # 2026-09-23 (Александр hit it live): an urgent 5-language upload died
+    # with "Failed to fetch" because ONE Step-2 call took longer than the
+    # old flat 120s read timeout (ReadTimeout in the Railway log) — and
+    # since Step 2 isn't wrapped per-branch like Step 1, that single slow
+    # call took the whole multi-check down with it. Now: a longer read
+    # timeout (long answers on big chunks legitimately take minutes) plus
+    # automatic retries on transient failures (timeouts, dropped
+    # connections, 429 rate limits, 5xx/529 overloads) before giving up.
+    last_exc: Exception | None = None
+    for attempt in range(_CLAUDE_MAX_ATTEMPTS):
+        try:
+            return await _call_claude_once(prompt, resolved_model)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in _RETRYABLE_STATUS:
+                raise
+            last_exc = exc
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+        if attempt < _CLAUDE_MAX_ATTEMPTS - 1:
+            logger.warning("Claude call failed (attempt %d/%d): %r — retrying",
+                           attempt + 1, _CLAUDE_MAX_ATTEMPTS, last_exc)
+            await asyncio.sleep(3 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
+
+
+_CLAUDE_MAX_ATTEMPTS = 3
+_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
+_CLAUDE_TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=60.0)
+
+
+async def _call_claude_once(prompt: str, resolved_model: str) -> tuple[str | None, dict, str | None]:
+    async with httpx.AsyncClient(timeout=_CLAUDE_TIMEOUT) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
