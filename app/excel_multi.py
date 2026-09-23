@@ -907,13 +907,21 @@ async def _run_ai_chunks(
     lang: str,
     source_lang: str,
     semaphore: asyncio.Semaphore,
-) -> tuple[dict[int, list[dict]], float, bool]:
+) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
     """Runs every chunk of one language's items through the AI (bounded by
     the shared semaphore) and merges the per-chunk results back into a
     single {item index: findings} dict, with "_also_idx" indices shifted to
     match. Factored out of _check_language_for_sheet purely to share this
-    chunking/merging logic between the live and batch code paths."""
-    async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool]:
+    chunking/merging logic between the live and batch code paths.
+
+    The 4th return value, search_warnings, is Step 1's own ensemble
+    warnings (see claude_client._ensemble_search_findings) — a language
+    with several chunks can surface the SAME "Sonnet/GPT didn't run"
+    warning from more than one chunk (each chunk runs its own independent
+    Step 1 search), so these are deduplicated by message text here before
+    being handed back, rather than showing the manager the identical
+    warning repeated once per chunk."""
+    async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
         async with semaphore:
             return await run_ai_checks_batch(
                 chunk_items, checks, extra_instructions, lang, source_lang,
@@ -924,8 +932,12 @@ async def _run_ai_chunks(
     ai_findings_by_idx: dict[int, list[dict]] = {}
     cost_usd = 0.0
     truncated = False
+    search_warnings: list[dict] = []
+    seen_warning_messages: set[str] = set()
     offset = 0
-    for (chunk_findings, chunk_cost, chunk_truncated), chunk_items in zip(chunk_results, item_chunks):
+    for (chunk_findings, chunk_cost, chunk_truncated, chunk_search_warnings), chunk_items in zip(
+        chunk_results, item_chunks,
+    ):
         for local_idx, findings in chunk_findings.items():
             # "_also_idx" (see group_batch_findings) still holds indices
             # local to THIS chunk at this point — shift those too, or
@@ -939,9 +951,13 @@ async def _run_ai_chunks(
             ai_findings_by_idx[offset + local_idx] = remapped
         cost_usd += chunk_cost
         truncated = truncated or chunk_truncated
+        for w in chunk_search_warnings:
+            if w["message"] not in seen_warning_messages:
+                seen_warning_messages.add(w["message"])
+                search_warnings.append(w)
         offset += len(chunk_items)
 
-    return ai_findings_by_idx, cost_usd, truncated
+    return ai_findings_by_idx, cost_usd, truncated, search_warnings
 
 
 async def _check_language_for_sheet(
@@ -979,7 +995,7 @@ async def _check_language_for_sheet(
     # check didn't.
     item_chunks = _chunk_list(ai_items, _chunk_size_for_lang(lang))
 
-    ai_findings_by_idx, cost_usd, truncated = await _run_ai_chunks(
+    ai_findings_by_idx, cost_usd, truncated, search_warnings = await _run_ai_chunks(
         item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
     )
     ai_findings_by_idx = _resolve_repeated_findings(ai_findings_by_idx, relevant_rows)
@@ -1011,6 +1027,21 @@ async def _check_language_for_sheet(
             "source": "",
             "translation": "",
             "findings": [_truncation_warning()],
+        })
+    if search_warnings:
+        # Step 1's ensemble (Sonnet + GPT — see claude_client.
+        # _ensemble_search_findings) had a configured model that failed to
+        # contribute at all for this language — Александр's explicit ask
+        # (2026-09-23): he wants to see directly in the report when a model
+        # he expects to be running actually isn't, rather than the ensemble
+        # silently and permanently degrading to one model. Already
+        # deduplicated across this language's own chunks by _run_ai_chunks.
+        out.append({
+            "excel_row": 0,
+            "context": "⚠ Системное предупреждение",
+            "source": "",
+            "translation": "",
+            "findings": search_warnings,
         })
     if "register" in checks:
         by_excel_row = {relevant_rows[idx]["excel_row"]: v for idx, v in register_values_by_idx.items()}

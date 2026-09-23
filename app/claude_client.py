@@ -511,34 +511,58 @@ async def _search_findings_openai(
     return _parse_search_findings(text_block, checkable), _openai_usage_cost(settings.OPENAI_MODEL, usage)
 
 
-async def _search_step_degrading_on_error(coro) -> tuple[dict[int, list[str]], float]:
-    """Runs one Step 1 branch of the ensemble below and turns a transient
-    failure from THAT branch alone into an empty, zero-cost contribution
-    rather than letting it sink the other branch's results too — same
-    resilience fix the earlier (since-reverted) Sonnet+Haiku ensemble
-    needed; see git history for "Ensemble Step 1 search under Sonnet +
-    Haiku, resilient to a single model's outage".
+_BRANCH_FAILURE_EXCEPTIONS = (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError)
+# Catches more than just httpx.HTTPError (a non-2xx response or a
+# lower-level connection failure) — an independent review of the Step 1
+# ensemble (2026-09-23) pointed out that a vendor (or a proxy in between)
+# can also return a 200 with a garbled or unexpected-shaped body:
+# resp.json() then raises json.JSONDecodeError (a ValueError, not an
+# httpx.HTTPError), and _call_openai's own response parsing
+# (choices[0]/message/content) can raise KeyError/TypeError/AttributeError
+# if that shape isn't what's expected. Any of these is exactly the same
+# kind of "this one branch had a bad moment" failure as an HTTP error.
 
-    Catches more than just httpx.HTTPError (a non-2xx response or a
-    lower-level connection failure) — an independent review of THIS
-    ensemble (2026-09-23) pointed out that a vendor (or a proxy in
-    between) can also return a 200 with a garbled or unexpected-shaped
-    body: resp.json() then raises json.JSONDecodeError (a ValueError, not
-    an httpx.HTTPError), and _call_openai's own response parsing
-    (choices[0]/message/content) can raise KeyError/TypeError/AttributeError
-    if that shape isn't what's expected. Any of these is exactly the same
-    kind of "this one branch had a bad moment" failure as an HTTP error,
-    and deserves the exact same degrade-to-empty treatment, not a crash
-    that takes the whole Step 1 search (both branches) down with it."""
+
+async def _run_search_branch(coro) -> tuple[tuple[dict[int, list[str]], float], Exception | None]:
+    """Runs one Step 1 branch of the ensemble below and turns a failure
+    from THAT branch alone into an empty, zero-cost contribution — rather
+    than letting it sink the other branch's results too (same resilience
+    fix the earlier, since-reverted Sonnet+Haiku ensemble needed) — while
+    still handing the exception back to the caller, so _ensemble_search_
+    findings can tell "this branch wasn't even configured" apart from
+    "this branch was configured but broke" and only warn about the
+    latter (see _ensemble_search_findings's own comment)."""
     try:
-        return await coro
-    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
-        return {}, 0.0
+        return await coro, None
+    except _BRANCH_FAILURE_EXCEPTIONS as exc:
+        return ({}, 0.0), exc
+
+
+def _model_branch_search_warning(model_label: str) -> dict:
+    """A visible "type": "system" finding (same synthetic-finding pattern
+    as _truncation_warning/_ai_failure_warning elsewhere in this file) for
+    when a model that WAS configured to run on Step 1's ensemble search
+    (see _ensemble_search_findings) actually failed to contribute —
+    Александр's explicit ask (2026-09-23): he wants to be able to tell,
+    from the report itself, that both models really did run, rather than
+    the ensemble silently and permanently degrading to one model (e.g. an
+    OpenAI account running out of credit) with no visible trace at all."""
+    return {
+        "type": "system",
+        "severity": "medium",
+        "message": (
+            f"Поиск ошибок на первом шаге не сработал для модели {model_label} (сбой на её стороне — "
+            "например, закончились доступные средства на счёте, неверный/просроченный ключ API, или "
+            "временная недоступность сервиса). Проверка всё равно выполнена полностью — второй, "
+            "проверяющий шаг по-прежнему сработал — но БЕЗ вклада этой модели в поиск. Если это "
+            f"повторяется часто, стоит проверить баланс/ключ API для {model_label}."
+        ),
+    }
 
 
 async def _ensemble_search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
-) -> tuple[dict[int, list[str]], float]:
+) -> tuple[dict[int, list[str]], float, list[dict]]:
     """Step 1 of the two-step pipeline, Александр's ask (2026-09-23): run
     it under Sonnet (Anthropic) and GPT (OpenAI) concurrently and merge
     their candidates, instead of Sonnet alone. The two calls run via
@@ -559,22 +583,34 @@ async def _ensemble_search_findings(
     same caveat as before, this is unproven and mainly trades cost for a
     SECOND independent pass, not a guaranteed fix.
 
-    Falls back to plain _search_findings (no GPT branch at all) when
-    model_override is given — mirrors run_ai_checks_batch's own
-    model_override passthrough from before: a caller forcing a specific
-    model (currently only app.model_comparison's diagnostic) gets exactly
-    that model for Step 1, not a silent extra GPT call it never asked for.
+    Falls back to plain _search_findings (no GPT branch at all, empty
+    warnings list) when model_override is given — mirrors run_ai_checks_
+    batch's own model_override passthrough from before: a caller forcing a
+    specific model (currently only app.model_comparison's diagnostic) gets
+    exactly that model for Step 1, not a silent extra GPT call it never
+    asked for.
 
-    When no OPENAI_API_KEY is configured, the GPT branch costs nothing and
-    contributes no candidates (see _search_findings_openai) — this
-    degrades to exactly the plain Sonnet-only pipeline with no code-path
-    difference, so it's safe to ship even before a key is set on Railway."""
+    Returns a third element, `warnings` — a list of synthetic "system"
+    finding dicts (see _model_branch_search_warning), one per branch that
+    WAS EXPECTED to contribute (its own API key is configured) but
+    actually failed. A branch whose key just isn't configured at all
+    contributes nothing silently (see _search_findings_openai and
+    _call_claude's own missing-key behavior) — that's an intentional,
+    expected no-contribution, not a failure worth warning about; only a
+    configured-but-broken branch (bad/expired key, no credit, an outage)
+    produces a warning, so Александр can see directly in the report when
+    a model he expects to be running actually isn't, rather than the
+    ensemble silently and permanently degrading with no visible trace."""
     if model_override is not None:
-        return await _search_findings(items, target_lang, source_lang, model_override=model_override)
+        findings, cost = await _search_findings(items, target_lang, source_lang, model_override=model_override)
+        return findings, cost, []
 
-    (sonnet_findings, sonnet_cost), (gpt_findings, gpt_cost) = await asyncio.gather(
-        _search_step_degrading_on_error(_search_findings(items, target_lang, source_lang)),
-        _search_step_degrading_on_error(_search_findings_openai(items, target_lang, source_lang)),
+    sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
+    gpt_expected = bool(settings.OPENAI_API_KEY)
+
+    ((sonnet_findings, sonnet_cost), sonnet_error), ((gpt_findings, gpt_cost), gpt_error) = await asyncio.gather(
+        _run_search_branch(_search_findings(items, target_lang, source_lang)),
+        _run_search_branch(_search_findings_openai(items, target_lang, source_lang)),
     )
 
     merged: dict[int, list[str]] = {idx: list(candidates) for idx, candidates in sonnet_findings.items()}
@@ -584,7 +620,13 @@ async def _ensemble_search_findings(
             if c not in existing:
                 existing.append(c)
 
-    return merged, sonnet_cost + gpt_cost
+    warnings = []
+    if sonnet_expected and sonnet_error is not None:
+        warnings.append(_model_branch_search_warning("Sonnet"))
+    if gpt_expected and gpt_error is not None:
+        warnings.append(_model_branch_search_warning("GPT"))
+
+    return merged, sonnet_cost + gpt_cost, warnings
 
 
 def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
@@ -1399,8 +1441,9 @@ async def run_ai_checks(
     # "nothing checkable" early-outs.
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
+    search_warnings: list[dict] = []
     if checks_description:
-        prior_findings, search_cost = await _ensemble_search_findings(
+        prior_findings, search_cost, search_warnings = await _ensemble_search_findings(
             [{"context": "", "source": source, "translation": translation}],
             target_lang=target_lang, source_lang=source_lang,
         )
@@ -1424,6 +1467,7 @@ async def run_ai_checks(
     findings = _filter_findings_by_checks(parse_json_array(text_block), checks)
     if stop_reason == "max_tokens":
         findings = findings + [_truncation_warning()]
+    findings = findings + search_warnings
 
     if "register" in checks:
         register_findings = [f for f in findings if f.get("type") == REGISTER_VALUE_TYPE]
@@ -1575,12 +1619,14 @@ async def run_ai_checks_batch(
     target_lang: str = "",
     source_lang: str = "",
     model_override: str | None = None,
-) -> tuple[dict[int, list[dict]], float, bool]:
+) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
     """Synchronous path: builds the prompt, calls Claude right away, and
     returns (findings keyed by index into items, this call's cost_usd,
-    whether the response was truncated by the max_tokens ceiling — the
-    caller adds a visible warning for that rather than presenting a
-    partial result as a complete one).
+    whether the response was truncated by the max_tokens ceiling, Step 1's
+    own ensemble search_warnings — see _ensemble_search_findings). The
+    caller adds a visible warning for the truncation/search_warnings cases
+    rather than presenting a partial or silently-degraded result as a
+    complete one.
 
     model_override: bypass the normal _model_for_lang(target_lang)
     selection and force a specific model id instead. Added 2026-09-22
@@ -1604,7 +1650,7 @@ async def run_ai_checks_batch(
     checks_description = _checks_description(checks)
     register_instructions = _register_instructions(checks, batch=True, target_lang=target_lang)
     if not checks_description and not register_instructions:
-        return {}, 0.0, False
+        return {}, 0.0, False, []
 
     # Step 1 — same rationale as run_ai_checks's own call to this,
     # including skipping it entirely for a register-only run (nothing for
@@ -1615,8 +1661,9 @@ async def run_ai_checks_batch(
     # pick instead.
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
+    search_warnings: list[dict] = []
     if checks_description:
-        prior_findings, search_cost = await _ensemble_search_findings(
+        prior_findings, search_cost, search_warnings = await _ensemble_search_findings(
             items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
         )
 
@@ -1624,13 +1671,13 @@ async def run_ai_checks_batch(
         items, checks, extra_instructions, target_lang, source_lang, prior_findings=prior_findings,
     )
     if prompt is None:
-        return {}, search_cost, False
+        return {}, search_cost, False, search_warnings
     model = model_override or _model_for_lang(target_lang)
     text_block, usage, stop_reason = await _call_claude(prompt, model=model)
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
-    return filtered, search_cost + _usage_cost(model, usage), stop_reason == "max_tokens"
+    return filtered, search_cost + _usage_cost(model, usage), stop_reason == "max_tokens", search_warnings
 
 
 # --------------------------------------------------- Message Batches API ---
