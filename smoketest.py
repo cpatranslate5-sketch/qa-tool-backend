@@ -1907,6 +1907,28 @@ from app.claude_client import CHECK_LABELS
 assert "ДРУГАЯ ВАЛЮТА" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
 print("[OK] currency identity (wrong currency, e.g. € instead of $) is scoped to «опечатки/ошибки»")
 
+# --- Александр's real feedback (2026-09-24): a marketing-copy English
+# translation was flagged for "уникальный" -> "unforgettable" as a loss of
+# specific meaning, even though he judged it a normal, acceptable adaptation
+# (meaning preserved in context, translator just made the text read more
+# naturally). His explicit instruction: leave the (separate) softened-
+# superlative feedback alone for now, but DO add "synonymous substitution
+# that preserves the OVERALL meaning in context" to the list of things the
+# typo/meaning-distortion check should NOT flag — even when the substituted
+# word isn't a strict dictionary-for-dictionary equivalent of the source
+# word, as long as the message the reader gets doesn't change. ---
+assert "не обязана быть точным словарным соответствием слово-в-слово" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
+assert "уникальный" in CHECK_LABELS["typo"] and "unforgettable" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
+# the new clarifying sentence must not come at the cost of the underlying hard
+# gate it sits inside of — pin that the two-condition requirement itself
+# (grammatically correct AND fully meaning-preserving) is still there verbatim.
+assert "ОБА условия" in CHECK_LABELS["typo"] and "грамматически корректен И полностью сохраняет смысл" in CHECK_LABELS["typo"], (
+    CHECK_LABELS["typo"]
+)
+print("[OK] «опечатки/ошибки»: a synonymous substitution doesn't have to be a strict word-for-word "
+      "dictionary match to count as meaning-preserving — only that the overall message stays the same "
+      "in context (Александр's real 'уникальный' -> 'unforgettable' example, 2026-09-24)")
+
 # --- untranslatable: Александр's real feedback (2026-09-17) — a confusing
 # self-contradicting finding ("'Grand Prix' shouldn't have been translated,
 # but it correctly stayed 'Grand Prix' — error") shows the model needs an
