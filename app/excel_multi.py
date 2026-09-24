@@ -5,7 +5,6 @@ one sheet (sometimes several) with a header row of language codes, a
 one row per translatable string.
 """
 import asyncio
-import logging
 import io
 import re
 
@@ -33,8 +32,6 @@ from app.claude_client import (
 from app.rule_checks import run_rule_checks
 
 LANG_CODE_RE = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,5})?$")
-logger = logging.getLogger(__name__)
-
 AI_CONCURRENCY = 5
 
 # Industry-standard placeholder: a translator (or the client) can mark a
@@ -925,21 +922,10 @@ async def _run_ai_chunks(
     being handed back, rather than showing the manager the identical
     warning repeated once per chunk."""
     async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
-        # 2026-09-23 (Александр, urgent 5- and 30+-language uploads dying with
-        # "Failed to fetch"): one chunk's AI call failing (e.g. a ReadTimeout
-        # even after _call_claude's own retries) used to raise straight
-        # through asyncio.gather and take EVERY language down with it. Now
-        # that chunk alone degrades to a visible "ИИ-проверка не выполнилась"
-        # warning for its language (same system-finding the batch path
-        # already uses), and everything else still gets its real result.
         async with semaphore:
-            try:
-                return await run_ai_checks_batch(
-                    chunk_items, checks, extra_instructions, lang, source_lang,
-                )
-            except Exception as exc:
-                logger.error("AI chunk failed for %s: %r", lang, exc)
-                return {}, 0.0, False, [_ai_failure_warning("сервис ИИ не ответил или вернул ошибку")]
+            return await run_ai_checks_batch(
+                chunk_items, checks, extra_instructions, lang, source_lang,
+            )
 
     chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
 

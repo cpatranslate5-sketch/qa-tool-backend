@@ -1525,6 +1525,34 @@ assert "малайск" not in normal_line.lower() and "бирманск" not in
 print("[OK] _target_lang_line: the «my» code is explicitly clarified as Malay (not the ISO-standard "
       "Burmese) so the model doesn't misjudge correct Malay text as the wrong language")
 
+# --- Real translator pushback (2026-09-24, Kyrgyz + Kazakh): a missing
+# падеж ending before «баштап»/«бастап» directly after a template
+# VARIABLE placeholder (its runtime value unknown at translation time) is
+# not a real grammar error — but this must stay narrow: a spelled-out,
+# literal number before the same postposition is unaffected (Александр's
+# own call), and no OTHER language should see this text at all.
+from app.claude_client import GRAMMAR_LANGUAGE_HINTS, _grammar_language_hint
+
+ky_line = _target_lang_line("ky")
+assert "баштап" in ky_line and "переменн" in ky_line and "{{" in ky_line, ky_line
+kk_line = _target_lang_line("kk")
+assert "бастап" in kk_line and "переменн" in kk_line and "{{" in kk_line, kk_line
+kk_region_line = _target_lang_line("kk-KZ")  # a region-qualified code must still match by base subtag
+assert "бастап" in kk_region_line, kk_region_line
+assert _grammar_language_hint("ru") == "" and _grammar_language_hint("uz") == "", (
+    "the hint must be scoped to exactly the languages real feedback came in for (ky, kk) — no other "
+    "language, including a close Turkic relative like Uzbek, should get text about «баштап»/«бастап» it "
+    "has no such postposition for"
+)
+assert set(GRAMMAR_LANGUAGE_HINTS) == {"ky", "kk"}, (
+    f"scope creep check — if this ever legitimately grows to cover another language, update this "
+    f"assertion deliberately rather than let it happen silently: {set(GRAMMAR_LANGUAGE_HINTS)}"
+)
+print("[OK] _target_lang_line: Kyrgyz/Kazakh get an explicit carve-out — a missing падеж ending before "
+      "«баштап»/«бастап» directly after a template variable placeholder is not flagged as an error — "
+      "scoped to exactly these two languages (by base subtag, so a region-qualified code like «kk-KZ» "
+      "still matches) and to nothing else")
+
 # --- numbers check: a correctly localized decimal comma or zero-padded
 # hour must NOT be flagged as a mismatch — Александр hit this live: an
 # Azerbaijani translation writing "0,40" for the source's "$0.40" and
@@ -1652,6 +1680,22 @@ assert _source_lang_note("en", ["untranslatable"]) == ""  # only applies to a Ru
 print("[OK] _source_lang_note: an English term left untranslated in a Russian source is filed under "
       "«непереводимые термины» when that check is selected (avoiding a contradiction with its own "
       "\"unchanged is correct\" rule), and only falls back to «неполнота перевода» when it isn't")
+
+# --- Client-specific terminology equivalence (Александр, 2026-09-24): the
+# platform had flagged a Kazakh translation as a meaning distortion for
+# rendering "отыгрыш" through a term normally used for "вейджер" — he
+# confirmed the two Russian words are genuine synonyms in his domain
+# (both mean a wagering requirement). Must ride on the same "source is
+# Russian" gate as the English-words rule (any target language), not be
+# tied to Kazakh/Kyrgyz specifically.
+assert "отыгрыш" in _source_lang_note("ru", ["typo"]) and "вейджер" in _source_lang_note("ru", ["typo"]), (
+    _source_lang_note("ru", ["typo"])
+)
+assert "отыгрыш" in _source_lang_note("ru", None)  # present regardless of which checks are selected
+assert _source_lang_note("en", ["typo"]) == ""  # still gated on a Russian SOURCE, same as the English rule
+print("[OK] _source_lang_note: «отыгрыш» and «вейджер» are flagged to the model as client-confirmed "
+      "synonyms whenever the source is Russian (any target language) — a translation that renders one "
+      "through the other's usual equivalent must not be reported as a meaning distortion")
 
 # --- placeholders check: a literal "\u00A0" escape token (some of
 # Александр's Crowdin exports write a non-breaking space out this way,

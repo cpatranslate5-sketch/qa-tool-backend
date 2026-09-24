@@ -1,14 +1,10 @@
 import asyncio
 import json
-import logging
-import os
 import re
 
 import httpx
 
 from app.config import settings
-
-logger = logging.getLogger(__name__)
 
 # "register" (tone of address) is NOT in here — as of 2026-09-16 it isn't
 # an error-finding check at all any more, so it never appears in the
@@ -24,25 +20,6 @@ logger = logging.getLogger(__name__)
 # summarize_register_values below for the replacement, and
 # _allowed_ai_types for how "register_value" gets recognized as a valid
 # response type only when "register" is one of the selected checks.
-# 2026-09-24 (Александр): register (ты/вы) mismatches vs the source were
-# showing up as "typo"/"other" findings — but register is already covered
-# by its own separate check, and the right register depends on the
-# language and task (not a calque of the Russian source). Excluded from
-# CHECK_LABELS["typo"], _OTHER_TYPE_INSTRUCTION, FINDINGS_SEARCH_PROMPT and
-# _prior_findings_block — but ONLY the source-vs-translation comparison:
-# the register_value entry (incl. "mixed" within one cell) is explicitly
-# kept, since that's how the register check itself gets its data.
-# 2026-09-24 (Александр, recurring): the model kept demanding plural
-# agreement with game/tournament names that merely LOOK plural in English
-# ("Haunted Hell Fire Treats आ रहा है" → "should be आ रहे हैं"), even when
-# the source itself uses singular ("Treats is coming"). A name is one
-# entity — singular agreement is correct. Rule added to CHECK_LABELS["typo"].
-# 2026-09-24 (Александр): Korean 이/가 flagged by SPELLING, not reading —
-# "Treats가" (read 트리츠, vowel-final → 가 is right) and "€250,000가"
-# (read 25만 유로, vowel-final → 가 is right). Rule added: pronunciation-
-# based allomorph choice (Korean particles, Turkic vowel harmony) is judged
-# by the real reading; ambiguous readings aren't reported. A MISSING case/
-# particle (e.g. the real Kyrgyz "{{amount}} баштап" miss) stays an error.
 CHECK_LABELS = {
     # (A "glossary" check used to live here too — required-term matching
     # against an uploaded glossary document. Removed: unlike the other AI
@@ -56,38 +33,13 @@ CHECK_LABELS = {
         "«resulits» вместо «results»); (2) ЛЮБАЯ объективная грамматическая ошибка целевого языка — неправильный "
         "падеж, управление, согласование, число, род, форма слова, предлог/послелог, синтаксис и т.п. Для этого "
         "пункта НЕ требуется, чтобы ошибка «ломала» понимание — если форма объективно неправильная по грамматике "
-        "целевого языка, это находка, даже когда смысл всё равно можно понять; (3) ошибки смысла — читатель "
-        "перевода поймёт НЕ ТО, что читатель исходника: пропущенное или добавленное отрицание, спутанные "
-        "число/род/лицо, неверно переданный термин, неверно переданное условие/количество/отношение между частями "
-        "фразы, потерянный или добавленный кусок информации. Смысл сверяй на уровне ВСЕЙ фразы, а не слово в слово: "
-        "естественная для целевого языка перестройка — другая конструкция или часть речи («много дел» → «очень "
-        "занят»), близкий по смыслу глагол или оборот («у тебя есть решение» → «тебе пришло в голову решение»), "
-        "слово, которое в этом контексте значит то же самое («решение» в значении «вариант/идея» → «idée»), "
-        "адаптация под жанр (мемы, маркетинг, игровые и рекламные тексты) — это НЕ ошибка смысла, даже если "
-        "дословно слова различаются. Сообщай об ошибке смысла, только если можешь назвать, что КОНКРЕТНО читатель "
-        "перевода поймёт иначе (другой факт, действие, число, условие, адресат, отрицание); если разница видна "
-        "только при дословном сравнении слов — это не находка. Названия игр, турниров, акций, брендов и т.п. "
-        "(например «Haunted Hell Fire Treats», «Sweet Bonanza», «Gates of Olympus») — это ОДИН объект, даже если "
-        "по форме название выглядит как множественное число: согласование с ним в единственном числе (глагол, "
-        "прилагательное, местоимение) — НЕ ошибка, требовать множественное число из-за формы слова в названии "
-        "нельзя. Особенно если и в исходнике с этим названием согласовано единственное число («... Treats is "
-        "coming»). Ошибкой согласования с названием считай только явный разнобой внутри самого перевода. "
-        "Выбор между вариантами одного и того же показателя ПО ЗВУЧАНИЮ (корейские 이/가, 은/는, 을/를, 과/와, "
-        "гармония гласных в турецком, казахском, киргизском, узбекском, азербайджанском и т.п.) после иностранного "
-        "слова, названия, числа, плейсхолдера или символа оценивай по тому, как это РЕАЛЬНО читается вслух на "
-        "целевом языке, а не по написанию: «Treats» по-корейски читается «트리츠» (на гласный) → «Treats가» верно; "
-        "«€250,000» читается «25만 유로» (на гласный, валюта произносится после числа) → «€250,000가» верно. Если "
-        "прочтение неоднозначно (плейсхолдер вроде {{amount}}, аббревиатура, которую читают по-разному) — выбор "
-        "варианта НЕ сообщай. Это касается только выбора между вариантами показателя: если нужного падежа, "
-        "окончания или частицы нет вовсе или стоит показатель с другой функцией — это по-прежнему ошибка. Форма обращения (ты/вы, tú/usted, du/Sie и т.п.) — "
-        "НЕ предмет этого критерия вообще: её проверяет отдельная проверка, а требования к ней зависят от языка "
-        "и задачи и могут не совпадать с исходником — никогда не сообщай о несовпадении обращения с исходником "
-        "как о находке этого критерия. Это НЕ отменяет отдельную запись об обращении (register_value, включая "
-        "значение \"mixed\" при смешении ты/вы внутри перевода), если она запрошена ниже — её добавляй как обычно. "
+        "целевого языка, это находка, даже когда смысл всё равно можно понять; (3) ошибки смысла — перевод "
+        "означает не то, что исходник: пропущенное отрицание, спутанные число/род, неверно переданный термин, "
+        "неверно переданное условие/количество/отношение между частями фразы, потерянный или добавленный смысл. "
         "Сюда же относится ДРУГАЯ ВАЛЮТА, чем в исходнике (например, евро вместо доллара, или другой ISO-код) — "
         "это меняет смысл суммы, а не просто стиль. Не считай находкой стилистические предпочтения (другой "
         "синоним с тем же смыслом, другой порядок слов, другая формулировка) — но ТОЛЬКО когда одновременно "
-        "выполнены ОБА условия: перевод грамматически корректен И передаёт читателю тот же смысл, что и исходник (на уровне всей фразы, как в пункте (3), а не дословно). Если "
+        "выполнены ОБА условия: перевод грамматически корректен И полностью сохраняет смысл исходника. Если "
         "нарушено хотя бы одно из этих двух условий — это уже не стиль, а настоящая находка по одному из пунктов "
         "выше, и о ней нужно сообщить"
     ),
@@ -167,23 +119,11 @@ CHECK_LABELS = {
 # instead (grammatically correct AND fully meaning-preserving), which is
 # harder to satisfy by accident than the old one-line "tell them apart"
 # instruction was.
-# 2026-09-23, evening (Александр's ask): after the two-step pipeline and
-# the "report every objective finding" wording above went live, translators
-# started rejecting almost every MEANING finding — the model was flagging
-# ordinary paraphrase as "смысловой сдвиг" (ES «много дел» → «estás muy
-# ocupado», «у тебя есть» → «se te ocurre»; FR «решение» → «idée»),
-# reading "полностью сохраняет смысл" as word-for-word equivalence. Fix:
-# meaning errors get their own, higher bar (the reader must understand
-# something concretely different), checked at whole-phrase level, here, in
-# CHECK_LABELS["typo"] point (3) and in _prior_findings_block. Spelling and
-# grammar keep the strict "report it even if understandable" rule.
 CALIBRATION_STRICT_OPENING = (
     "Общее правило: сообщай обо всех объективных находках по каждому выбранному критерию — не обязательно быть "
     "стопроцентно уверенным(ой), чтобы сообщить о реальной проблеме. Не сообщай только о том, что является другим, "
     "тоже полностью допустимым и корректным вариантом перевода — критерии ниже сами объясняют, когда именно "
-    "находка считается таким допустимым вариантом, а когда нет. Для ошибок СМЫСЛА порог другой: сообщай о них, "
-    "только если читатель перевода поймёт что-то конкретно другое, чем читатель исходника — перефразирование, "
-    "естественная перестройка фразы и не дословный, но верный по смыслу перевод ошибкой не являются."
+    "находка считается таким допустимым вариантом, а когда нет."
 )
 _CALIBRATION_SHARED_TAIL = (
     "Порядок символа валюты относительно числа, "
@@ -254,16 +194,11 @@ def _calibration(checks: list[str]) -> str:
 SINGLE_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
 Проверяй только критерии из "Что проверять" ниже.
 
+{target_lang_line}
+
 {calibration}
 
 {source_lang_note}
-
-Особые указания к задаче (важнее общих правил, если есть):
-{extra_instructions}
-
-Что проверять: {checks_description}
-{other_type_instruction}
-<<CACHE_SPLIT>>{target_lang_line}
 
 Исходный текст:
 \"\"\"{source}\"\"\"
@@ -271,6 +206,11 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 Перевод:
 \"\"\"{translation}\"\"\"
 {prior_findings}
+Особые указания к задаче (важнее общих правил, если есть):
+{extra_instructions}
+
+Что проверять: {checks_description}
+{other_type_instruction}
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
@@ -281,6 +221,8 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 BATCH_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны пары (контекст, исходный текст, перевод) на один целевой язык.
 Проверяй только критерии из "Что проверять" ниже. По умолчанию оценивай каждую пару отдельно от остальных — но если
 описание конкретного критерия ниже прямо просит сравнить пары между собой, следуй этому описанию для этого критерия.
+
+{target_lang_line}
 
 {calibration}
 
@@ -316,7 +258,6 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 сама программа (через "row"/"rows" и, для повторов, автоматическую пометку вида "также в строках: …", которую ты
 не пишешь сам). Если нужно различить конкретные места — используй ТОЛЬКО цитаты самого текста (например, конкретную
 фразу или предложение из перевода), а не номера пар.
-<<CACHE_SPLIT>>{target_lang_line}
 
 Пары для проверки:
 {pairs_block}
@@ -351,20 +292,14 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качества перевода для бюро переводов. Дана одна пара (контекст, исходный текст, перевод).
 Проверяй только критерии из "Что проверять" ниже.
 
+{target_lang_line}
+
 {calibration}
 
 {source_lang_note}
 
 Особые указания к задаче (важнее общих правил, если есть):
 {extra_instructions}
-
-Что проверять: {checks_description}
-{other_type_instruction}
-
-Важно про сам текст "message": НИКОГДА не упоминай в нём номер пары/строки — ни словом ("пара 1", "строка 1"), ни
-просто числом в скобках. Если нужно различить конкретные места (например, при нескольких предложениях в одном
-тексте) — используй ТОЛЬКО цитаты самого текста (конкретную фразу или предложение), а не номер.
-<<CACHE_SPLIT>>{target_lang_line}
 
 Контекст: {context}
 Исходный текст:
@@ -373,6 +308,12 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 Перевод:
 \"\"\"{translation}\"\"\"
 {prior_findings}
+Что проверять: {checks_description}
+{other_type_instruction}
+
+Важно про сам текст "message": НИКОГДА не упоминай в нём номер пары/строки — ни словом ("пара 1", "строка 1"), ни
+просто числом в скобках. Если нужно различить конкретные места (например, при нескольких предложениях в одном
+тексте) — используй ТОЛЬКО цитаты самого текста (конкретную фразу или предложение), а не номер.
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
@@ -417,7 +358,7 @@ FINDINGS_SEARCH_PROMPT = """Ты — опытный редактор перев�
 Прочитай их совершенно свободно, БЕЗ заранее заданного списка типов ошибок и БЕЗ формальной шкалы уверенности —
 просто внимательно сверь каждую пару и отметь всё, что кажется тебе неправильным, сомнительным, нелогичным или
 просто заслуживающим внимания редактора: опечатки, грамматика, искажение смысла, пропуски, странности стиля —
-что угодно, вплоть до мелочей (кроме несовпадения обращения ты/вы с исходником — это проверяют отдельно; а вот смешение ты/вы внутри самого перевода отметить можно). Отметить лишнее не страшно (это перепроверят и при необходимости отсеют на
+что угодно, вплоть до мелочей. Отметить лишнее не страшно (это перепроверят и при необходимости отсеют на
 следующем шаге) — а вот промолчать о том, что реально не так, нежелательно.
 
 {target_lang_line}
@@ -460,12 +401,7 @@ def _prior_findings_block(candidates: list[str] | None) -> str:
         "\nЧерновой, ничем не ограниченный просмотр уже заметил в этой паре следующее (это не готовые находки, "
         "а просто наводки — оцени каждую по критериям выше и ниже, отбрось то, что при внимательной проверке "
         "окажется просто стилем или не относится ни к одному критерию, и по-прежнему сам ищи всё, что этот "
-        "черновой просмотр мог пропустить; особенно строго отсеивай наводки вида «смысловой сдвиг»/«неточность»/"
-        "«искажение»: они остаются находкой, только если читатель перевода реально поймёт что-то другое, а не "
-        "просто потому, что перевод не дословный; наводки про несовпадение обращения ты/вы с исходником "
-        "отбрасывай как находки, а смешение ты/вы внутри перевода учитывай в отдельной записи об обращении, "
-        "если она запрошена):\n"
-        f"{lines}\n"
+        f"черновой просмотр мог пропустить):\n{lines}\n"
     )
 
 
@@ -624,9 +560,6 @@ def _model_branch_search_warning(model_label: str) -> dict:
     }
 
 
-GPT_GRACE_SECONDS = float(os.environ.get("GPT_GRACE_SECONDS", "10"))
-
-
 async def _ensemble_search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
 ) -> tuple[dict[int, list[str]], float, list[dict]]:
@@ -675,28 +608,10 @@ async def _ensemble_search_findings(
     sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
     gpt_expected = bool(settings.OPENAI_API_KEY)
 
-    # Same 2026-09-23 speed fix as OPENAI_REASONING_EFFORT: Sonnet's branch
-    # is the one Step 1 must have; GPT is a bonus second opinion. Once
-    # Sonnet is done, GPT gets at most GPT_GRACE_SECONDS more — if it's
-    # still thinking, Step 2 goes ahead on Sonnet's candidates alone
-    # instead of the whole check waiting on the slowest vendor. Deliberately
-    # NOT a visible warning (it's an intended skip, not a broken branch) —
-    # only logged. If Sonnet itself failed, GPT is the only source left, so
-    # it gets waited for in full as before.
-    sonnet_task = asyncio.ensure_future(_run_search_branch(_search_findings(items, target_lang, source_lang)))
-    gpt_task = asyncio.ensure_future(_run_search_branch(_search_findings_openai(items, target_lang, source_lang)))
-    (sonnet_findings, sonnet_cost), sonnet_error = await sonnet_task
-    if sonnet_error is None and gpt_expected:
-        done, _pending = await asyncio.wait({gpt_task}, timeout=GPT_GRACE_SECONDS)
-        if not done:
-            gpt_task.cancel()
-            logger.info("GPT Step 1 branch still running %ss after Sonnet finished — proceeding without it",
-                        GPT_GRACE_SECONDS)
-            (gpt_findings, gpt_cost), gpt_error = ({}, 0.0), None
-        else:
-            (gpt_findings, gpt_cost), gpt_error = gpt_task.result()
-    else:
-        (gpt_findings, gpt_cost), gpt_error = await gpt_task
+    ((sonnet_findings, sonnet_cost), sonnet_error), ((gpt_findings, gpt_cost), gpt_error) = await asyncio.gather(
+        _run_search_branch(_search_findings(items, target_lang, source_lang)),
+        _run_search_branch(_search_findings_openai(items, target_lang, source_lang)),
+    )
 
     merged: dict[int, list[str]] = {idx: list(candidates) for idx, candidates in sonnet_findings.items()}
     for idx, candidates in gpt_findings.items():
@@ -714,11 +629,35 @@ async def _ensemble_search_findings(
     return merged, sonnet_cost + gpt_cost, warnings
 
 
+# Client-specific terminology equivalence, 2026-09-24 (Александр, reporting
+# real translator pushback on a Kazakh check): the platform had flagged a
+# translation that rendered "отыгрыш" and "вейджер" through two different
+# target-language equivalents as a meaning distortion/terminology shift.
+# Александр confirmed the two Russian words are used interchangeably in his
+# source texts and both mean the same betting-industry concept (a wagering
+# requirement — a bonus/freebet amount that must be turned over before it
+# can be withdrawn), so translating one through a term that would normally
+# correspond to the other is not a real error. Not tied to any one target
+# language (the source pattern is Russian, regardless of what it's being
+# translated into), so this rides on the same "source is Russian" gate as
+# the English-embedded-words rule below rather than living in
+# GRAMMAR_LANGUAGE_HINTS.
+_RU_TERM_SYNONYMS_NOTE = (
+    "Отдельное уточнение от клиента: в русском исходнике слова «отыгрыш» и «вейджер» — синонимы, оба "
+    "обозначают требование сделать ставки на определённую сумму, прежде чем бонус/фрибет можно вывести. Если "
+    "один из этих терминов переведён через понятие, обычно соответствующее другому (например «отыгрыш» "
+    "передан аналогом «вейджера» или наоборот) — это НЕ искажение смысла и не ошибка термина."
+)
+
+
 def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
     """Client-specific rule: when the source is Russian, English words or
     phrases embedded in it (brand names, terms, rare exceptions aside)
     should stay in English in every target translation too — not be
-    translated into the target language.
+    translated into the target language. Also always appends
+    _RU_TERM_SYNONYMS_NOTE (see its own comment) whenever the source is
+    Russian, regardless of which checks are selected — harmless when
+    "typo" isn't running (there's no finding type it could affect then).
 
     Which check-type a violation is filed under depends on what's actually
     selected: "untranslatable" (see CHECK_LABELS) is the more specific,
@@ -736,8 +675,8 @@ def _source_lang_note(source_lang: str, checks: list[str] | None = None) -> str:
     return (
         "Особое правило: если в русском исходнике есть слова или фразы на английском (не считая редких "
         "исключений), они должны остаться на английском и в переводе на другой язык — не переводиться. Если такой "
-        f"фрагмент всё же переведён на язык перевода, это ошибка (относи к «{category}»)."
-    )
+        f"фрагмент всё же переведён на язык перевода, это ошибка (относи к «{category}»). "
+    ) + _RU_TERM_SYNONYMS_NOTE
 
 
 
@@ -754,11 +693,67 @@ LANG_CODE_MEANING_OVERRIDES = {
 }
 
 
+# Real translator pushback (2026-09-24, Kyrgyz + Kazakh) on findings the
+# platform itself generated: before the postposition «баштап»/«бастап»
+# ("начиная с"/"от"), the исходный-падеж ending attaches to the LAST
+# NUMBER and depends on its own final digit/sound ("10дон баштап",
+# "12ден баштап" — genuinely different endings for different numbers,
+# per both translators' own explanation). That's exactly the real
+# grammatical pattern the two-step pipeline was built to catch in the
+# first place (see FINDINGS_SEARCH_PROMPT's own comment, and the
+# "{{amount}} баштап" case that started this whole investigation) — so
+# this must NOT become a blanket "never flag missing ending before
+# баштап/бастап" rule, or it undoes that fix.
+#
+# The one case that genuinely isn't an error: when what precedes
+# «баштап»/«бастап» is a TEMPLATE VARIABLE placeholder (e.g.
+# {{dep_amount_currency}}) rather than a number written out in the text.
+# Its actual value isn't known until runtime, so there is no correct
+# ending to attach at translation time — omitting one there is a real
+# grammatical necessity, not a style choice or an oversight. Deliberately
+# narrow: a literal, spelled-out number (e.g. "1,25 бастап 4,0") still
+# gets the platform's normal judgment, unchanged — Александр's own call
+# (2026-09-24), since that case is genuinely more arguable and a blanket
+# exemption there risks quietly reopening real misses instead.
+GRAMMAR_LANGUAGE_HINTS: dict[str, str] = {
+    "ky": (
+        'Важное уточнение для этого языка (подтверждено переводчиками-носителями): перед послелогом '
+        '«баштап» ("начиная с"/"от") окончание исходного падежа присоединяется к последнему числу и '
+        'зависит от его звучания — «10дон баштап», «12ден баштап» и т.п. — так что это НЕ единая, всегда '
+        'одинаковая форма, и разные окончания для разных чисел — это правильно, а не непоследовательность. '
+        'Если вместо конкретного числа сразу перед «баштап» стоит переменная-плейсхолдер вида {{...}} — её '
+        'итоговое значение на момент перевода неизвестно, поэтому окончание для неё нельзя подобрать заранее: '
+        'отсутствие падежного окончания непосредственно перед «баштап» сразу после ТАКОЙ переменной — это НЕ '
+        'ошибка, не сообщай о ней. Если же окончание пропущено перед «баштап» после КОНКРЕТНОГО, прямо '
+        'написанного в тексте числа (не переменной) — это по-прежнему настоящая находка, здесь ничего не '
+        'изменилось.\n'
+    ),
+    "kk": (
+        'Важное уточнение для этого языка (подтверждено переводчиками-носителями): перед послелогом '
+        '«бастап» ("начиная с"/"от") окончание исходного падежа (аффикс) присоединяется к последнему числу '
+        'и зависит от его звучания — так что разные окончания для разных чисел — это правильно, а не '
+        'непоследовательность. Если вместо конкретного числа сразу перед «бастап» стоит переменная-'
+        'плейсхолдер вида {{...}} — её итоговое значение на момент перевода неизвестно, поэтому окончание '
+        'для неё нельзя подобрать заранее: отсутствие падежного окончания непосредственно перед «бастап» '
+        'сразу после ТАКОЙ переменной — это НЕ ошибка, не сообщай о ней. Если же окончание пропущено перед '
+        '«бастап» после КОНКРЕТНОГО, прямо написанного в тексте числа (не переменной, например «1,25 бастап '
+        '4,0») — по-прежнему оценивай это по общим правилам, здесь ничего не изменилось.\n'
+    ),
+}
+
+
+def _grammar_language_hint(target_lang: str) -> str:
+    return GRAMMAR_LANGUAGE_HINTS.get(target_lang.strip().lower().split("-")[0], "")
+
+
 def _target_lang_line(target_lang: str) -> str:
     """Explicitly names the target language rather than leaving the model
     to infer it purely from the translated text — closely related
     languages (e.g. Turkish/Azerbaijani, Kazakh/Kyrgyz) are otherwise a
-    real risk of being mixed up, especially in short texts."""
+    real risk of being mixed up, especially in short texts. Also appends
+    _grammar_language_hint (normally empty) — a short, language-specific
+    correction for a real grammatical pattern the model tends to
+    over-flag for THIS particular language (see GRAMMAR_LANGUAGE_HINTS)."""
     code = target_lang.strip().lower()
     if not code:
         return ""
@@ -766,9 +761,12 @@ def _target_lang_line(target_lang: str) -> str:
     if override:
         return (
             f"Целевой язык перевода обозначен кодом «{code}», но здесь этот код означает: {override}. "
-            "Ориентируйся именно на этот язык, а не на формальное значение кода по стандарту ISO."
-        )
-    return f"Целевой язык перевода: {code}. Ориентируйся конкретно на этот язык — не путай с родственными языками."
+            "Ориентируйся именно на этот язык, а не на формальное значение кода по стандарту ISO.\n"
+        ) + _grammar_language_hint(target_lang)
+    return (
+        f"Целевой язык перевода: {code}. Ориентируйся конкретно на этот язык — не путай с родственными "
+        "языками.\n"
+    ) + _grammar_language_hint(target_lang)
 
 
 def _checks_description(checks: list[str]) -> str | None:
@@ -817,9 +815,7 @@ _OTHER_TYPE_INSTRUCTION = (
     'именно этого критерия, её не должно быть под этим типом. Вместо этого добавь её в ответ отдельной записью '
     'с "type": "other" — так она не потеряется, но и не исказит статистику по основным критериям. Стилистические '
     "предпочтения или сомнительные наблюдения (не объективная ошибка) вне списка проверок пропускай — не сообщай "
-    "о них вообще. Несовпадение формы обращения (ты/вы) с исходником не отмечай и как «other» — его проверяет "
-    "отдельная проверка (отдельную запись об обращении, если она запрошена ниже, в том числе «mixed», "
-    "добавляй как обычно)."
+    "о них вообще."
 )
 
 
@@ -1300,16 +1296,7 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
     rates = MODEL_PRICING_PER_TOKEN.get(model)
     if not rates or not usage:
         return 0.0
-    # Prompt caching (see CACHE_SPLIT): Anthropic reports cached tokens
-    # separately from input_tokens — writes bill at 1.25x input price,
-    # reads at 0.1x. Both MUST be counted or the shown cost would drop
-    # below the real bill.
-    cost = (
-        usage.get("input_tokens", 0) * rates["input"]
-        + (usage.get("cache_creation_input_tokens") or 0) * rates["input"] * 1.25
-        + (usage.get("cache_read_input_tokens") or 0) * rates["input"] * 0.10
-        + usage.get("output_tokens", 0) * rates["output"]
-    )
+    cost = usage.get("input_tokens", 0) * rates["input"] + usage.get("output_tokens", 0) * rates["output"]
     return cost * BATCH_PRICE_DISCOUNT if batch else cost
 
 
@@ -1335,38 +1322,7 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
     if not settings.ANTHROPIC_API_KEY:
         return None, {}, None
     resolved_model = model or settings.CLAUDE_MODEL
-    # 2026-09-23 (Александр hit it live): an urgent 5-language upload died
-    # with "Failed to fetch" because ONE Step-2 call took longer than the
-    # old flat 120s read timeout (ReadTimeout in the Railway log) — and
-    # since Step 2 isn't wrapped per-branch like Step 1, that single slow
-    # call took the whole multi-check down with it. Now: a longer read
-    # timeout (long answers on big chunks legitimately take minutes) plus
-    # automatic retries on transient failures (timeouts, dropped
-    # connections, 429 rate limits, 5xx/529 overloads) before giving up.
-    last_exc: Exception | None = None
-    for attempt in range(_CLAUDE_MAX_ATTEMPTS):
-        try:
-            return await _call_claude_once(prompt, resolved_model)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code not in _RETRYABLE_STATUS:
-                raise
-            last_exc = exc
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            last_exc = exc
-        if attempt < _CLAUDE_MAX_ATTEMPTS - 1:
-            logger.warning("Claude call failed (attempt %d/%d): %r — retrying",
-                           attempt + 1, _CLAUDE_MAX_ATTEMPTS, last_exc)
-            await asyncio.sleep(3 * (attempt + 1))
-    raise last_exc  # type: ignore[misc]
-
-
-_CLAUDE_MAX_ATTEMPTS = 3
-_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
-_CLAUDE_TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=60.0)
-
-
-async def _call_claude_once(prompt: str, resolved_model: str) -> tuple[str | None, dict, str | None]:
-    async with httpx.AsyncClient(timeout=_CLAUDE_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -1389,7 +1345,7 @@ async def _call_claude_once(prompt: str, resolved_model: str) -> tuple[str | Non
                 # model's behavior instead" — there's no replacement
                 # determinism knob, so consistency now has to come from
                 # clear prompt wording, not a request parameter.
-                "messages": [{"role": "user", "content": _prompt_content(prompt)}],
+                "messages": [{"role": "user", "content": prompt}],
             },
         )
         resp.raise_for_status()
@@ -1397,27 +1353,6 @@ async def _call_claude_once(prompt: str, resolved_model: str) -> tuple[str | Non
 
     text = next((b["text"] for b in data.get("content", []) if b.get("type") == "text"), None)
     return text, data.get("usage", {}), data.get("stop_reason")
-
-
-# 2026-09-23 (Александр: "одна фраза раньше 10 сек, теперь в 3-4 раза
-# дольше"): gpt-5-mini is a reasoning model and, at OpenAI's default
-# (medium) effort, was routinely the slowest part of Step 1 — and Step 1
-# waits for its slowest branch before Step 2 can even start. Step 1 is
-# only a candidate-gathering pass (Step 2 does the real judging), so low
-# effort is enough there. Override with OPENAI_REASONING_EFFORT on Railway
-# ("minimal"/"low"/"medium"/"high"; empty = don't send it at all).
-OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "low").strip()
-
-
-def _openai_payload(model: str, prompt: str, with_effort: bool) -> dict:
-    payload = {
-        "model": model,
-        "max_completion_tokens": AI_MAX_TOKENS,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    if with_effort and OPENAI_REASONING_EFFORT:
-        payload["reasoning_effort"] = OPENAI_REASONING_EFFORT
-    return payload
 
 
 async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | None, dict, str | None]:
@@ -1442,19 +1377,12 @@ async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | Non
                 "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
                 "content-type": "application/json",
             },
-            json=_openai_payload(resolved_model, strip_cache_marker(prompt), with_effort=True),
+            json={
+                "model": resolved_model,
+                "max_completion_tokens": AI_MAX_TOKENS,
+                "messages": [{"role": "user", "content": prompt}],
+            },
         )
-        # Some OpenAI models don't accept reasoning_effort — rather than
-        # breaking the whole GPT branch over it, retry once without it.
-        if resp.status_code == 400 and "reasoning_effort" in resp.text:
-            resp = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                    "content-type": "application/json",
-                },
-                json=_openai_payload(resolved_model, strip_cache_marker(prompt), with_effort=False),
-            )
         resp.raise_for_status()
         data = resp.json()
 
@@ -1844,39 +1772,6 @@ async def run_ai_checks_batch(
 BATCHES_URL = "https://api.anthropic.com/v1/messages/batches"
 
 
-# ------------------------------------------------------ prompt caching ---
-# 2026-09-24 (Александр: "можем ли удешевить без потери качества?"). Over
-# 99% of every Step-2 prompt is the same fixed instructions (calibration,
-# CHECK_LABELS, formatting rules) — ~13.5K chars for a 70-char phrase —
-# and hard languages send one call PER ROW, so a 30-language upload paid
-# for those identical instructions hundreds of times. The three Step-2
-# templates were reordered so everything that's constant within one task
-# (instructions, checks, extra_instructions, source-language note) comes
-# first, and everything per-language/per-row (target language, the pairs,
-# Step-1 leads, register block) comes after CACHE_SPLIT. _prompt_content
-# turns that into two content blocks with Anthropic's prompt caching on the
-# first: re-reading a cached prefix within 5 minutes costs 10% of normal
-# input price (the first write costs 125%). The model sees exactly the same
-# text either way — only the billing changes. Prefixes below the model's
-# minimum cacheable length simply aren't cached (no error).
-CACHE_SPLIT = "<<CACHE_SPLIT>>"
-
-
-def strip_cache_marker(prompt: str) -> str:
-    """For non-Anthropic callers (Gemini diagnostics etc.) and logging."""
-    return prompt.replace(CACHE_SPLIT, "")
-
-
-def _prompt_content(prompt: str):
-    if CACHE_SPLIT not in prompt:
-        return prompt
-    prefix, suffix = prompt.split(CACHE_SPLIT, 1)
-    return [
-        {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": suffix},
-    ]
-
-
 def _headers() -> dict:
     return {
         "x-api-key": settings.ANTHROPIC_API_KEY,
@@ -1905,7 +1800,7 @@ async def create_message_batch(requests: list[dict]) -> str | None:
                 # 400 on newer models (confirmed live against Sonnet), and
                 # recommends prompting instead of a temperature parameter
                 # for consistent output on these models.
-                "messages": [{"role": "user", "content": _prompt_content(r["prompt"])}],
+                "messages": [{"role": "user", "content": r["prompt"]}],
             },
         }
         for r in requests

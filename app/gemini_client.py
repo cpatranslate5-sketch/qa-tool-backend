@@ -32,7 +32,6 @@ from app.claude_client import (
     group_batch_findings,
     parse_json_array,
     _filter_findings_by_checks,
-    strip_cache_marker,
 )
 from app.config import settings
 
@@ -213,7 +212,6 @@ async def run_gemini_checks_batch(
     # settings.GEMINI_API_KEY isn't configured — falls through to
     # parse_json_array(None) == [] below, same graceful "nothing to show"
     # as a missing ANTHROPIC_API_KEY, not treated as an error.
-    prompt = strip_cache_marker(prompt)  # Anthropic-only caching marker, see claude_client.CACHE_SPLIT
     text_block, usage, stop_reason, error_detail = await _call_gemini(prompt)
     if stop_reason == "errored":
         return {}, 0.0, False, True, error_detail
