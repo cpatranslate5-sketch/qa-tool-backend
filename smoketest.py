@@ -2092,15 +2092,11 @@ _squeeze_test_prompts = {"typo": [], "register": []}
 
 async def _fake_call_claude_records_prompt_typo(prompt, model=None):
     _squeeze_test_prompts["typo"].append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
 
 
 async def _fake_call_claude_records_prompt_register(prompt, model=None):
     _squeeze_test_prompts["register"].append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]', {"input_tokens": 10, "output_tokens": 5}, "end_turn"
 
 
@@ -2297,8 +2293,6 @@ from app.excel_multi import _check_language_for_sheet
 
 
 async def _fake_call_claude_repeated_batch(prompt, model=None):
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return (
         '[{"row": 2, "type": "typo", "severity": "low", "message": "мелкая опечатка только здесь"},'
         '{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
@@ -2424,8 +2418,6 @@ _chunk_structured_call_count = {"n": 0}
 
 async def _fake_call_claude_chunked(prompt, model=None):
     _chunk_call_prompts.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "проблем не найдено", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
     _chunk_structured_call_count["n"] += 1
@@ -2460,11 +2452,7 @@ _chunk_out, _chunk_cost = asyncio.get_event_loop().run_until_complete(
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_chunk_call_prompts) == 6, (
-    "expected exactly 6 AI calls — 2 chunks x (search step + structured step + review step) — both chunks' "
-    "structured findings are medium-severity real types (untranslatable), so Step 3's review pass fires for "
-    "each chunk on top of the two-step pipeline's own search+structured calls"
-)
+assert len(_chunk_call_prompts) == 4, "expected exactly 4 AI calls — 2 chunks x (search step + structured step)"
 assert _chunk_structured_call_count["n"] == 2, "expected exactly 2 structured-step AI calls — one per chunk"
 _chunk_by_row = {r["excel_row"]: r["findings"] for r in _chunk_out}
 # first chunk's repeat: local rows 1 and 3 -> global indices 0 and 2 -> excel_row 100 and 102
@@ -2512,8 +2500,6 @@ _hard_chunk_calls = {"n": 0}
 
 async def _fake_call_claude_count_calls(prompt, model=None):
     _hard_chunk_calls["n"] += 1
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return "[]", {"input_tokens": 20, "output_tokens": 5}, "end_turn"
 
 
@@ -2730,8 +2716,6 @@ captured_prompts = []
 
 async def _fake_call_claude(prompt, model=None):
     captured_prompts.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     # Simulates a model that ignores "проверяй только typo" and
     # reports an untranslatable-text issue anyway.
     text = (
@@ -2750,19 +2734,12 @@ findings, ai_cost = asyncio.get_event_loop().run_until_complete(
 assert findings == [raw_findings[0]], findings
 assert ai_cost > 0, ai_cost
 # The JSON schema shown to the model is also scoped down to just the
-# requested check(s), not a fixed always-all list. Searched across ALL
-# captured prompts (not just one fixed index) — run_ai_checks now makes
-# up to three calls (Step 1 search, Step 2 structured, Step 3 review; see
-# FINDINGS_SEARCH_PROMPT's and FINDINGS_REVIEW_PROMPT's own comments), and
-# only Step 2's own SINGLE_PROMPT actually carries a '"type": ...,
-# "severity": ...' JSON schema line — Step 1/Step 3's free-text prompts
-# never do, so this naturally finds the right one regardless of how many
-# extra calls surround it.
+# requested check(s), not a fixed always-all list. captured_prompts[-1] —
+# not [0] — since run_ai_checks now makes an extra Step 1 search call
+# first (see FINDINGS_SEARCH_PROMPT's own comment), which carries no JSON
+# schema line at all.
 type_enum_line = next(
-    line
-    for a_prompt in captured_prompts
-    for line in a_prompt.splitlines()
-    if '"type":' in line and '"severity":' in line
+    line for line in captured_prompts[-1].splitlines() if '"type":' in line and '"severity":' in line
 )
 assert "typo" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
 print("[OK] AI findings hard-filtered to requested checks even when the model reports "
@@ -2797,8 +2774,6 @@ assert _filter_findings_by_checks(_other_raw_findings, ["typo"]) == _other_raw_f
 
 
 async def _fake_call_claude_other_type(prompt, model=None):
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return (
         '[{"type": "typo", "severity": "medium", "message": "обычная опечатка"},'
         '{"type": "other", "severity": "high", "message": "явная ошибка смысла вне списка проверок"}]',
@@ -2846,8 +2821,6 @@ print("[OK] parse_json_array: a JSON array cut off mid-object (max_tokens trunca
 
 
 async def _fake_call_claude_truncated(prompt, model=None):
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return ('[{"type": "typo", "severity": "medium", "message": "неверная валюта"}]',
             {"input_tokens": 500, "output_tokens": 100}, "max_tokens")
 
@@ -3121,8 +3094,6 @@ print("[OK] build_register_report: everywhere-the-same reports just the bare wor
 # the raw register_value entry itself never leaks into the visible
 # findings (it's not a real problem, so it must never look like one) ---
 async def _fake_call_claude_register_single(prompt, model=None):
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     assert REGISTER_VALUE_TYPE in prompt
     return (
         f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal", "message": ""}}]',
@@ -3189,8 +3160,6 @@ _reg_sheet = {
 
 
 async def _fake_call_claude_register_batch(prompt, model=None):
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     assert REGISTER_VALUE_TYPE in prompt
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
@@ -3273,8 +3242,6 @@ from app.claude_client import REGISTER_MIXED_TYPE
 
 
 async def _fake_call_claude_register_mixed_single(prompt, model=None):
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return (
         f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
         {"input_tokens": 10, "output_tokens": 10},
@@ -3303,8 +3270,6 @@ print("[OK] standalone /check: a single pair the model reports as internally mix
 # "везде на «вы»" with no exceptions at all, as if row 3 didn't exist for
 # that purpose).
 async def _fake_call_claude_register_mixed_batch(prompt, model=None):
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
         '{"row": 2, "type": "register_value", "severity": "low", "value": "mixed", "message": ""},'
@@ -4168,8 +4133,6 @@ _two_step_prompts: list[str] = []
 
 async def _fake_call_claude_two_step(prompt, model=None):
     _two_step_prompts.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: пропущено отрицание в переводе", {"input_tokens": 30, "output_tokens": 10}, "end_turn"
     return (
@@ -4186,10 +4149,7 @@ _two_step_findings, _two_step_cost, _two_step_trunc, _two_step_warnings = asynci
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_two_step_prompts) == 3, (
-    "expected exactly 3 calls — the search step, the structured step, then Step 3's review step (the "
-    "structured step's own finding is medium-severity typo, a real reviewable type, so review fires too)"
-)
+assert len(_two_step_prompts) == 2, "expected exactly 2 calls — the search step, then the structured step"
 assert _two_step_prompts[0].startswith("Ты — опытный редактор переводов"), "Step 1 (search) must run FIRST"
 assert "пропущено отрицание в переводе" in _two_step_prompts[1], (
     "Step 1's candidate must actually reach Step 2's own structured prompt text, not just be computed and "
@@ -4225,8 +4185,6 @@ _reg_only_prompts: list[str] = []
 
 async def _fake_call_claude_reg_only_two_step(prompt, model=None):
     _reg_only_prompts.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]',
         {"input_tokens": 10, "output_tokens": 5}, "end_turn",
@@ -4260,8 +4218,6 @@ _override_seen_models = []
 
 async def _fake_call_claude_records_model(prompt, model=None):
     _override_seen_models.append(model)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     return "[]", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
 
 
@@ -4494,8 +4450,6 @@ _e2e_openai_calls: list[str] = []
 
 async def _fake_call_claude_e2e_ensemble(prompt, model=None):
     _e2e_claude_calls.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: sonnet видит пропуск", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
     return (
@@ -4521,10 +4475,7 @@ claude_client_mod._call_claude = _previous_call_claude
 claude_client_mod._call_openai = _previous_call_openai
 settings.ANTHROPIC_API_KEY = ""
 settings.OPENAI_API_KEY = ""
-assert len(_e2e_claude_calls) == 3, (
-    "Sonnet: Step 1 search + Step 2 structured check + Step 3 review (the structured step's own finding is "
-    "medium-severity typo, a real reviewable type, so review fires too — GPT is never involved in Step 3)"
-)
+assert len(_e2e_claude_calls) == 2, "Sonnet: Step 1 search + Step 2 structured check"
 assert len(_e2e_openai_calls) == 1, "GPT: only Step 1 search — Step 2 stays Sonnet-only, per Александр's ask"
 assert "sonnet видит пропуск" in _e2e_claude_calls[1] and "gpt тоже видит пропуск" in _e2e_claude_calls[1], (
     "both models' Step 1 candidates must reach Step 2's own structured prompt text"
@@ -4545,8 +4496,6 @@ _e2e_warn_claude_calls: list[str] = []
 
 async def _fake_call_claude_e2e_warn(prompt, model=None):
     _e2e_warn_claude_calls.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: sonnet видит пропуск", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
     return (
@@ -4649,269 +4598,6 @@ assert len(_both_warnings) == 2 and _both_labels == {"Sonnet", "GPT"}, _both_war
 print("[OK] _ensemble_search_findings: when BOTH configured branches fail at once, BOTH warnings are "
       "returned together (not just one), while the check itself still completes with empty Step 1 "
       "candidates rather than crashing")
-
-# --- Step 3: FINDINGS_REVIEW_PROMPT / _review_eligible_types / ----------
-# _review_findings — a fresh, skeptical second look at Step 2's own
-# already-decided findings, hunting specifically for false positives
-# (regional/dialectal variation, informal-register looseness, a factually
-# wrong grammar rule on the checker's own part), modeled on Александр
-# getting much better results by pasting a raw report back to Claude in
-# chat and asking "is this fair" than the structured pipeline gave alone.
-# See FINDINGS_REVIEW_PROMPT's own comment in app.claude_client for the
-# full rationale and the "never touches Важно/synthetic types" guarantee.
-from app.claude_client import _review_findings as _review_findings_direct
-from app.claude_client import _review_eligible_types as _review_eligible_types_direct
-from app.claude_client import FINDINGS_REVIEW_PROMPT
-
-assert "Находки для перепроверки" in FINDINGS_REVIEW_PROMPT, (
-    "FINDINGS_REVIEW_PROMPT's rendered text must always contain this literal section-header substring — "
-    "it's the one reliable way the rest of the pipeline (and every fake _call_claude in this file) tells a "
-    "Step 3 review call apart from a Step 1/Step 2 call"
-)
-
-# 1) _review_eligible_types: never register_value/register_summary/system,
-# always the real CHECK_LABELS-derived types (+OTHER_TYPE) _allowed_ai_types
-# would allow for the same checks.
-_elig_typo = _review_eligible_types_direct(["typo"])
-assert _elig_typo == _allowed_ai_types(["typo"]) - {REGISTER_VALUE_TYPE} == {"typo", OTHER_TYPE}, _elig_typo
-_elig_multi = _review_eligible_types_direct(["typo", "untranslatable", "register"])
-assert _elig_multi == _allowed_ai_types(["typo", "untranslatable", "register"]) - {REGISTER_VALUE_TYPE}, _elig_multi
-assert "register_value" not in _elig_multi and "register_summary" not in _elig_multi and "system" not in _elig_multi, (
-    f"the platform's own synthetic/meta types must never be eligible for review, no matter which real checks "
-    f"are selected — got {_elig_multi}"
-)
-# a register-only run has NOTHING eligible at all — _allowed_ai_types(["register"]) is exactly
-# {register_value}, and that's the one type review is never allowed to touch
-_elig_reg_only = _review_eligible_types_direct(["register"])
-assert _elig_reg_only == set(), _elig_reg_only
-print("[OK] _review_eligible_types: never includes register_value/register_summary/system regardless of "
-      "which checks are selected, always includes the real CHECK_LABELS-derived types (+\"other\") "
-      "_allowed_ai_types would allow, and a register-only run has nothing eligible at all")
-
-_review_items = [
-    {"context": "", "source": "a", "translation": "b"},
-    {"context": "", "source": "c", "translation": "d"},
-]
-
-
-async def _fake_call_claude_review_poison(prompt, model=None):
-    raise AssertionError("_review_findings must make NO API call at all when nothing is eligible for review")
-
-
-# 2a) every finding high-severity -> nothing eligible -> unchanged, zero calls
-_no_elig_high = {0: [{"type": "typo", "severity": "high", "message": "важная опечатка"}]}
-claude_client_mod._call_claude = _fake_call_claude_review_poison
-_no_elig_high_out, _no_elig_high_cost = asyncio.run(
-    _review_findings_direct(_review_items, _no_elig_high, ["typo"])
-)
-claude_client_mod._call_claude = _previous_call_claude
-assert _no_elig_high_out == _no_elig_high, _no_elig_high_out
-assert _no_elig_high_cost == 0.0, _no_elig_high_cost
-
-# 2b) every finding a synthetic type (register_value) -> nothing eligible -> unchanged, zero calls
-_no_elig_synthetic = {0: [{"type": "register_value", "severity": "low", "value": "formal", "message": ""}]}
-claude_client_mod._call_claude = _fake_call_claude_review_poison
-_no_elig_synth_out, _no_elig_synth_cost = asyncio.run(
-    _review_findings_direct(_review_items, _no_elig_synthetic, ["typo", "register"])
-)
-claude_client_mod._call_claude = _previous_call_claude
-assert _no_elig_synth_out == _no_elig_synthetic, _no_elig_synth_out
-assert _no_elig_synth_cost == 0.0, _no_elig_synth_cost
-
-# 2c) both at once (a high-severity real finding on one row, a synthetic-type finding on another) -> still
-# nothing eligible -> unchanged, zero calls
-_no_elig_both = {
-    0: [{"type": "typo", "severity": "high", "message": "важная опечатка"}],
-    1: [{"type": "register_value", "severity": "low", "value": "informal", "message": ""}],
-}
-claude_client_mod._call_claude = _fake_call_claude_review_poison
-_no_elig_both_out, _no_elig_both_cost = asyncio.run(
-    _review_findings_direct(_review_items, _no_elig_both, ["typo", "register"])
-)
-claude_client_mod._call_claude = _previous_call_claude
-assert _no_elig_both_out == _no_elig_both, _no_elig_both_out
-assert _no_elig_both_cost == 0.0, _no_elig_both_cost
-print("[OK] _review_findings: with nothing eligible for review (every finding already high-severity, a "
-      "synthetic type, or both at once) returns the input dict UNCHANGED with cost 0.0 and makes ZERO API "
-      "calls — a poison fake that raises if ever invoked proves it, not just a lucky no-op response")
-
-
-# 3) an eligible (medium-severity, real-type) finding, review response says "1: причина" -> that exact
-# finding is dropped, cost reflects the fake's own usage
-_one_eligible = {0: [{"type": "typo", "severity": "medium", "message": "сомнительная опечатка"}]}
-
-
-async def _fake_call_claude_review_drop_one(prompt, model=None):
-    assert "Находки для перепроверки" in prompt
-    return "1: на самом деле это нормальный региональный вариант", {"input_tokens": 25, "output_tokens": 12}, "end_turn"
-
-
-claude_client_mod._call_claude = _fake_call_claude_review_drop_one
-_drop_out, _drop_cost = asyncio.run(_review_findings_direct(_review_items, _one_eligible, ["typo"]))
-claude_client_mod._call_claude = _previous_call_claude
-assert 0 not in _drop_out, (
-    f"the only finding under idx 0 was dropped by review, so idx 0 must disappear from the dict entirely — "
-    f"never survive as an empty list (matches group_batch_findings' own invariant) — got {_drop_out}"
-)
-_drop_expected_cost = _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 25, "output_tokens": 12})
-assert abs(_drop_cost - _drop_expected_cost) < 1e-9, (_drop_cost, _drop_expected_cost)
-print("[OK] _review_findings: an eligible medium/low-severity finding that the review response names by "
-      "number is actually dropped from the returned dict — a fully-dropped idx disappears entirely rather "
-      "than being left as idx: [] — and the returned cost reflects the review call's own real usage")
-
-# 4) a high-severity finding sharing a batch with an eligible one: the high-severity one must NEVER even
-# reach the review prompt's text, and must survive untouched no matter what the fake tries to reference —
-# including an out-of-range number that doesn't correspond to anything real
-_mixed_severity = {0: [
-    {"type": "typo", "severity": "high", "message": "критичная опечатка — должна всегда дойти до человека"},
-    {"type": "typo", "severity": "medium", "message": "мелкая опечатка под сомнением"},
-]}
-_mixed_severity_prompts = []
-
-
-async def _fake_call_claude_review_high_survives(prompt, model=None):
-    _mixed_severity_prompts.append(prompt)
-    # Only ONE finding was ever eligible (the medium one, numbered "1" — the high-severity one was never
-    # numbered at all), so "99" is deliberately out of range and must resolve to nothing.
-    return "99: несуществующий номер", {"input_tokens": 10, "output_tokens": 5}, "end_turn"
-
-
-claude_client_mod._call_claude = _fake_call_claude_review_high_survives
-_mixed_out, _mixed_cost = asyncio.run(_review_findings_direct(_review_items, _mixed_severity, ["typo"]))
-claude_client_mod._call_claude = _previous_call_claude
-assert "критичная опечатка" not in _mixed_severity_prompts[0], (
-    "a Важно/high-severity finding must never even be SENT to Step 3 review — it must not appear in the "
-    "review prompt's own text at all, not just survive the response"
-)
-assert "мелкая опечатка под сомнением" in _mixed_severity_prompts[0], (
-    "the medium-severity finding in the SAME batch must still be sent for review"
-)
-assert _mixed_out == _mixed_severity, (
-    f"an out-of-range drop number must change nothing, and the high-severity finding must survive review "
-    f"completely untouched — got {_mixed_out}"
-)
-print("[OK] _review_findings: a \"Важно\"/high-severity finding sharing a batch with an eligible one is "
-      "NEVER sent to review at all (absent from the review prompt's own text, confirmed by inspecting what "
-      "the fake actually received) and always survives untouched, even against a fake trying to reference "
-      "an out-of-range finding number")
-
-# 5) the "все находки подтверждены" sentinel (and any other non-matching text) drops nothing
-_sentinel_input = {0: [{"type": "typo", "severity": "low", "message": "мелочь"}]}
-
-
-async def _fake_call_claude_review_sentinel(prompt, model=None):
-    return "все находки подтверждены", {"input_tokens": 8, "output_tokens": 4}, "end_turn"
-
-
-async def _fake_call_claude_review_garbage(prompt, model=None):
-    return "это вообще не в формате NUMBER: причина", {"input_tokens": 8, "output_tokens": 4}, "end_turn"
-
-
-claude_client_mod._call_claude = _fake_call_claude_review_sentinel
-_sentinel_out, _ = asyncio.run(_review_findings_direct(_review_items, _sentinel_input, ["typo"]))
-claude_client_mod._call_claude = _fake_call_claude_review_garbage
-_garbage_out, _ = asyncio.run(_review_findings_direct(_review_items, _sentinel_input, ["typo"]))
-claude_client_mod._call_claude = _previous_call_claude
-assert _sentinel_out == _sentinel_input, _sentinel_out
-assert _garbage_out == _sentinel_input, _garbage_out
-print("[OK] _review_findings: the \"все находки подтверждены\" sentinel, and any other response that "
-      "doesn't parse as \"NUMBER: reason\" lines, correctly drops nothing at all")
-
-# 6) integration: run_ai_checks (single-pair) end-to-end — Step 2's real JSON on the structured call, then
-# a review response (detected via FINDINGS_REVIEW_PROMPT's own marker, not call order/count, since the
-# search call happens to share Step 3's opening words) that drops the one finding — confirms it's actually
-# gone from run_ai_checks's own returned findings list, and cost includes every call's usage.
-_int_single_calls = []
-
-
-async def _fake_call_claude_review_integration_single(prompt, model=None):
-    _int_single_calls.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "1: это нормальный разговорный вариант, не ошибка", {"input_tokens": 15, "output_tokens": 8}, "end_turn"
-    if prompt.startswith("Ты — опытный редактор переводов"):
-        return "проблем не найдено", {"input_tokens": 10, "output_tokens": 3}, "end_turn"
-    return (
-        '[{"type": "typo", "severity": "medium", "message": "опечатка под сомнением"}]',
-        {"input_tokens": 40, "output_tokens": 15}, "end_turn",
-    )
-
-
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_review_integration_single
-_int_single_findings, _int_single_cost = asyncio.run(run_ai_checks(
-    "source text", "translation text", ["typo"], target_lang="ru",
-))
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-assert _int_single_findings == [], (
-    f"run_ai_checks's own single finding must actually be gone once Step 3 review drops it — got "
-    f"{_int_single_findings}"
-)
-assert len(_int_single_calls) == 3, "search + structured + review — got " + str(len(_int_single_calls))
-assert _int_single_cost > 0, _int_single_cost
-print("[OK] run_ai_checks (single-pair) integration: a real Step 2 finding that Step 3 review drops is "
-      "actually gone from run_ai_checks's own returned findings list, not just from _review_findings in "
-      "isolation, and the returned cost includes all three calls' usage")
-
-# 7) integration: run_ai_checks_batch — a dropped finding disappears from the returned dict[int,
-# list[dict]], an idx that ends up with zero surviving findings disappears from the dict entirely (matches
-# group_batch_findings' own invariant), and a DIFFERENT idx's untouched findings are unaffected.
-_int_batch_calls = []
-
-
-async def _fake_call_claude_review_integration_batch(prompt, model=None):
-    _int_batch_calls.append(prompt)
-    if "Находки для перепроверки" in prompt:
-        return "1: региональный вариант, не настоящая ошибка", {"input_tokens": 12, "output_tokens": 6}, "end_turn"
-    if prompt.startswith("Ты — опытный редактор переводов"):
-        return "проблем не найдено", {"input_tokens": 10, "output_tokens": 3}, "end_turn"
-    return (
-        '[{"row": 1, "type": "typo", "severity": "medium", "message": "сомнительная опечатка"},'
-        '{"row": 2, "type": "typo", "severity": "medium", "message": "настоящая опечатка"}]',
-        {"input_tokens": 50, "output_tokens": 20}, "end_turn",
-    )
-
-
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_review_integration_batch
-_int_batch_findings, _int_batch_cost, _int_batch_trunc, _int_batch_warnings = asyncio.run(_run_ai_checks_batch_direct(
-    [
-        {"context": "", "source": "a", "translation": "b"},
-        {"context": "", "source": "c", "translation": "d"},
-    ],
-    ["typo"], target_lang="ru", source_lang="en",
-))
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
-assert 0 not in _int_batch_findings, (
-    f"idx 0's only finding was dropped by review, so idx 0 must disappear from the returned dict entirely, "
-    f"not survive as idx 0: [] — got {_int_batch_findings}"
-)
-assert _int_batch_findings[1] == [{"type": "typo", "severity": "medium", "message": "настоящая опечатка"}], (
-    _int_batch_findings
-)
-assert not _int_batch_trunc
-print("[OK] run_ai_checks_batch integration: a dropped finding disappears from the returned dict[int, "
-      "list[dict]], the now-empty idx disappears from the dict entirely rather than lingering as an empty "
-      "list, and a different idx's own untouched finding survives completely unaffected")
-
-# 8) no ANTHROPIC_API_KEY configured -> _review_findings degrades gracefully (no crash) — same
-# no-key-configured pattern already proven for the Step 1 ensemble above. _call_claude itself already
-# no-ops without a key (returns (None, {}, None)), so this should just work, but Александр explicitly
-# cares about this safety property, so it gets its own direct assertion rather than being left implicit.
-assert settings.ANTHROPIC_API_KEY == ""
-claude_client_mod._call_claude = _previous_call_claude  # the REAL _call_claude, not any fake
-_nokey_review_out, _nokey_review_cost = asyncio.run(
-    _review_findings_direct(_review_items, _one_eligible, ["typo"])
-)
-assert _nokey_review_out == _one_eligible, (
-    f"with no ANTHROPIC_API_KEY configured, _review_findings must degrade to a no-op (nothing dropped, "
-    f"since _call_claude itself returns no usable text) rather than crashing — got {_nokey_review_out}"
-)
-assert _nokey_review_cost == 0.0, _nokey_review_cost
-print("[OK] _review_findings: with no ANTHROPIC_API_KEY configured, degrades gracefully to a no-op (no "
-      "crash, nothing dropped, cost 0.0) instead of failing — the same safety property already proven for "
-      "the rest of the AI-check pipeline")
 
 # --- app.model_comparison: the standalone model-comparison diagnostic ---
 # Built in direct response to Александр's "1 раз на sonnet и после 3 на
