@@ -1972,6 +1972,34 @@ print("[OK] «непереводимые термины»: a name/brand fully re
       "document — while a grammatical ending attached to a term left in its OWN original spelling stays "
       "exempt, so the original 'Grand Prix left correctly untouched' self-contradiction can't come back")
 
+# --- untranslatable, take three: Александр's real feedback (2026-09-24,
+# re-running the same Hindi/Hinglish file a second time) — a Step 2 run
+# flagged "FS" (the project's own established abbreviation for "free
+# spins", left untranslated on purpose) as "неполнота перевода" on one row,
+# while the very same untranslated "FS" went completely unflagged on two
+# OTHER rows of the identical document — a direct self-contradiction, the
+# same shape as the original "Grand Prix" bug above, just for an
+# abbreviation rather than a brand/tournament name. The "untranslatable"
+# category used to only name proper-noun-ish categories (tournaments,
+# brands, marketing words) — nothing in its wording obviously covered a
+# plain English acronym, so the model fell through to treating it as a
+# missed-translation "completeness" finding instead of recognizing it as
+# the same kind of intentionally-preserved term "Grand Prix" already gets.
+# Broadened to explicitly name established project abbreviations, with a
+# concrete worked example (FS / free spins) showing the SAME source can
+# use both the abbreviated and spelled-out form in different rows without
+# contradiction — each pair should mirror whichever form IT actually has. ---
+assert "устоявшиеся сокращения/аббревиатуры проекта" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "FS" in CHECK_LABELS["untranslatable"] and "free spins" in CHECK_LABELS["untranslatable"], (
+    CHECK_LABELS["untranslatable"]
+)
+assert "устоявшимся сокращениям вроде «FS»" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+print("[OK] «непереводимые термины» now also explicitly covers established project abbreviations left "
+      "untranslated on purpose (e.g. «FS» for «free spins»), so a real case Александр hit — 'FS' flagged as "
+      "an incomplete translation on one row while identical untranslated 'FS' went unflagged on two other "
+      "rows of the same document — routes to the 'always correct, never a finding' untranslatable-term rule "
+      "instead of «неполнота перевода», which now explicitly excludes it too")
+
 # --- completeness: Александр's real feedback (2026-09-17) — the check was
 # missing cases where a whole sentence/chunk of the source was dropped
 # from the translation entirely (not left in the source language, just
@@ -2092,11 +2120,15 @@ _squeeze_test_prompts = {"typo": [], "register": []}
 
 async def _fake_call_claude_records_prompt_typo(prompt, model=None):
     _squeeze_test_prompts["typo"].append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
 
 
 async def _fake_call_claude_records_prompt_register(prompt, model=None):
     _squeeze_test_prompts["register"].append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]', {"input_tokens": 10, "output_tokens": 5}, "end_turn"
 
 
@@ -2283,6 +2315,27 @@ print("[OK] _resolve_repeated_findings: the internal row-index list is turned in
       "(the finding's own row named inside its own \"_also_idx\") is correctly excluded rather than making "
       "a row's message claim it also repeats in itself")
 
+# A finding that Step 3 scoring (app.claude_client._score_findings) already annotated — its message ends
+# in "... [Оценка валидности: N%]" — runs through _resolve_repeated_findings AFTER scoring in every real
+# pipeline path (run_ai_checks_batch, called inside _run_ai_chunks, runs first; _resolve_repeated_findings
+# runs on the merged result afterward). Found by review: a naive append would sandwich the "также в
+# строках" note in the middle of the message, ahead of the validity score, instead of leaving the score
+# as the visibly LAST thing a manager reads. The percentage must be peeled off and reattached at the end.
+_rrf_scored = _resolve_repeated_findings(
+    {0: [{"type": "untranslatable", "severity": "medium",
+          "message": "Повторяется по всему документу: ... [Оценка валидности: 80%]", "_also_idx": [2, 4]}]},
+    _rrf_rows,
+)
+assert _rrf_scored[0][0]["message"] == (
+    "Повторяется по всему документу: ... (также в строках: 9, 20) [Оценка валидности: 80%]"
+), (
+    f"the validity-score annotation must stay the visibly LAST part of the message, not get sandwiched "
+    f"ahead of the \"также в строках\" note — got {_rrf_scored}"
+)
+print("[OK] _resolve_repeated_findings: a message Step 3 scoring already annotated with a trailing "
+      "\"[Оценка валидности: N%]\" keeps that annotation last — the \"также в строках\" note is inserted "
+      "before it, not appended after it and sandwiching it in the middle")
+
 # --- end-to-end through the live multi-check path: a mocked batch
 # response using "rows" for one repeated problem (rows 1 and 3) plus an
 # ordinary "row" finding (row 2) — the repeated one must be attached to
@@ -2293,6 +2346,8 @@ from app.excel_multi import _check_language_for_sheet
 
 
 async def _fake_call_claude_repeated_batch(prompt, model=None):
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return (
         '[{"row": 2, "type": "typo", "severity": "low", "message": "мелкая опечатка только здесь"},'
         '{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
@@ -2418,6 +2473,8 @@ _chunk_structured_call_count = {"n": 0}
 
 async def _fake_call_claude_chunked(prompt, model=None):
     _chunk_call_prompts.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "проблем не найдено", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
     _chunk_structured_call_count["n"] += 1
@@ -2452,7 +2509,11 @@ _chunk_out, _chunk_cost = asyncio.get_event_loop().run_until_complete(
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_chunk_call_prompts) == 4, "expected exactly 4 AI calls — 2 chunks x (search step + structured step)"
+assert len(_chunk_call_prompts) == 6, (
+    "expected exactly 6 AI calls — 2 chunks x (search step + structured step + review step) — both chunks' "
+    "structured findings are medium-severity real types (untranslatable), so Step 3's review pass fires for "
+    "each chunk on top of the two-step pipeline's own search+structured calls"
+)
 assert _chunk_structured_call_count["n"] == 2, "expected exactly 2 structured-step AI calls — one per chunk"
 _chunk_by_row = {r["excel_row"]: r["findings"] for r in _chunk_out}
 # first chunk's repeat: local rows 1 and 3 -> global indices 0 and 2 -> excel_row 100 and 102
@@ -2500,6 +2561,8 @@ _hard_chunk_calls = {"n": 0}
 
 async def _fake_call_claude_count_calls(prompt, model=None):
     _hard_chunk_calls["n"] += 1
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return "[]", {"input_tokens": 20, "output_tokens": 5}, "end_turn"
 
 
@@ -2716,6 +2779,8 @@ captured_prompts = []
 
 async def _fake_call_claude(prompt, model=None):
     captured_prompts.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     # Simulates a model that ignores "проверяй только typo" and
     # reports an untranslatable-text issue anyway.
     text = (
@@ -2734,12 +2799,19 @@ findings, ai_cost = asyncio.get_event_loop().run_until_complete(
 assert findings == [raw_findings[0]], findings
 assert ai_cost > 0, ai_cost
 # The JSON schema shown to the model is also scoped down to just the
-# requested check(s), not a fixed always-all list. captured_prompts[-1] —
-# not [0] — since run_ai_checks now makes an extra Step 1 search call
-# first (see FINDINGS_SEARCH_PROMPT's own comment), which carries no JSON
-# schema line at all.
+# requested check(s), not a fixed always-all list. Searched across ALL
+# captured prompts (not just one fixed index) — run_ai_checks now makes
+# up to three calls (Step 1 search, Step 2 structured, Step 3 scoring; see
+# FINDINGS_SEARCH_PROMPT's and FINDINGS_VALIDITY_PROMPT's own comments), and
+# only Step 2's own SINGLE_PROMPT actually carries a '"type": ...,
+# "severity": ...' JSON schema line — Step 1/Step 3's free-text prompts
+# never do, so this naturally finds the right one regardless of how many
+# extra calls surround it.
 type_enum_line = next(
-    line for line in captured_prompts[-1].splitlines() if '"type":' in line and '"severity":' in line
+    line
+    for a_prompt in captured_prompts
+    for line in a_prompt.splitlines()
+    if '"type":' in line and '"severity":' in line
 )
 assert "typo" in type_enum_line and "untranslatable" not in type_enum_line, type_enum_line
 print("[OK] AI findings hard-filtered to requested checks even when the model reports "
@@ -2774,6 +2846,8 @@ assert _filter_findings_by_checks(_other_raw_findings, ["typo"]) == _other_raw_f
 
 
 async def _fake_call_claude_other_type(prompt, model=None):
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return (
         '[{"type": "typo", "severity": "medium", "message": "обычная опечатка"},'
         '{"type": "other", "severity": "high", "message": "явная ошибка смысла вне списка проверок"}]',
@@ -2821,6 +2895,8 @@ print("[OK] parse_json_array: a JSON array cut off mid-object (max_tokens trunca
 
 
 async def _fake_call_claude_truncated(prompt, model=None):
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return ('[{"type": "typo", "severity": "medium", "message": "неверная валюта"}]',
             {"input_tokens": 500, "output_tokens": 100}, "max_tokens")
 
@@ -3094,6 +3170,8 @@ print("[OK] build_register_report: everywhere-the-same reports just the bare wor
 # the raw register_value entry itself never leaks into the visible
 # findings (it's not a real problem, so it must never look like one) ---
 async def _fake_call_claude_register_single(prompt, model=None):
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     assert REGISTER_VALUE_TYPE in prompt
     return (
         f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal", "message": ""}}]',
@@ -3160,6 +3238,8 @@ _reg_sheet = {
 
 
 async def _fake_call_claude_register_batch(prompt, model=None):
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     assert REGISTER_VALUE_TYPE in prompt
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
@@ -3242,6 +3322,8 @@ from app.claude_client import REGISTER_MIXED_TYPE
 
 
 async def _fake_call_claude_register_mixed_single(prompt, model=None):
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return (
         f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
         {"input_tokens": 10, "output_tokens": 10},
@@ -3270,6 +3352,8 @@ print("[OK] standalone /check: a single pair the model reports as internally mix
 # "везде на «вы»" with no exceptions at all, as if row 3 didn't exist for
 # that purpose).
 async def _fake_call_claude_register_mixed_batch(prompt, model=None):
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
         '{"row": 2, "type": "register_value", "severity": "low", "value": "mixed", "message": ""},'
@@ -4133,6 +4217,8 @@ _two_step_prompts: list[str] = []
 
 async def _fake_call_claude_two_step(prompt, model=None):
     _two_step_prompts.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: пропущено отрицание в переводе", {"input_tokens": 30, "output_tokens": 10}, "end_turn"
     return (
@@ -4149,7 +4235,10 @@ _two_step_findings, _two_step_cost, _two_step_trunc, _two_step_warnings = asynci
 ))
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert len(_two_step_prompts) == 2, "expected exactly 2 calls — the search step, then the structured step"
+assert len(_two_step_prompts) == 3, (
+    "expected exactly 3 calls — the search step, the structured step, then Step 3's review step (the "
+    "structured step's own finding is medium-severity typo, a real reviewable type, so review fires too)"
+)
 assert _two_step_prompts[0].startswith("Ты — опытный редактор переводов"), "Step 1 (search) must run FIRST"
 assert "пропущено отрицание в переводе" in _two_step_prompts[1], (
     "Step 1's candidate must actually reach Step 2's own structured prompt text, not just be computed and "
@@ -4185,6 +4274,8 @@ _reg_only_prompts: list[str] = []
 
 async def _fake_call_claude_reg_only_two_step(prompt, model=None):
     _reg_only_prompts.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]',
         {"input_tokens": 10, "output_tokens": 5}, "end_turn",
@@ -4218,6 +4309,8 @@ _override_seen_models = []
 
 async def _fake_call_claude_records_model(prompt, model=None):
     _override_seen_models.append(model)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     return "[]", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
 
 
@@ -4450,6 +4543,8 @@ _e2e_openai_calls: list[str] = []
 
 async def _fake_call_claude_e2e_ensemble(prompt, model=None):
     _e2e_claude_calls.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: sonnet видит пропуск", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
     return (
@@ -4475,7 +4570,10 @@ claude_client_mod._call_claude = _previous_call_claude
 claude_client_mod._call_openai = _previous_call_openai
 settings.ANTHROPIC_API_KEY = ""
 settings.OPENAI_API_KEY = ""
-assert len(_e2e_claude_calls) == 2, "Sonnet: Step 1 search + Step 2 structured check"
+assert len(_e2e_claude_calls) == 3, (
+    "Sonnet: Step 1 search + Step 2 structured check + Step 3 review (the structured step's own finding is "
+    "medium-severity typo, a real reviewable type, so review fires too — GPT is never involved in Step 3)"
+)
 assert len(_e2e_openai_calls) == 1, "GPT: only Step 1 search — Step 2 stays Sonnet-only, per Александр's ask"
 assert "sonnet видит пропуск" in _e2e_claude_calls[1] and "gpt тоже видит пропуск" in _e2e_claude_calls[1], (
     "both models' Step 1 candidates must reach Step 2's own structured prompt text"
@@ -4496,6 +4594,8 @@ _e2e_warn_claude_calls: list[str] = []
 
 async def _fake_call_claude_e2e_warn(prompt, model=None):
     _e2e_warn_claude_calls.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "все находки подтверждены", {}, None
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: sonnet видит пропуск", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
     return (
@@ -4598,6 +4698,355 @@ assert len(_both_warnings) == 2 and _both_labels == {"Sonnet", "GPT"}, _both_war
 print("[OK] _ensemble_search_findings: when BOTH configured branches fail at once, BOTH warnings are "
       "returned together (not just one), while the check itself still completes with empty Step 1 "
       "candidates rather than crashing")
+
+# --- Step 3: FINDINGS_VALIDITY_PROMPT / _score_eligible_types / ---------
+# _score_findings — a fresh, skeptical second look at Step 2's own
+# already-decided findings, hunting specifically for false positives
+# (regional/dialectal variation, informal-register looseness, a factually
+# wrong grammar rule on the checker's own part), modeled on Александр
+# getting much better results by pasting a raw report back to Claude in
+# chat and asking "is this fair" than the structured pipeline gave alone.
+# Originally shipped as a binary drop (commit a7d7cff); Александр then
+# asked for a percentage validity score instead of a silent removal, and
+# chose to keep everything visible for now ("давай пока что показывать
+# всё, потом посмотрим") — so this pass now only ANNOTATES, never removes.
+# See FINDINGS_VALIDITY_PROMPT's own comment in app.claude_client for the
+# full rationale, including why "Важно"/high-severity findings are now
+# scored too instead of being carved out.
+from app.claude_client import _score_findings as _score_findings_direct
+from app.claude_client import _score_eligible_types as _score_eligible_types_direct
+from app.claude_client import FINDINGS_VALIDITY_PROMPT
+
+assert "Находки для оценки" in FINDINGS_VALIDITY_PROMPT, (
+    "FINDINGS_VALIDITY_PROMPT's rendered text must always contain this literal section-header substring — "
+    "it's the one reliable way the rest of the pipeline (and every fake _call_claude in this file) tells a "
+    "Step 3 scoring call apart from a Step 1/Step 2 call"
+)
+
+# 1) _score_eligible_types: never register_value/register_summary/system, always the real CHECK_LABELS-
+# derived types (+OTHER_TYPE) _allowed_ai_types would allow for the same checks — severity plays NO part in
+# eligibility any more (unlike the old binary-drop _review_eligible_types, which also excluded "high").
+_elig_typo = _score_eligible_types_direct(["typo"])
+assert _elig_typo == _allowed_ai_types(["typo"]) - {REGISTER_VALUE_TYPE} == {"typo", OTHER_TYPE}, _elig_typo
+_elig_multi = _score_eligible_types_direct(["typo", "untranslatable", "register"])
+assert _elig_multi == _allowed_ai_types(["typo", "untranslatable", "register"]) - {REGISTER_VALUE_TYPE}, _elig_multi
+assert "register_value" not in _elig_multi and "register_summary" not in _elig_multi and "system" not in _elig_multi, (
+    f"the platform's own synthetic/meta types must never be eligible for scoring, no matter which real "
+    f"checks are selected — got {_elig_multi}"
+)
+# a register-only run has NOTHING eligible at all — _allowed_ai_types(["register"]) is exactly
+# {register_value}, and that's the one type scoring is never allowed to touch
+_elig_reg_only = _score_eligible_types_direct(["register"])
+assert _elig_reg_only == set(), _elig_reg_only
+print("[OK] _score_eligible_types: never includes register_value/register_summary/system regardless of "
+      "which checks are selected, always includes the real CHECK_LABELS-derived types (+\"other\") "
+      "_allowed_ai_types would allow REGARDLESS of severity, and a register-only run has nothing eligible "
+      "at all")
+
+_review_items = [
+    {"context": "", "source": "a", "translation": "b"},
+    {"context": "", "source": "c", "translation": "d"},
+]
+
+
+async def _fake_call_claude_score_poison(prompt, model=None):
+    raise AssertionError("_score_findings must make NO API call at all when nothing is eligible for scoring")
+
+
+# 2a) every finding a synthetic type (register_value) -> nothing eligible -> unchanged, zero calls. Unlike
+# the old binary-drop step, a high-severity REAL-type finding is no longer a reason to skip scoring on its
+# own any more — only a synthetic type is (see test 4 below for the contrast).
+_no_elig_synthetic = {0: [{"type": "register_value", "severity": "low", "value": "formal", "message": ""}]}
+claude_client_mod._call_claude = _fake_call_claude_score_poison
+_no_elig_synth_out, _no_elig_synth_cost = asyncio.run(
+    _score_findings_direct(_review_items, _no_elig_synthetic, ["typo", "register"])
+)
+claude_client_mod._call_claude = _previous_call_claude
+assert _no_elig_synth_out == _no_elig_synthetic, _no_elig_synth_out
+assert _no_elig_synth_cost == 0.0, _no_elig_synth_cost
+print("[OK] _score_findings: with nothing eligible at all (every finding a synthetic type) returns the "
+      "input dict UNCHANGED with cost 0.0 and makes ZERO API calls — a poison fake that raises if ever "
+      "invoked proves it, not just a lucky no-op response")
+
+# 2b) a synthetic-type finding on one row and a real-type finding on another -> the real one IS eligible, so
+# a call still happens, the synthetic one is left completely alone, and only the real one is sent/annotated.
+_mixed_elig = {
+    0: [{"type": "register_value", "severity": "low", "value": "informal", "message": ""}],
+    1: [{"type": "typo", "severity": "medium", "message": "под вопросом"}],
+}
+_mixed_elig_prompts = []
+
+
+async def _fake_call_claude_score_mixed_elig(prompt, model=None):
+    _mixed_elig_prompts.append(prompt)
+    return "1: 30", {"input_tokens": 10, "output_tokens": 5}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_score_mixed_elig
+_mixed_elig_out, _mixed_elig_cost = asyncio.run(
+    _score_findings_direct(_review_items, _mixed_elig, ["typo", "register"])
+)
+claude_client_mod._call_claude = _previous_call_claude
+assert "register_value" not in _mixed_elig_prompts[0] and "под вопросом" in _mixed_elig_prompts[0], (
+    "only the real-type (typo) finding should ever be sent to scoring — the synthetic register_value "
+    "finding must never appear in the prompt text at all"
+)
+assert _mixed_elig_out[0] == _mixed_elig[0], "the synthetic-type finding must be completely untouched"
+assert _mixed_elig_out[1][0]["validity_percent"] == 30, _mixed_elig_out
+assert _mixed_elig_cost > 0, _mixed_elig_cost
+print("[OK] _score_findings: a synthetic-type finding sharing a batch with a real-type one is left "
+      "completely alone (never sent, never annotated) while the real-type one is still sent and scored "
+      "normally")
+
+# 3) an eligible (medium-severity, real-type) finding, scoring response says "1: 5" -> that exact finding
+# gains a validity_percent field AND a visible annotation appended to its own message, cost reflects the
+# fake's own usage, and nothing is ever removed from the dict.
+_one_eligible = {0: [{"type": "typo", "severity": "medium", "message": "сомнительная опечатка"}]}
+
+
+async def _fake_call_claude_score_one(prompt, model=None):
+    assert "Находки для оценки" in prompt
+    return "1: 5", {"input_tokens": 25, "output_tokens": 12}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_score_one
+_score_out, _score_cost = asyncio.run(_score_findings_direct(_review_items, _one_eligible, ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+assert 0 in _score_out and len(_score_out[0]) == 1, (
+    f"scoring must never remove a finding, only annotate it — got {_score_out}"
+)
+assert _score_out[0][0]["validity_percent"] == 5, _score_out
+assert _score_out[0][0]["message"] == "сомнительная опечатка [Оценка валидности: 5%]", (
+    f"the percentage must also be appended to the finding's own visible \"message\" text, since this "
+    f"session has no access to the separate frontend repo to add a new field the UI would render — got "
+    f"{_score_out}"
+)
+_score_expected_cost = _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 25, "output_tokens": 12})
+assert abs(_score_cost - _score_expected_cost) < 1e-9, (_score_cost, _score_expected_cost)
+print("[OK] _score_findings: an eligible finding named by number in the scoring response gains a "
+      "\"validity_percent\" field AND a matching visible annotation on its own \"message\" text, stays "
+      "exactly where it was in the returned dict (nothing removed), and the returned cost reflects the "
+      "scoring call's own real usage")
+
+# 4) a "Важно"/high-severity finding sharing a batch with a medium one: unlike the old binary-drop step,
+# BOTH must now actually be SENT to the scoring prompt and BOTH get annotated — high severity is no longer
+# a reason to hide a finding from this pass, since nothing this pass does can make a finding vanish any more.
+_mixed_severity = {0: [
+    {"type": "typo", "severity": "high", "message": "критичная опечатка"},
+    {"type": "typo", "severity": "medium", "message": "мелкая опечатка под сомнением"},
+]}
+_mixed_severity_prompts = []
+
+
+async def _fake_call_claude_score_high_included(prompt, model=None):
+    _mixed_severity_prompts.append(prompt)
+    return "1: 95\n2: 20", {"input_tokens": 10, "output_tokens": 5}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_score_high_included
+_mixed_out, _mixed_cost = asyncio.run(_score_findings_direct(_review_items, _mixed_severity, ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+assert "критичная опечатка" in _mixed_severity_prompts[0], (
+    "a Важно/high-severity finding must now be SENT to Step 3 scoring same as any other eligible finding — "
+    "nothing this pass does can remove it any more, so there's no reason left to hide it from the prompt"
+)
+assert "мелкая опечатка под сомнением" in _mixed_severity_prompts[0]
+assert _mixed_out[0][0]["validity_percent"] == 95 and _mixed_out[0][1]["validity_percent"] == 20, _mixed_out
+assert len(_mixed_out[0]) == 2, "scoring must never remove either finding — got " + str(_mixed_out)
+print("[OK] _score_findings: a \"Важно\"/high-severity finding sharing a batch with a medium one is now "
+      "SENT to scoring and annotated exactly like any other eligible finding (confirmed by inspecting what "
+      "the fake actually received) — both findings always survive, since scoring alone can never remove one")
+
+# 5) an out-of-range number is silently ignored, and a partial response that only scores SOME of the
+# eligible findings leaves the unmatched finding(s) completely untouched (fail-open) rather than crashing or
+# guessing.
+_partial_findings = {0: [
+    {"type": "typo", "severity": "medium", "message": "первая находка"},
+    {"type": "typo", "severity": "low", "message": "вторая находка"},
+]}
+
+
+async def _fake_call_claude_score_partial(prompt, model=None):
+    # "99" doesn't correspond to any real finding number and must be ignored; only #1 gets a real score,
+    # #2 is left out of the response entirely.
+    return "99: несуществующий номер\n1: 80", {"input_tokens": 10, "output_tokens": 5}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_score_partial
+_partial_out, _ = asyncio.run(_score_findings_direct(_review_items, _partial_findings, ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+assert _partial_out[0][0]["validity_percent"] == 80, _partial_out
+assert _partial_out[0][0]["message"] == "первая находка [Оценка валидности: 80%]", _partial_out
+assert "validity_percent" not in _partial_out[0][1], (
+    f"a finding the scoring response never mentions must be left completely untouched, not given a "
+    f"default/guessed score — got {_partial_out}"
+)
+assert _partial_out[0][1]["message"] == "вторая находка", _partial_out
+print("[OK] _score_findings: an out-of-range finding number in the response is silently ignored, and a "
+      "finding the response simply never mentions is left completely untouched (no field added, message "
+      "unchanged) rather than being guessed at or crashing the rest of the response")
+
+# 6) percentages are clamped to [0, 100] even if the model returns something outside that range, and the
+# old "все находки подтверждены"-style sentinel / any other non-matching text scores nothing at all.
+_clamp_findings = {0: [{"type": "typo", "severity": "low", "message": "мелочь"}]}
+
+
+async def _fake_call_claude_score_over_100(prompt, model=None):
+    return "1: 150", {"input_tokens": 8, "output_tokens": 4}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_score_over_100
+_clamp_out, _ = asyncio.run(_score_findings_direct(_review_items, _clamp_findings, ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+assert _clamp_out[0][0]["validity_percent"] == 100, _clamp_out
+
+# a negative-looking percentage ("-20") must clamp to 0, not have its sign silently stripped and be stored
+# as a positive 20 — _PERCENT_RE must capture the leading "-" so int() sees the real negative value
+_negative_findings = {0: [{"type": "typo", "severity": "low", "message": "мелочь"}]}
+
+
+async def _fake_call_claude_score_negative(prompt, model=None):
+    return "1: -20", {"input_tokens": 8, "output_tokens": 4}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_score_negative
+_negative_out, _ = asyncio.run(_score_findings_direct(_review_items, _negative_findings, ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+assert _negative_out[0][0]["validity_percent"] == 0, (
+    f"a negative percentage like \"-20\" must clamp to 0, not have its minus sign silently dropped and "
+    f"land as a positive 20 — got {_negative_out}"
+)
+
+_sentinel_input = {0: [{"type": "typo", "severity": "low", "message": "мелочь"}]}
+
+
+async def _fake_call_claude_score_sentinel(prompt, model=None):
+    return "все находки подтверждены", {"input_tokens": 8, "output_tokens": 4}, "end_turn"
+
+
+async def _fake_call_claude_score_garbage(prompt, model=None):
+    return "это вообще не в формате NUMBER: PERCENT", {"input_tokens": 8, "output_tokens": 4}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_score_sentinel
+_sentinel_out, _ = asyncio.run(_score_findings_direct(_review_items, _sentinel_input, ["typo"]))
+claude_client_mod._call_claude = _fake_call_claude_score_garbage
+_garbage_out, _ = asyncio.run(_score_findings_direct(_review_items, _sentinel_input, ["typo"]))
+claude_client_mod._call_claude = _previous_call_claude
+assert _sentinel_out == _sentinel_input, _sentinel_out
+assert _garbage_out == _sentinel_input, _garbage_out
+print("[OK] _score_findings: a percentage outside [0, 100] is clamped rather than stored verbatim, and "
+      "text that doesn't parse as \"NUMBER: PERCENT\" lines at all (a stray sentinel, or genuine garbage) "
+      "correctly scores nothing")
+
+# 7) integration: run_ai_checks (single-pair) end-to-end — Step 2's real JSON on the structured call, then
+# a scoring response (detected via FINDINGS_VALIDITY_PROMPT's own marker, not call order/count, since the
+# search call happens to share Step 3's opening words) — confirms the score actually reaches run_ai_checks's
+# own returned findings list (both the field and the message annotation), the finding is NOT removed, and
+# cost includes every call's usage.
+_int_single_calls = []
+
+
+async def _fake_call_claude_score_integration_single(prompt, model=None):
+    _int_single_calls.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "1: 65", {"input_tokens": 15, "output_tokens": 8}, "end_turn"
+    if prompt.startswith("Ты — опытный редактор переводов"):
+        return "проблем не найдено", {"input_tokens": 10, "output_tokens": 3}, "end_turn"
+    return (
+        '[{"type": "typo", "severity": "medium", "message": "опечатка под сомнением"}]',
+        {"input_tokens": 40, "output_tokens": 15}, "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_score_integration_single
+_int_single_findings, _int_single_cost = asyncio.run(run_ai_checks(
+    "source text", "translation text", ["typo"], target_lang="ru",
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert len(_int_single_findings) == 1, (
+    f"Step 3 scoring must never remove run_ai_checks's own finding — got {_int_single_findings}"
+)
+assert _int_single_findings[0]["validity_percent"] == 65, _int_single_findings
+assert _int_single_findings[0]["message"] == "опечатка под сомнением [Оценка валидности: 65%]", (
+    _int_single_findings
+)
+assert len(_int_single_calls) == 3, "search + structured + scoring — got " + str(len(_int_single_calls))
+assert _int_single_cost > 0, _int_single_cost
+print("[OK] run_ai_checks (single-pair) integration: a real Step 2 finding actually gains its validity "
+      "score (both the structured field and the visible message annotation) in run_ai_checks's own "
+      "returned findings list, not just in _score_findings in isolation, stays in the list (nothing "
+      "removed), and the returned cost includes all three calls' usage")
+
+# 8) integration: run_ai_checks_batch — a scored finding keeps its place in the returned dict[int,
+# list[dict]] (an idx never disappears just because Step 3 ran), and a DIFFERENT idx's finding that the
+# scoring response doesn't mention is left completely unannotated.
+_int_batch_calls = []
+
+
+async def _fake_call_claude_score_integration_batch(prompt, model=None):
+    _int_batch_calls.append(prompt)
+    if "Находки для оценки" in prompt:
+        return "1: 10", {"input_tokens": 12, "output_tokens": 6}, "end_turn"
+    if prompt.startswith("Ты — опытный редактор переводов"):
+        return "проблем не найдено", {"input_tokens": 10, "output_tokens": 3}, "end_turn"
+    return (
+        '[{"row": 1, "type": "typo", "severity": "medium", "message": "сомнительная опечатка"},'
+        '{"row": 2, "type": "typo", "severity": "medium", "message": "настоящая опечатка"}]',
+        {"input_tokens": 50, "output_tokens": 20}, "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_score_integration_batch
+_int_batch_findings, _int_batch_cost, _int_batch_trunc, _int_batch_warnings = asyncio.run(_run_ai_checks_batch_direct(
+    [
+        {"context": "", "source": "a", "translation": "b"},
+        {"context": "", "source": "c", "translation": "d"},
+    ],
+    ["typo"], target_lang="ru", source_lang="en",
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert 0 in _int_batch_findings and 1 in _int_batch_findings, (
+    f"scoring must never make an idx disappear from the returned dict — got {_int_batch_findings}"
+)
+assert _int_batch_findings[0][0]["validity_percent"] == 10, _int_batch_findings
+assert _int_batch_findings[0][0]["message"] == "сомнительная опечатка [Оценка валидности: 10%]", (
+    _int_batch_findings
+)
+assert "validity_percent" not in _int_batch_findings[1][0], (
+    f"idx 1's finding was never mentioned by number in the scoring response, so it must stay completely "
+    f"unannotated — got {_int_batch_findings}"
+)
+assert _int_batch_findings[1][0]["message"] == "настоящая опечатка", _int_batch_findings
+assert not _int_batch_trunc
+print("[OK] run_ai_checks_batch integration: a scored finding keeps its place in the returned dict[int, "
+      "list[dict]] with both the field and the message annotation applied, no idx ever disappears just "
+      "because Step 3 ran, and a different idx's finding the scoring response doesn't mention stays "
+      "completely unannotated")
+
+# 9) no ANTHROPIC_API_KEY configured -> _score_findings degrades gracefully (no crash) — same
+# no-key-configured pattern already proven for the Step 1 ensemble above. _call_claude itself already
+# no-ops without a key (returns (None, {}, None)), so this should just work, but Александр explicitly
+# cares about this safety property, so it gets its own direct assertion rather than being left implicit.
+_nokey_input = {0: [{"type": "typo", "severity": "medium", "message": "проверка без ключа"}]}
+assert settings.ANTHROPIC_API_KEY == ""
+claude_client_mod._call_claude = _previous_call_claude  # the REAL _call_claude, not any fake
+_nokey_score_out, _nokey_score_cost = asyncio.run(
+    _score_findings_direct(_review_items, _nokey_input, ["typo"])
+)
+assert _nokey_score_out == _nokey_input, (
+    f"with no ANTHROPIC_API_KEY configured, _score_findings must degrade to a no-op (nothing annotated, "
+    f"since _call_claude itself returns no usable text) rather than crashing — got {_nokey_score_out}"
+)
+assert "validity_percent" not in _nokey_score_out[0][0], _nokey_score_out
+assert _nokey_score_cost == 0.0, _nokey_score_cost
+print("[OK] _score_findings: with no ANTHROPIC_API_KEY configured, degrades gracefully to a no-op (no "
+      "crash, nothing annotated, cost 0.0) instead of failing — the same safety property already proven "
+      "for the rest of the AI-check pipeline")
 
 # --- app.model_comparison: the standalone model-comparison diagnostic ---
 # Built in direct response to Александр's "1 раз на sonnet и после 3 на

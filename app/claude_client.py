@@ -49,9 +49,14 @@ CHECK_LABELS = {
         "сообщить"
     ),
     "untranslatable": (
-        "непереводимые термины — имена турниров/событий/игр/брендов/продуктов/акций, а также устоявшиеся "
+        "непереводимые термины — имена турниров/событий/игр/брендов/продуктов/акций, устоявшиеся "
         "маркетинговые слова, которые обычно оставляют как есть (например «VIP», «Lootbox», название турнира вроде "
-        "«Grand Prix»). Сильный сигнал, что термин непереводимый: если он уже в САМОМ ИСХОДНИКЕ оставлен нетронутым "
+        "«Grand Prix»), А ТАКЖЕ устоявшиеся сокращения/аббревиатуры проекта на английском, которые в исходнике "
+        "последовательно используются НЕ расшифрованными (например «FS» вместо «free spins» — если в самом "
+        "исходнике рядом также встречается расшифрованный вариант «free spins», это не противоречие: значит, "
+        "источник сам иногда сокращает, а иногда пишет полностью, и перевод должен зеркалить именно то, что стоит "
+        "в конкретной паре — сокращение остаётся сокращением, а расшифровка переводится как обычный текст). Сильный "
+        "сигнал, что термин непереводимый: если он уже в САМОМ ИСХОДНИКЕ оставлен нетронутым "
         "(написан на другом языке/латиницей внутри текста на другом языке/скрипте) — значит, почти наверняка он "
         "должен остаться таким же нетронутым и в переводе, В СВОЁМ ИСХОДНОМ НАПИСАНИИ (тем же алфавитом/письменностью, "
         "что и в исходнике). Сообщай находку, если термин в переводе реально ИЗМЕНЁН: переведён по смыслу, искажён, "
@@ -70,9 +75,9 @@ CHECK_LABELS = {
     "completeness": (
         "неполнота перевода — ЛЮБОЙ случай, когда содержательный кусок исходного текста не дошёл до перевода: (1) "
         "обычные слова/фраза/предложение по ОШИБКЕ остались НЕПЕРЕВЕДЁННЫМИ, просто скопированы внутри перевода как "
-        "есть, хотя должны были быть переведены (это НЕ относится к отдельным именам/брендам/терминам, которые "
-        "правильно оставлены нетронутыми намеренно — за них отвечает отдельная проверка «непереводимые термины», "
-        "и там это не находка); (2) весь перевод "
+        "есть, хотя должны были быть переведены (это НЕ относится к отдельным именам/брендам/терминам/устоявшимся "
+        "сокращениям вроде «FS», которые правильно оставлены нетронутыми намеренно — за них отвечает отдельная "
+        "проверка «непереводимые термины», и там это не находка); (2) весь перевод "
         "сделан на другом языке, чем требуемый целевой (например, вставлен не тот язык, или перевод не изменился с "
         "другого родственного языка); (3) целое предложение, пункт списка или значимый смысловой кусок ПРОПУЩЕН из "
         "перевода целиком — просто отсутствует в переводе в каком бы то ни было виде. Пункт (3) — это НЕ то же самое, "
@@ -632,6 +637,204 @@ async def _ensemble_search_findings(
         warnings.append(_model_branch_search_warning("GPT"))
 
     return merged, sonnet_cost + gpt_cost, warnings
+
+
+# Step 3 of the pipeline, Александр's ask (2026-09-24, generalized from a
+# batch of real per-language false positives he'd caught by hand — French
+# "au calendrier" vs "du calendrier", a Turkish vowel-harmony "error" on a
+# loanword that's actually a known exception, Mexican Spanish "jugar golf"
+# without "al", several Hinglish findings graded against formal Hindi
+# grammar instead of its own looser, code-mixed norms): he wants the SAME
+# kind of second look he got when he pasted a raw report back to Claude
+# directly and asked "is this fair" — where a fresh, specifically skeptical
+# read caught most of Step 2's findings as false positives — built into the
+# pipeline itself, for every language, instead of Claude hand-writing one
+# narrow per-language/per-term prompt carve-out at a time forever
+# (GRAMMAR_LANGUAGE_HINTS, _RU_TERM_SYNONYMS_NOTE — both stay, they're
+# still cheap and still correct, this doesn't replace them).
+#
+# Deliberately a SEPARATE pass over Step 2's own output, not a stricter
+# Step 2 calibration bar — CALIBRATION_STRICT_OPENING's "report even when
+# not 100% sure" instruction stays exactly as it is, because that's what
+# fixed the opposite failure (Step 2 silently missing the real Kyrgyz
+# "{{amount}} баштап" case-ending error under the old, more cautious
+# wording — see that constant's own history). Softening Step 2 itself would
+# reintroduce that exact risk. This step only removes a finding when the
+# model, looking again with fresh framing, is CONFIDENT it is NOT a real
+# problem (a legitimate regional/dialectal variant, an accepted alternate
+# spelling, informal-register looseness, or a factually wrong grammar rule
+# on the checker's own part) — genuine uncertainty ("might be real, might
+# not") is explicitly told to survive review unchanged, same bias toward
+# showing too much rather than hiding something real that Step 1/Step 2
+# already have.
+#
+# Originally shipped (2026-09-24, commit a7d7cff) as a binary drop: the
+# model silently removed findings it was confident weren't real, same
+# show-too-much-rather-than-hide-something-real bias as Step 1/Step 2, just
+# applied in reverse. Александр then asked for a percentage validity score
+# instead of a silent removal ("оставить отчёт в том же виде... чтобы ты
+# также ставил оценку валидности правки в процентах") — asked whether that
+# score should replace the drop or sit alongside it for survivors, he chose
+# to keep everything visible for now ("давай пока что показывать всё, потом
+# посмотрим"). So as of 2026-09-24 this pass no longer removes anything:
+# every eligible finding keeps its place in the report and gains a 0-100
+# validity percentage instead, both as a structured field and as text
+# appended to the finding's own "message" (there's no access to the
+# separate frontend repo from here, so the message string is the only way
+# to guarantee Александр actually sees the score without a frontend
+# change).
+#
+# Still never offered the platform's own synthetic types
+# (register_value/register_summary/system) — see _score_eligible_types —
+# those aren't judgment calls about translation quality, a percentage has
+# nothing meaningful to attach to them. "Важно"/high-severity findings,
+# which the old drop mechanism always protected from removal, are now
+# scored like everything else — scoring can no longer make anything vanish,
+# so the original reason for that carve-out (never let the highest-stakes
+# findings disappear) no longer applies.
+FINDINGS_VALIDITY_PROMPT = """Ты — опытный редактор переводов, отвечающий за качество уже готового отчёта о найденных проблемах.
+Ниже даны пары (исходный текст, перевод) и находки, которые уже нашла другая, более осторожная проверка по каждой
+паре. Твоя задача — не искать новые проблемы, а оценить свежим взглядом, насколько КАЖДАЯ уже найденная находка
+действительно является настоящей проблемой, специально ища причины усомниться в ней: не является ли это на самом
+деле нормальным региональным/разговорным вариантом языка, устоявшимся альтернативным написанием, естественной
+интерпретацией, полностью сохраняющей смысл исходника, или сама находка не основана ли на фактически неверном
+грамматическом правиле.
+
+{target_lang_line}
+
+{source_lang_note}
+
+Находки для оценки:
+{items_block}
+
+Для КАЖДОЙ находки из списка выше, без исключений, напиши отдельную строку в формате:
+NUMBER: PERCENT
+где NUMBER — номер находки, а PERCENT — целое число от 0 до 100: твоя оценка того, насколько это настоящая
+проблема. 0 значит ты полностью уверен(а), что это НЕ настоящая проблема (нормальный вариант/адаптация/ошибочное
+правило у самой проверки), 100 значит ты полностью уверен(а), что это настоящая проблема, а промежуточные значения
+— когда сомневаешься сам(а). Не бойся ставить среднее значение (например 40 или 60), если не уверен(а) — это
+честный ответ. Не используй JSON, markdown, вступления или заключения — только такие строки, по одной на каждую
+находку из списка, в том же порядке."""
+
+
+def _score_eligible_types(checks: list[str]) -> set[str]:
+    """The finding "type" values Step 3 scoring is allowed to touch at all —
+    every real quality-check type Step 2 could have returned, but never the
+    platform's own synthetic/meta types (register_value, register_summary,
+    "system") — those aren't judgment calls about translation quality, so a
+    validity percentage has nothing meaningful to attach to them."""
+    return _allowed_ai_types(checks) - {REGISTER_VALUE_TYPE}
+
+
+def _score_block(entries: list[tuple[int, dict, dict]]) -> str:
+    """entries: [(number, item, finding), ...], 1-based number already
+    assigned by the caller — mirrors _pairs_block's own numbered-block
+    shape, plus the specific already-found finding under each pair being
+    put up for scoring."""
+    parts = []
+    for n, item, finding in entries:
+        parts.append(
+            f'{n}. Контекст: {item["context"] or "—"}\n'
+            f'Источник: """{item["source"]}"""\n'
+            f'Перевод: """{item["translation"]}"""\n'
+            f'Уже найденная проблема — тип «{finding.get("type", "")}», важность «{finding.get("severity", "")}»: '
+            f'{finding.get("message", "")}'
+        )
+    return "\n\n".join(parts)
+
+
+_PERCENT_RE = re.compile(r"-?\d+")
+
+
+def _parse_validity_scores(text_block: str | None, number_to_key: dict[int, tuple]) -> dict[tuple, int]:
+    """Mirrors _parse_search_findings' own free-text "NUMBER: ..." parsing
+    (same _SEARCH_LINE_RE), but instead of collecting a set of findings to
+    drop, pulls the first integer out of each line's remainder and clamps
+    it to [0, 100] as that finding's validity percentage. The numbers here
+    key into number_to_key — (item_index, position_in_its_findings_list), a
+    finding's identity — rather than plain item indices. A line that
+    doesn't parse, has an out-of-range number, or has no digits after the
+    colon is silently skipped — this is free text, not JSON — leaving that
+    one finding unscored (fail-open: _score_findings never touches a
+    finding it has no parsed score for)."""
+    if not text_block:
+        return {}
+    scores: dict[tuple, int] = {}
+    for line in text_block.splitlines():
+        line = line.strip().lstrip("-•* ").strip()
+        if not line:
+            continue
+        m = _SEARCH_LINE_RE.match(line)
+        if not m:
+            continue
+        key = number_to_key.get(int(m.group(1)))
+        if key is None:
+            continue
+        pm = _PERCENT_RE.search(m.group(2))
+        if not pm:
+            continue
+        scores[key] = max(0, min(100, int(pm.group(0))))
+    return scores
+
+
+async def _score_findings(
+    items: list[dict], findings_by_index: dict[int, list[dict]], checks: list[str],
+    target_lang: str = "", source_lang: str = "", model_override: str | None = None,
+) -> tuple[dict[int, list[dict]], float]:
+    """Step 3 of the pipeline — see FINDINGS_VALIDITY_PROMPT's own comment
+    above for the full rationale. Returns (findings_by_index UNCHANGED in
+    both shape and content, 0.0) with NO API call when there's nothing
+    eligible to score (every finding a synthetic type) — same
+    no-point-spending-a-call-on-nothing rationale as _search_findings' own
+    early-out.
+
+    Never removes a finding and never changes which idx keys are present —
+    unlike the old binary-drop pipeline step, this only ANNOTATES: an
+    eligible finding that got a parsed score gains both a
+    "validity_percent" field and a short visible note appended to its own
+    "message" text (see the module comment above for why the message
+    itself carries it). A finding the model didn't return a parseable score
+    for is left exactly as it was — fail-open, one unparsed line never
+    blocks the rest of the report.
+
+    items is keyed exactly like findings_by_index (both by the caller's
+    original item index) — run_ai_checks_batch already has both in that
+    shape; run_ai_checks wraps its single pair/findings the same way before
+    calling this, so this one function serves both call sites."""
+    eligible_types = _score_eligible_types(checks)
+    numbered: list[tuple[int, dict, dict]] = []
+    number_to_key: dict[int, tuple] = {}
+    for idx, findings in findings_by_index.items():
+        for pos, finding in enumerate(findings):
+            if finding.get("type") not in eligible_types:
+                continue
+            n = len(numbered) + 1
+            numbered.append((n, items[idx], finding))
+            number_to_key[n] = (idx, pos)
+
+    if not numbered:
+        return findings_by_index, 0.0
+
+    prompt = FINDINGS_VALIDITY_PROMPT.format(
+        target_lang_line=_target_lang_line(target_lang),
+        source_lang_note=_source_lang_note(source_lang, checks),
+        items_block=_score_block(numbered),
+    )
+    model = model_override or _model_for_lang(target_lang)
+    text_block, usage, _stop_reason = await _call_claude(prompt, model=model)
+    scores = _parse_validity_scores(text_block, number_to_key)
+    cost = _usage_cost(model, usage)
+    if not scores:
+        return findings_by_index, cost
+
+    for idx, findings in findings_by_index.items():
+        for pos, finding in enumerate(findings):
+            percent = scores.get((idx, pos))
+            if percent is None:
+                continue
+            finding["validity_percent"] = percent
+            finding["message"] = f'{finding.get("message", "")} [Оценка валидности: {percent}%]'
+    return findings_by_index, cost
 
 
 # Client-specific terminology equivalence, 2026-09-24 (Александр, reporting
@@ -1578,7 +1781,20 @@ async def run_ai_checks(
                     "register_majority": report["majority"],
                 })
 
-    return findings, search_cost + _usage_cost(model, usage)
+    # Step 3 of the pipeline (see FINDINGS_VALIDITY_PROMPT's own comment) —
+    # a fresh, skeptical second look at what Step 2 (plus any search
+    # warnings) is about to report, attaching a 0-100 validity percentage to
+    # every eligible finding without removing anything. Runs on the
+    # fully-assembled findings list so its own type eligibility filter
+    # naturally leaves register_summary and any "system" warning alone —
+    # no extra plumbing needed here to keep those safe.
+    scored, score_cost = await _score_findings(
+        [{"context": "", "source": source, "translation": translation}],
+        {0: findings}, checks, target_lang=target_lang, source_lang=source_lang,
+    )
+    findings = scored.get(0, [])
+
+    return findings, search_cost + score_cost + _usage_cost(model, usage)
 
 
 def build_batch_prompt(
@@ -1765,7 +1981,19 @@ async def run_ai_checks_batch(
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
-    return filtered, search_cost + _usage_cost(model, usage), stop_reason == "max_tokens", search_warnings
+
+    # Step 3 of the pipeline (see FINDINGS_VALIDITY_PROMPT's own comment) —
+    # a fresh, skeptical second look at Step 2's own findings, attaching a
+    # 0-100 validity percentage to every eligible finding without removing
+    # anything. search_warnings is deliberately NOT included here (it's
+    # passed straight through to the caller below, same as before) — those
+    # are "system"-type meta-warnings about the ensemble itself, not
+    # translation-quality findings, and _score_eligible_types would exclude
+    # them anyway even if they were.
+    scored, score_cost = await _score_findings(
+        items, filtered, checks, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
+    )
+    return scored, search_cost + score_cost + _usage_cost(model, usage), stop_reason == "max_tokens", search_warnings
 
 
 # --------------------------------------------------- Message Batches API ---
