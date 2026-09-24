@@ -634,6 +634,168 @@ async def _ensemble_search_findings(
     return merged, sonnet_cost + gpt_cost, warnings
 
 
+# Step 3 of the pipeline, Александр's ask (2026-09-24, generalized from a
+# batch of real per-language false positives he'd caught by hand — French
+# "au calendrier" vs "du calendrier", a Turkish vowel-harmony "error" on a
+# loanword that's actually a known exception, Mexican Spanish "jugar golf"
+# without "al", several Hinglish findings graded against formal Hindi
+# grammar instead of its own looser, code-mixed norms): he wants the SAME
+# kind of second look he got when he pasted a raw report back to Claude
+# directly and asked "is this fair" — where a fresh, specifically skeptical
+# read caught most of Step 2's findings as false positives — built into the
+# pipeline itself, for every language, instead of Claude hand-writing one
+# narrow per-language/per-term prompt carve-out at a time forever
+# (GRAMMAR_LANGUAGE_HINTS, _RU_TERM_SYNONYMS_NOTE — both stay, they're
+# still cheap and still correct, this doesn't replace them).
+#
+# Deliberately a SEPARATE pass over Step 2's own output, not a stricter
+# Step 2 calibration bar — CALIBRATION_STRICT_OPENING's "report even when
+# not 100% sure" instruction stays exactly as it is, because that's what
+# fixed the opposite failure (Step 2 silently missing the real Kyrgyz
+# "{{amount}} баштап" case-ending error under the old, more cautious
+# wording — see that constant's own history). Softening Step 2 itself would
+# reintroduce that exact risk. This step only removes a finding when the
+# model, looking again with fresh framing, is CONFIDENT it is NOT a real
+# problem (a legitimate regional/dialectal variant, an accepted alternate
+# spelling, informal-register looseness, or a factually wrong grammar rule
+# on the checker's own part) — genuine uncertainty ("might be real, might
+# not") is explicitly told to survive review unchanged, same bias toward
+# showing too much rather than hiding something real that Step 1/Step 2
+# already have.
+#
+# Never even offered "Важно"/high-severity findings, or the platform's own
+# synthetic types (register_value/register_summary/system) — see
+# _review_eligible_types. Александр's call: the highest-stakes findings
+# should always still reach a human, even if this pass would have been
+# confident about them too — a convenience filter for lower-stakes noise,
+# not a substitute for a person's own judgment on anything that actually
+# matters.
+FINDINGS_REVIEW_PROMPT = """Ты — опытный редактор переводов, отвечающий за качество уже готового отчёта о найденных проблемах.
+Ниже даны пары (исходный текст, перевод) и находки, которые уже нашла другая, более осторожная проверка по каждой
+паре. Твоя задача — не искать новые проблемы, а перепроверить уже НАЙДЕННЫЕ свежим взглядом, специально ища причины
+усомниться в них: не является ли это на самом деле нормальным региональным/разговорным вариантом языка, устоявшимся
+альтернативным написанием, естественной интерпретацией, полностью сохраняющей смысл исходника, или сама находка не
+основана ли на фактически неверном грамматическом правиле.
+
+Отменяй находку ТОЛЬКО когда ты действительно УВЕРЕН(А), что это не настоящая проблема. Если сомневаешься — не до
+конца уверен(а), может ли это всё-таки быть настоящей ошибкой — НЕ отменяй, оставляй находку как есть: лучше
+показать человеку что-то сомнительное на проверку, чем скрыть то, что может оказаться реальной ошибкой.
+
+{target_lang_line}
+
+{source_lang_note}
+
+Находки для перепроверки:
+{items_block}
+
+Для каждой находки, которую нужно ОТМЕНИТЬ (ты уверен(а), что это не настоящая проблема), напиши отдельную строку:
+NUMBER: причина одним коротким предложением
+где NUMBER — номер находки из списка выше. Находки, которые нужно ОСТАВИТЬ как есть, просто пропусти — не пиши по
+ним ничего. Если ни одну находку отменять не нужно, верни ровно одну строку: "все находки подтверждены". Не
+используй JSON, markdown, вступления или заключения — только такие строки, по одной на строку."""
+
+
+def _review_eligible_types(checks: list[str]) -> set[str]:
+    """The finding "type" values Step 3 review is allowed to touch at all —
+    every real quality-check type Step 2 could have returned, but never the
+    platform's own synthetic/meta types (register_value, register_summary,
+    "system") — those aren't judgment calls about translation quality, so a
+    "confident this isn't a real problem" review has nothing meaningful to
+    say about them and must never be allowed to make one vanish."""
+    return _allowed_ai_types(checks) - {REGISTER_VALUE_TYPE}
+
+
+def _review_block(entries: list[tuple[int, dict, dict]]) -> str:
+    """entries: [(number, item, finding), ...], 1-based number already
+    assigned by the caller — mirrors _pairs_block's own numbered-block
+    shape, plus the specific already-found finding under each pair being
+    put up for review."""
+    parts = []
+    for n, item, finding in entries:
+        parts.append(
+            f'{n}. Контекст: {item["context"] or "—"}\n'
+            f'Источник: """{item["source"]}"""\n'
+            f'Перевод: """{item["translation"]}"""\n'
+            f'Уже найденная проблема — тип «{finding.get("type", "")}», важность «{finding.get("severity", "")}»: '
+            f'{finding.get("message", "")}'
+        )
+    return "\n\n".join(parts)
+
+
+def _parse_review_drops(text_block: str | None, number_to_key: dict[int, tuple]) -> set[tuple]:
+    """Mirrors _parse_search_findings' own free-text "NUMBER: reason"
+    parsing (same _SEARCH_LINE_RE), but the numbers here key into
+    number_to_key — (item_index, position_in_its_findings_list), a
+    finding's identity — rather than plain item indices. A line that
+    doesn't parse, or an out-of-range number, is silently skipped, same
+    rationale as there: this is free text, not JSON."""
+    if not text_block:
+        return set()
+    dropped: set[tuple] = set()
+    for line in text_block.splitlines():
+        line = line.strip().lstrip("-•* ").strip()
+        if not line:
+            continue
+        m = _SEARCH_LINE_RE.match(line)
+        if not m:
+            continue
+        key = number_to_key.get(int(m.group(1)))
+        if key is not None:
+            dropped.add(key)
+    return dropped
+
+
+async def _review_findings(
+    items: list[dict], findings_by_index: dict[int, list[dict]], checks: list[str],
+    target_lang: str = "", source_lang: str = "", model_override: str | None = None,
+) -> tuple[dict[int, list[dict]], float]:
+    """Step 3 of the pipeline — see FINDINGS_REVIEW_PROMPT's own comment
+    above for the full rationale. Returns (findings_by_index UNCHANGED,
+    0.0) with NO API call when there's nothing eligible to review (every
+    finding already high-severity or a synthetic type) — same
+    no-point-spending-a-call-on-nothing rationale as _search_findings' own
+    early-out. Never invents an idx -> [] entry for a fully-dropped pair —
+    matches group_batch_findings' own invariant (an idx only ever appears
+    with a non-empty list), which run_ai_checks_batch's callers rely on.
+
+    items is keyed exactly like findings_by_index (both by the caller's
+    original item index) — run_ai_checks_batch already has both in that
+    shape; run_ai_checks wraps its single pair/findings the same way before
+    calling this, so this one function serves both call sites."""
+    eligible_types = _review_eligible_types(checks)
+    numbered: list[tuple[int, dict, dict]] = []
+    number_to_key: dict[int, tuple] = {}
+    for idx, findings in findings_by_index.items():
+        for pos, finding in enumerate(findings):
+            if finding.get("severity") == "high" or finding.get("type") not in eligible_types:
+                continue
+            n = len(numbered) + 1
+            numbered.append((n, items[idx], finding))
+            number_to_key[n] = (idx, pos)
+
+    if not numbered:
+        return findings_by_index, 0.0
+
+    prompt = FINDINGS_REVIEW_PROMPT.format(
+        target_lang_line=_target_lang_line(target_lang),
+        source_lang_note=_source_lang_note(source_lang, checks),
+        items_block=_review_block(numbered),
+    )
+    model = model_override or _model_for_lang(target_lang)
+    text_block, usage, _stop_reason = await _call_claude(prompt, model=model)
+    dropped = _parse_review_drops(text_block, number_to_key)
+    cost = _usage_cost(model, usage)
+    if not dropped:
+        return findings_by_index, cost
+
+    result: dict[int, list[dict]] = {}
+    for idx, findings in findings_by_index.items():
+        kept = [f for pos, f in enumerate(findings) if (idx, pos) not in dropped]
+        if kept:
+            result[idx] = kept
+    return result, cost
+
+
 # Client-specific terminology equivalence, 2026-09-24 (Александр, reporting
 # real translator pushback on a Kazakh check): the platform had flagged a
 # translation that rendered "отыгрыш" and "вейджер" through two different
@@ -1578,7 +1740,20 @@ async def run_ai_checks(
                     "register_majority": report["majority"],
                 })
 
-    return findings, search_cost + _usage_cost(model, usage)
+    # Step 3 of the pipeline (see FINDINGS_REVIEW_PROMPT's own comment) —
+    # a fresh, skeptical second look at what Step 2 (plus any search
+    # warnings) is about to report, dropping only what it's confident isn't
+    # a real problem. Runs on the fully-assembled findings list so its own
+    # type/severity eligibility filter naturally leaves register_summary,
+    # any "system" warning, and every "Важно"/high-severity finding alone —
+    # no extra plumbing needed here to keep those safe.
+    reviewed, review_cost = await _review_findings(
+        [{"context": "", "source": source, "translation": translation}],
+        {0: findings}, checks, target_lang=target_lang, source_lang=source_lang,
+    )
+    findings = reviewed.get(0, [])
+
+    return findings, search_cost + review_cost + _usage_cost(model, usage)
 
 
 def build_batch_prompt(
@@ -1765,7 +1940,18 @@ async def run_ai_checks_batch(
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
-    return filtered, search_cost + _usage_cost(model, usage), stop_reason == "max_tokens", search_warnings
+
+    # Step 3 of the pipeline (see FINDINGS_REVIEW_PROMPT's own comment) —
+    # a fresh, skeptical second look at Step 2's own findings, dropping
+    # only what it's confident isn't a real problem. search_warnings is
+    # deliberately NOT included here (it's passed straight through to the
+    # caller below, same as before) — those are "system"-type meta-
+    # warnings about the ensemble itself, not translation-quality findings,
+    # and _review_eligible_types would exclude them anyway even if they were.
+    reviewed, review_cost = await _review_findings(
+        items, filtered, checks, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
+    )
+    return reviewed, search_cost + review_cost + _usage_cost(model, usage), stop_reason == "max_tokens", search_warnings
 
 
 # --------------------------------------------------- Message Batches API ---
