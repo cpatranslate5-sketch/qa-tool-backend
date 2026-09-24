@@ -835,18 +835,7 @@ def _resolve_repeated_findings(grouped: dict[int, list[dict]], rows: list[dict])
                 )
                 if also_rows:
                     rows_str = ", ".join(str(r) for r in also_rows)
-                    # If Step 3 scoring (app.claude_client._score_findings) already appended its own
-                    # "[Оценка валидности: N%]" annotation to this message, that annotation needs to stay
-                    # the visibly LAST thing a manager reads (see FINDINGS_VALIDITY_PROMPT's own comment on
-                    # why it's in the message at all) — so it's peeled off here and reattached after this
-                    # repeat-rows note, instead of ending up sandwiched in the middle of the string.
-                    base_message = f.get("message", "")
-                    validity_suffix = ""
-                    validity_match = re.search(r" \[Оценка валидности: \d+%\]$", base_message)
-                    if validity_match:
-                        validity_suffix = validity_match.group(0)
-                        base_message = base_message[: validity_match.start()]
-                    f["message"] = f"{base_message} (также в строках: {rows_str}){validity_suffix}"
+                    f["message"] = f"{f.get('message', '')} (также в строках: {rows_str})"
             new_findings.append(f)
         resolved[idx] = new_findings
     return resolved
