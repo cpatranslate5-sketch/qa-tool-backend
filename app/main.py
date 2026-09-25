@@ -2,7 +2,7 @@ import datetime
 import logging
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
@@ -11,7 +11,7 @@ from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import run_ai_checks
 from app.config import settings
-from app.database import get_db, init_db
+from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
     BATCH_THRESHOLD_CHARS,
     _label_to_code,
@@ -108,6 +108,54 @@ async def anthropic_call_failed(request: Request, exc: httpx.HTTPError):
 @app.on_event("startup")
 def on_startup():
     init_db()
+
+
+async def _run_second_opinion_background(multi_check_id: int, results: dict) -> None:
+    """Runs the automatic Sonnet+GPT second-opinion pass (apply_second_opinion)
+    AFTER a multi-check's response has already been sent to the browser,
+    instead of blocking that response on it.
+
+    Why: apply_second_opinion makes two more sequential API calls per
+    language on top of the check's own AI calls. Blocking the request on
+    it made the whole thing slow enough that the browser's fetch sometimes
+    gave up ("Failed to fetch") even though the backend was still working
+    and the result was saved fine a moment later — genuinely confusing
+    (was it saved? do I re-run it and pay twice?) and, with this change,
+    the live/"nothing to submit" response and the batch-finalize response
+    all return as soon as the check itself is done, same as before this
+    feature existed. The frontend polls multi-check detail until
+    second_opinion_pending flips back to false (same pattern it already
+    uses for a still-processing batch job) — see CheckRunner.tsx.
+
+    Runs in its OWN DB session: a FastAPI background task starts only
+    after the response has been sent, by which point the request's own
+    `Depends(get_db)` session is already closed.
+
+    Any failure here (an unexpected bug — apply_second_opinion already
+    turns a single model-call failure into a per-language warning on its
+    own, see its own docstring) just clears second_opinion_pending without
+    attaching any percents. shouldKeepFinding on the frontend already
+    treats a missing percent as "can't safely judge this, always keep
+    it" — so worst case, "Отфильтровать отчёт" just doesn't drop anything
+    for this check. It never silently double-runs or double-charges: the
+    check itself already ran and was saved before this task was even
+    scheduled — this only ever adds the two extra opinion calls once."""
+    try:
+        results = await apply_second_opinion(results)
+    except Exception:
+        logger.exception("apply_second_opinion failed for multi_check_id=%s", multi_check_id)
+    results["second_opinion_pending"] = False
+
+    db = SessionLocal()
+    try:
+        record = db.get(models.MultiCheck, multi_check_id)
+        if record is not None:
+            record.results = results
+            record.summary = results.get("summary", record.summary)
+            record.cost_usd = results.get("summary", {}).get("cost_usd", record.cost_usd)
+            db.commit()
+    finally:
+        db.close()
 
 
 @app.get("/health")
@@ -753,6 +801,7 @@ async def multi_check(
     # an hour. Costs 2x (the batch queue is exactly half price — see
     # claude_client.BATCH_PRICE_DISCOUNT — so skipping it is full price).
     urgent: bool = Form(False),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
 ):
     # Captured up front (rather than relying on created_at's own
@@ -791,7 +840,20 @@ async def multi_check(
         results = await run_multi_check(
             sheets, resolved_source, selected_checks, extra_instructions, target_filter,
         )
-        results = await apply_second_opinion(results)
+        # The Sonnet+GPT second-opinion pass no longer runs inline here — it
+        # used to (via a blocking `await apply_second_opinion(results)`),
+        # which added two more sequential API calls per language on top of
+        # everything run_multi_check already did, and made the whole request
+        # slow enough that the browser's fetch sometimes gave up ("Failed to
+        # fetch") even though the check itself had already finished and was
+        # saved — nothing lost, just confusing (was it saved? safe to retry,
+        # or does that mean paying twice?). The check is now saved as
+        # "completed" immediately, with second_opinion_pending=true, and the
+        # second-opinion pass runs in the background (see
+        # _run_second_opinion_background) — the frontend polls multi-check
+        # detail until it flips to false, the same pattern it already uses
+        # for a still-processing batch job.
+        results["second_opinion_pending"] = True
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
             project_id=project_id,
@@ -810,6 +872,7 @@ async def multi_check(
         db.add(record)
         db.commit()
         db.refresh(record)
+        background_tasks.add_task(_run_second_opinion_background, record.id, results)
         return {
             "multi_check_id": record.id,
             "status": "completed",
@@ -828,6 +891,10 @@ async def multi_check(
             # (e.g. only the free algorithmic checks were ticked) instead of
             # a manager having to guess whether something went wrong.
             "checks_run": record.checks_run,
+            # True until the background Sonnet+GPT second-opinion pass (see
+            # _run_second_opinion_background) finishes — the frontend polls
+            # while this is true, same as it does for status=="processing".
+            "second_opinion_pending": True,
         }
 
     requests, skeleton = build_batch_plan(
@@ -844,8 +911,12 @@ async def multi_check(
     if batch_id is None:
         # Nothing to submit (no AI check types selected, or no API key
         # configured) — the rule-based skeleton is already the final answer.
+        # In practice run_second_opinion returns instantly here (nothing but
+        # algorithmic findings to score — see its own docstring), but it's
+        # still deferred to the background for the same reason as the live
+        # path above: no request should ever have to wait on it.
         results = finalize_batch_results(skeleton, {})
-        results = await apply_second_opinion(results)
+        results["second_opinion_pending"] = True
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
             project_id=project_id,
@@ -864,6 +935,7 @@ async def multi_check(
         db.add(record)
         db.commit()
         db.refresh(record)
+        background_tasks.add_task(_run_second_opinion_background, record.id, results)
         return {
             "multi_check_id": record.id,
             "status": "completed",
@@ -874,6 +946,7 @@ async def multi_check(
             "created_at": record.created_at.isoformat(),
             "completed_at": record.completed_at.isoformat(),
             "checks_run": record.checks_run,
+            "second_opinion_pending": True,
         }
 
     record = models.MultiCheck(
@@ -920,7 +993,11 @@ async def multi_check(
     "/projects/{project_id}/multi-check",
     response_model=list[schemas.MultiCheckHistoryOut],
 )
-async def multi_check_history(project_id: int, manager_id: int, db: Session = Depends(get_db)):
+async def multi_check_history(
+    project_id: int, manager_id: int,
+    background_tasks: BackgroundTasks = None,
+    db: Session = Depends(get_db),
+):
     """Scoped to the requesting folder only — same per-folder history
     scoping as single_check_history, above."""
     _get_project(project_id, db)
@@ -939,7 +1016,11 @@ async def multi_check_history(project_id: int, manager_id: int, db: Session = De
             # reopen that specific check's page to trigger a poll.
             finalized, progress = await try_finalize_batch(r.batch_id, r.results["skeleton"])
             if finalized is not None:
-                finalized = await apply_second_opinion(finalized)
+                # Same deferral as the live multi-check path above — the
+                # Sonnet+GPT second opinion runs in the background instead
+                # of making THIS poll (already loaded with everyone else's
+                # history) wait on two more API calls per language.
+                finalized["second_opinion_pending"] = True
                 r.results = finalized
                 r.summary = finalized["summary"]
                 r.status = "completed"
@@ -950,6 +1031,7 @@ async def multi_check_history(project_id: int, manager_id: int, db: Session = De
                 r.completed_at = datetime.datetime.now(datetime.timezone.utc)
                 db.commit()
                 db.refresh(r)
+                background_tasks.add_task(_run_second_opinion_background, r.id, finalized)
                 progress = None
         out.append(schemas.MultiCheckHistoryOut(
             id=r.id, filename=r.filename, source_lang=r.source_lang,
@@ -959,12 +1041,17 @@ async def multi_check_history(project_id: int, manager_id: int, db: Session = De
             progress=progress,
             estimated_minutes=_estimate_batch_minutes(db, r.batch_volume_chars) if r.status == "processing" else None,
             completed_at=r.completed_at.isoformat() if r.completed_at else None,
+            second_opinion_pending=bool((r.results or {}).get("second_opinion_pending", False)),
         ))
     return out
 
 
 @app.get("/projects/{project_id}/multi-check/{multi_check_id}")
-async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: int, db: Session = Depends(get_db)):
+async def multi_check_detail(
+    project_id: int, multi_check_id: int, manager_id: int,
+    background_tasks: BackgroundTasks = None,
+    db: Session = Depends(get_db),
+):
     _get_project(project_id, db)
     record = db.get(models.MultiCheck, multi_check_id)
     if record is None or record.project_id != project_id or record.manager_id != manager_id:
@@ -974,7 +1061,9 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
     if record.status == "processing" and record.batch_id:
         finalized, progress = await try_finalize_batch(record.batch_id, record.results["skeleton"])
         if finalized is not None:
-            finalized = await apply_second_opinion(finalized)
+            # Same deferral as everywhere else — see
+            # _run_second_opinion_background's own docstring.
+            finalized["second_opinion_pending"] = True
             record.results = finalized
             record.summary = finalized["summary"]
             record.status = "completed"
@@ -984,6 +1073,7 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
             record.completed_at = datetime.datetime.now(datetime.timezone.utc)
             db.commit()
             db.refresh(record)
+            background_tasks.add_task(_run_second_opinion_background, record.id, finalized)
 
     if record.status == "processing":
         return {
@@ -1019,6 +1109,10 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
         "created_at": record.created_at.isoformat(),
         "completed_at": record.completed_at.isoformat() if record.completed_at else None,
         "checks_run": record.checks_run,
+        # True until the background Sonnet+GPT second-opinion pass finishes
+        # (see _run_second_opinion_background) — the frontend polls this
+        # endpoint while it's true, same as it does for status=="processing".
+        "second_opinion_pending": bool((record.results or {}).get("second_opinion_pending", False)),
     }
 
 
