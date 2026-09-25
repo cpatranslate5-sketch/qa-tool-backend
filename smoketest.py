@@ -1972,6 +1972,34 @@ print("[OK] «непереводимые термины»: a name/brand fully re
       "document — while a grammatical ending attached to a term left in its OWN original spelling stays "
       "exempt, so the original 'Grand Prix left correctly untouched' self-contradiction can't come back")
 
+# --- untranslatable, take three: Александр's real feedback (2026-09-24,
+# re-running the same Hindi/Hinglish file a second time) — a Step 2 run
+# flagged "FS" (the project's own established abbreviation for "free
+# spins", left untranslated on purpose) as "неполнота перевода" on one row,
+# while the very same untranslated "FS" went completely unflagged on two
+# OTHER rows of the identical document — a direct self-contradiction, the
+# same shape as the original "Grand Prix" bug above, just for an
+# abbreviation rather than a brand/tournament name. The "untranslatable"
+# category used to only name proper-noun-ish categories (tournaments,
+# brands, marketing words) — nothing in its wording obviously covered a
+# plain English acronym, so the model fell through to treating it as a
+# missed-translation "completeness" finding instead of recognizing it as
+# the same kind of intentionally-preserved term "Grand Prix" already gets.
+# Broadened to explicitly name established project abbreviations, with a
+# concrete worked example (FS / free spins) showing the SAME source can
+# use both the abbreviated and spelled-out form in different rows without
+# contradiction — each pair should mirror whichever form IT actually has. ---
+assert "устоявшиеся сокращения/аббревиатуры проекта" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "FS" in CHECK_LABELS["untranslatable"] and "free spins" in CHECK_LABELS["untranslatable"], (
+    CHECK_LABELS["untranslatable"]
+)
+assert "устоявшимся сокращениям вроде «FS»" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+print("[OK] «непереводимые термины» now also explicitly covers established project abbreviations left "
+      "untranslated on purpose (e.g. «FS» for «free spins»), so a real case Александр hit — 'FS' flagged as "
+      "an incomplete translation on one row while identical untranslated 'FS' went unflagged on two other "
+      "rows of the same document — routes to the 'always correct, never a finding' untranslatable-term rule "
+      "instead of «неполнота перевода», which now explicitly excludes it too")
+
 # --- completeness: Александр's real feedback (2026-09-17) — the check was
 # missing cases where a whole sentence/chunk of the source was dropped
 # from the translation entirely (not left in the source language, just
@@ -5101,5 +5129,295 @@ assert _ep_two_step_body["results"]["sonnet"]["catches"] == 2, _ep_two_step_body
 print("[OK] POST /debug/model-comparison: the two_step=true field reaches run_model_comparison end-to-end "
       "through the request schema — Александр can now trigger this from the interactive /docs page to "
       "verify the two-step pipeline for real, on known examples, before trusting it in production")
+
+# ============================================================================
+# Automatic second opinion (Александр's ask, 2026-09-25): after a multi-check
+# finishes, Sonnet AND GPT are each automatically asked how likely every
+# already-reported finding is a real problem — same thing Александр was
+# doing by hand (copying the report into a chat, see frontend copyReport.ts)
+# — so the report page can offer a "Отфильтровать отчёт" button. Whole-
+# language-at-once, NOT the old rolled-back Step 3's isolated-per-row
+# scoring (see the "Revert Step 3" commit) — and algorithmic findings
+# (rule_checks.RULE_BASED_TYPES) are scored 100/100 directly in code, never
+# sent to a model at all, so they're guaranteed (not just prompted) to
+# survive any later filtering.
+# ============================================================================
+from app.claude_client import _parse_second_opinion as _parse_second_opinion_direct
+from app.claude_client import _second_opinion_input as _second_opinion_input_direct
+from app.claude_client import run_second_opinion as run_second_opinion_direct
+from app.excel_multi import apply_second_opinion as apply_second_opinion_direct
+
+assert _parse_second_opinion_direct([{"n": 1, "percent": 85}, {"n": 2, "percent": -5}, {"n": 3, "percent": 150}]) == (
+    {1: 85, 2: 0, 3: 100}
+), "percent must clamp to 0-100, including a negative value clamping to 0 (the exact bug the old Step 3 had)"
+assert _parse_second_opinion_direct([{"n": "1", "percent": 50}]) == {}, "a non-int 'n' must be skipped, not coerced"
+assert _parse_second_opinion_direct([{"n": 1, "percent": "50"}]) == {}, "a non-numeric percent must be skipped"
+assert _parse_second_opinion_direct([{"n": 1, "percent": True}]) == {}, "a boolean percent must be rejected, not treated as 1/0"
+assert _parse_second_opinion_direct([{"n": 1, "percent": 10}, "garbage", 42, {"no": "n or percent"}]) == {1: 10}, (
+    "a malformed entry anywhere in the list must be skipped without losing the entries that DO parse"
+)
+print("[OK] _parse_second_opinion: percent clamps to 0-100 (negative -> 0, over 100 -> 100), and any entry "
+      "with a non-int 'n', non-numeric or boolean 'percent', or the wrong shape entirely is silently "
+      "skipped rather than guessed at or crashing the whole parse")
+
+_rows_for_input_test = [
+    {"excel_row": 0, "context": "sys", "source": "", "translation": "", "findings": [{"type": "system", "message": "предупреждение"}]},
+    {"excel_row": 2, "context": "ctx1", "source": "src1", "translation": "tgt1", "findings": [
+        {"type": "typo", "message": "опечатка A"},
+        {"type": "numbers", "message": "число не совпадает"},
+    ]},
+    {"excel_row": 5, "context": "ctx2", "source": "src2", "translation": "tgt2", "findings": [
+        {"type": "register_summary", "message": "Тон: Вы"},
+    ]},
+    {"excel_row": 7, "context": "ctx3", "source": "src3", "translation": "tgt3", "findings": [
+        {"type": "untranslatable", "message": "не переведено B"},
+    ]},
+]
+_report_text, _refs = _second_opinion_input_direct(_rows_for_input_test)
+assert len(_refs) == 2, _refs
+assert _refs[0]["message"] == "опечатка A" and _refs[1]["message"] == "не переведено B", _refs
+assert "1. опечатка A" in _report_text and "2. не переведено B" in _report_text, _report_text
+assert "число не совпадает" not in _report_text, "algorithmic findings must never be sent to a model at all"
+assert "Тон: Вы" not in _report_text, "the register/tone-of-address fact isn't a finding and needs no opinion"
+assert "предупреждение" not in _report_text, "excel_row==0 system rows aren't real findings either"
+print("[OK] _second_opinion_input: numbers only the findings that actually need a model's opinion (skips "
+      "algorithmic findings, the register_summary tone fact, and excel_row==0 system rows entirely), in "
+      "appearance order starting at 1")
+
+_rows_algo_only = [
+    {"excel_row": 3, "context": "c", "source": "s", "translation": "t", "findings": [
+        {"type": "numbers", "message": "num mismatch"},
+        {"type": "punctuation", "message": "punct mismatch"},
+    ]},
+]
+
+
+async def _fake_call_claude_so_should_not_run(prompt, model=None):
+    raise AssertionError("must not call Claude when there are no AI-judged findings to score")
+
+
+async def _fake_call_openai_so_should_not_run(prompt, model=None):
+    raise AssertionError("must not call GPT when there are no AI-judged findings to score")
+
+
+claude_client_mod._call_claude = _fake_call_claude_so_should_not_run
+claude_client_mod._call_openai = _fake_call_openai_so_should_not_run
+_cost_algo, _warn_algo = asyncio.run(run_second_opinion_direct(_rows_algo_only))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+assert _cost_algo == 0.0, _cost_algo
+assert _warn_algo == [], _warn_algo
+assert _rows_algo_only[0]["findings"][0]["sonnet_percent"] == 100
+assert _rows_algo_only[0]["findings"][0]["gpt_percent"] == 100
+assert _rows_algo_only[0]["findings"][1]["sonnet_percent"] == 100
+assert _rows_algo_only[0]["findings"][1]["gpt_percent"] == 100
+print("[OK] run_second_opinion: a language with ONLY algorithmic findings gets them scored 100/100 with "
+      "ZERO API calls made at all (both fakes would raise if called) — guaranteed to survive filtering "
+      "rather than depending on a model correctly following a prompt instruction, and costs nothing")
+
+
+async def _fake_call_claude_so_ok(prompt, model=None):
+    assert "1. опечатка A" in prompt and "2. не переведено B" in prompt, prompt
+    return '[{"n": 1, "percent": 85}, {"n": 2, "percent": 20}]', {"input_tokens": 100, "output_tokens": 20}, "end_turn"
+
+
+async def _fake_call_openai_so_ok(prompt, model=None):
+    return '[{"n": 1, "percent": 90}, {"n": 2, "percent": 15}]', {"prompt_tokens": 100, "completion_tokens": 20}, "stop"
+
+
+_rows_mixed = [
+    {"excel_row": 2, "context": "c1", "source": "s1", "translation": "t1", "findings": [
+        {"type": "typo", "message": "опечатка A"},
+        {"type": "numbers", "message": "число не совпадает"},
+    ]},
+    {"excel_row": 6, "context": "c2", "source": "s2", "translation": "t2", "findings": [
+        {"type": "untranslatable", "message": "не переведено B"},
+    ]},
+]
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_so_ok
+claude_client_mod._call_openai = _fake_call_openai_so_ok
+_cost_mixed, _warn_mixed = asyncio.run(run_second_opinion_direct(_rows_mixed))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.ANTHROPIC_API_KEY = ""
+settings.OPENAI_API_KEY = ""
+
+_typo_f = _rows_mixed[0]["findings"][0]
+_num_f = _rows_mixed[0]["findings"][1]
+_untr_f = _rows_mixed[1]["findings"][0]
+assert _typo_f["sonnet_percent"] == 85 and _typo_f["gpt_percent"] == 90, _typo_f
+assert _num_f["sonnet_percent"] == 100 and _num_f["gpt_percent"] == 100, _num_f
+assert _untr_f["sonnet_percent"] == 20 and _untr_f["gpt_percent"] == 15, _untr_f
+assert _cost_mixed > 0, _cost_mixed
+assert _warn_mixed == [], _warn_mixed
+print("[OK] run_second_opinion: with algorithmic findings mixed into the same rows as AI-judged ones, "
+      "the numbering sent to each model skips the algorithmic ones entirely, so a model's response numbered "
+      "1/2 lands correctly on the typo and untranslatable findings (not the numbers finding sitting between "
+      "them in the row) — both models' percents attached, real added cost, no warnings")
+
+_rows_fail = [
+    {"excel_row": 4, "context": "c", "source": "s", "translation": "t", "findings": [
+        {"type": "typo", "message": "опечатка C"},
+    ]},
+]
+
+
+async def _fake_call_claude_so_single(prompt, model=None):
+    return '[{"n": 1, "percent": 85}]', {"input_tokens": 100, "output_tokens": 20}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_so_single
+claude_client_mod._call_openai = _fake_call_openai_broken
+_cost_fail, _warn_fail = asyncio.run(run_second_opinion_direct(_rows_fail))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.ANTHROPIC_API_KEY = ""
+settings.OPENAI_API_KEY = ""
+
+_typo_c = _rows_fail[0]["findings"][0]
+assert _typo_c["sonnet_percent"] == 85, _typo_c
+assert "gpt_percent" not in _typo_c, _typo_c
+assert len(_warn_fail) == 1 and "GPT" in _warn_fail[0]["message"] and _warn_fail[0]["type"] == "system", _warn_fail
+print("[OK] run_second_opinion: a configured-but-failing GPT branch produces a visible system-warning "
+      "finding naming GPT and leaves gpt_percent simply UNSET on the affected findings (never guessed at "
+      "or defaulted) while Sonnet's own percent still comes through normally — the frontend then treats a "
+      "missing percent as 'can't safely filter this, always keep it'")
+
+_rows_nokey = [
+    {"excel_row": 9, "context": "c", "source": "s", "translation": "t", "findings": [
+        {"type": "typo", "message": "опечатка D"},
+    ]},
+]
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+# OPENAI_API_KEY deliberately left unset ("" — the real, un-monkeypatched
+# _call_openai short-circuits on this by itself, same as everywhere else in
+# this file) — proves run_second_opinion doesn't warn just because GPT
+# contributed nothing, only when a CONFIGURED branch actually failed.
+claude_client_mod._call_claude = _fake_call_claude_so_single
+_cost_nokey, _warn_nokey = asyncio.run(run_second_opinion_direct(_rows_nokey))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+_typo_d = _rows_nokey[0]["findings"][0]
+assert _typo_d["sonnet_percent"] == 85, _typo_d
+assert "gpt_percent" not in _typo_d, _typo_d
+assert _warn_nokey == [], _warn_nokey
+print("[OK] run_second_opinion: with no OPENAI_API_KEY configured at all, GPT simply contributes no percent "
+      "to any finding and produces NO warning — an unconfigured model is an expected non-contribution, not "
+      "a failure, same philosophy as Step 1's own ensemble")
+
+_results_for_apply_test = {
+    "summary": {"cost_usd": 1.23, "total_findings": 2},
+    "sheets": [{
+        "sheet_name": "Sheet1",
+        "languages": {
+            "es": [{"excel_row": 2, "context": "c", "source": "s", "translation": "t", "findings": [
+                {"type": "typo", "message": "опечатка E"},
+            ]}],
+            "hi": [{"excel_row": 3, "context": "c2", "source": "s2", "translation": "t2", "findings": [
+                {"type": "numbers", "message": "число не совпадает"},
+            ]}],
+        },
+    }],
+}
+
+
+async def _fake_call_claude_apply(prompt, model=None):
+    return '[{"n": 1, "percent": 77}]', {"input_tokens": 50, "output_tokens": 10}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_apply
+claude_client_mod._call_openai = _fake_call_openai_broken
+_results_after_apply = asyncio.run(apply_second_opinion_direct(_results_for_apply_test))
+claude_client_mod._call_claude = _previous_call_claude
+claude_client_mod._call_openai = _previous_call_openai
+settings.ANTHROPIC_API_KEY = ""
+settings.OPENAI_API_KEY = ""
+
+assert _results_after_apply is _results_for_apply_test, "must mutate and return the SAME dict, not a copy"
+assert _results_after_apply["summary"]["cost_usd"] > 1.23, (
+    "the extra Sonnet+GPT cost must be folded into the check's own total cost_usd, not hidden"
+)
+_es_finding = _results_after_apply["sheets"][0]["languages"]["es"][0]["findings"][0]
+assert _es_finding["sonnet_percent"] == 77, _es_finding
+assert "gpt_percent" not in _es_finding, _es_finding
+_hi_finding = _results_after_apply["sheets"][0]["languages"]["hi"][0]["findings"][0]
+assert _hi_finding["sonnet_percent"] == 100 and _hi_finding["gpt_percent"] == 100, _hi_finding
+_es_rows = _results_after_apply["sheets"][0]["languages"]["es"]
+assert any(
+    r["excel_row"] == 0 and any("GPT" in f["message"] for f in r["findings"]) for r in _es_rows
+), "'es' had an AI-judged finding actually sent to the (failing) GPT branch — must get a visible warning row"
+_hi_rows = _results_after_apply["sheets"][0]["languages"]["hi"]
+assert not any(r["excel_row"] == 0 for r in _hi_rows), (
+    "'hi' had ONLY an algorithmic finding (scored 100/100 in code, no API call at all) — GPT's broken "
+    "branch never even ran for it, so it must get no warning"
+)
+assert _results_after_apply["summary"]["total_findings"] == 3, (
+    "the 'es' language's system-warning row is a real, counted finding (system-type warnings are "
+    "deliberately counted, per _count_real_findings' own policy) — total_findings must go from 2 to 3, "
+    f"not stay stuck at 2. Got {_results_after_apply['summary']['total_findings']}"
+)
+print("[OK] apply_second_opinion: runs every checked language across every sheet concurrently, folds the "
+      "extra Sonnet+GPT cost into summary.cost_usd on top of whatever the check itself already cost, "
+      "mutates and returns the SAME results dict, appends a visible system-warning row only to languages "
+      "that actually had something sent to a branch that then failed, and keeps summary.total_findings in "
+      "sync with that new warning row instead of silently undercounting")
+
+# A genuinely unexpected bug in ONE language's second-opinion pass (not a
+# model API call failing — run_second_opinion already handles that per
+# branch, see above — something else entirely, e.g. a malformed row) must
+# never be allowed to take the rest of an already-successful check down
+# with it. Simulated here by monkeypatching run_second_opinion itself
+# (imported directly into app.excel_multi's namespace) to blow up only for
+# one specific language.
+_previous_run_second_opinion = excel_multi_mod.run_second_opinion
+
+
+async def _flaky_run_second_opinion(rows):
+    if rows and rows[0].get("source") == "boom-trigger":
+        raise KeyError("simulated unexpected bug in one language's second-opinion pass")
+    return await _previous_run_second_opinion(rows)
+
+
+_results_for_crash_test = {
+    "summary": {"cost_usd": 0.0, "total_findings": 2},
+    "sheets": [{
+        "sheet_name": "Sheet1",
+        "languages": {
+            "broken-lang": [{"excel_row": 2, "context": "c", "source": "boom-trigger", "translation": "t", "findings": [
+                {"type": "typo", "message": "опечатка F"},
+            ]}],
+            "fine-lang": [{"excel_row": 3, "context": "c2", "source": "s2", "translation": "t2", "findings": [
+                {"type": "numbers", "message": "число не совпадает"},
+            ]}],
+        },
+    }],
+}
+excel_multi_mod.run_second_opinion = _flaky_run_second_opinion
+_results_after_crash = asyncio.run(apply_second_opinion_direct(_results_for_crash_test))
+excel_multi_mod.run_second_opinion = _previous_run_second_opinion
+
+assert _results_after_crash is _results_for_crash_test, "must still mutate and return the same dict"
+_broken_findings = _results_after_crash["sheets"][0]["languages"]["broken-lang"]
+assert any(
+    r["excel_row"] == 0 and any(
+        f["type"] == "system" and "непредвиденной" in f["message"] for f in r["findings"]
+    ) for r in _broken_findings
+), "the language whose second-opinion pass raised must get a visible generic-error warning row, not silence"
+_fine_findings = _results_after_crash["sheets"][0]["languages"]["fine-lang"][0]["findings"][0]
+assert _fine_findings["sonnet_percent"] == 100 and _fine_findings["gpt_percent"] == 100, (
+    "the OTHER language's second-opinion pass must complete normally even though a sibling language's own "
+    f"pass raised an unexpected exception — got {_fine_findings}"
+)
+print("[OK] apply_second_opinion: an unexpected exception in one language's second-opinion pass (not a "
+      "model API call failing, which run_second_opinion already handles per-branch — something else "
+      "entirely) is caught per-language, surfaces as a visible warning instead of failing silently, and "
+      "never takes the rest of an already-successful multi-check down with it")
 
 print("\nALL SMOKETEST CHECKS PASSED")

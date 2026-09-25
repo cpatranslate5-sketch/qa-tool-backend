@@ -1134,6 +1134,17 @@ def check_sms_charset(translation: str) -> list[dict]:
     }]
 
 
+# Every "type" this file's own checks can produce — deterministic/
+# algorithmic, never an AI judgment call. Used by claude_client.
+# run_second_opinion (the automatic Sonnet+GPT "is this finding worth
+# acting on" pass, Александр's ask 2026-09-25) to score these 100/100
+# directly IN CODE rather than by asking a model to follow a "always score
+# these 100" prompt instruction — Александр was explicit that these must
+# never disappear from the filtered report, so it's guaranteed rather than
+# hoped for. Keep in sync with the "type" literals used above.
+RULE_BASED_TYPES = {"numbers", "placeholders", "max_length", "missing", "punctuation", "emoji", "sms_charset"}
+
+
 def run_rule_checks(
     source: str,
     translation: str,

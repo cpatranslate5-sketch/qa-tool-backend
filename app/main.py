@@ -16,6 +16,7 @@ from app.excel_multi import (
     BATCH_THRESHOLD_CHARS,
     _label_to_code,
     _normalize_lang_label,
+    apply_second_opinion,
     build_batch_plan,
     build_report_workbook,
     cancel_multi_check_batch,
@@ -790,6 +791,7 @@ async def multi_check(
         results = await run_multi_check(
             sheets, resolved_source, selected_checks, extra_instructions, target_filter,
         )
+        results = await apply_second_opinion(results)
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
             project_id=project_id,
@@ -843,6 +845,7 @@ async def multi_check(
         # Nothing to submit (no AI check types selected, or no API key
         # configured) — the rule-based skeleton is already the final answer.
         results = finalize_batch_results(skeleton, {})
+        results = await apply_second_opinion(results)
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
             project_id=project_id,
@@ -936,6 +939,7 @@ async def multi_check_history(project_id: int, manager_id: int, db: Session = De
             # reopen that specific check's page to trigger a poll.
             finalized, progress = await try_finalize_batch(r.batch_id, r.results["skeleton"])
             if finalized is not None:
+                finalized = await apply_second_opinion(finalized)
                 r.results = finalized
                 r.summary = finalized["summary"]
                 r.status = "completed"
@@ -970,6 +974,7 @@ async def multi_check_detail(project_id: int, multi_check_id: int, manager_id: i
     if record.status == "processing" and record.batch_id:
         finalized, progress = await try_finalize_batch(record.batch_id, record.results["skeleton"])
         if finalized is not None:
+            finalized = await apply_second_opinion(finalized)
             record.results = finalized
             record.summary = finalized["summary"]
             record.status = "completed"

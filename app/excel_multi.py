@@ -6,6 +6,7 @@ one row per translatable string.
 """
 import asyncio
 import io
+import logging
 import re
 
 import openpyxl
@@ -17,6 +18,7 @@ from app.claude_client import (
     _is_hard_language,
     _model_for_lang,
     _register_mixed_finding,
+    _second_opinion_unexpected_error_warning,
     _truncation_warning,
     _usage_cost,
     build_batch_prompt,
@@ -28,8 +30,11 @@ from app.claude_client import (
     group_batch_findings,
     parse_json_array,
     run_ai_checks_batch,
+    run_second_opinion,
 )
 from app.rule_checks import run_rule_checks
+
+logger = logging.getLogger(__name__)
 
 LANG_CODE_RE = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,5})?$")
 AI_CONCURRENCY = 5
@@ -1442,6 +1447,92 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
         "cost_usd": total_cost_usd,
     }
     return {"sheets": result_sheets, "summary": summary}
+
+
+async def apply_second_opinion(results: dict) -> dict:
+    """Runs the automatic Sonnet+GPT second-opinion pass (Александр's ask,
+    2026-09-25 — see claude_client.run_second_opinion's own comment for the
+    full rationale) over an already-finished multi-check result: attaches
+    sonnet_percent/gpt_percent to every real finding and folds the extra
+    API cost into summary["cost_usd"], so it's counted as part of the same
+    check instead of hidden. Every checked language across every sheet runs
+    concurrently (same asyncio.gather spirit as run_multi_check's own
+    per-language parallelism).
+
+    Called once, right after a check's results are first assembled —
+    whichever of the three paths produced them: live (run_multi_check),
+    "nothing to submit" (finalize_batch_results), or a background batch
+    finishing (try_finalize_batch) — so every one of app.main's call sites
+    needs this one extra line, not a change to any of those three
+    functions' own signatures. A manager sees the same second opinion no
+    matter which path produced their report.
+
+    Note for a very large batch upload: this makes the moment a background
+    batch finishes (polled from multi_check_history/multi_check_detail)
+    take noticeably longer to respond — two more API calls per language,
+    now run synchronously inside that GET request — rather than being
+    instant once Anthropic's own batch has ended. Accepted for now as a
+    known trade-off rather than building a second async/polling stage on
+    top of an already large feature; worth revisiting if it becomes a real
+    problem on Александр's biggest uploads.
+
+    Bounded by the same AI_CONCURRENCY semaphore the rest of this module
+    uses for per-language AI calls (see run_multi_check) — a 30+ language
+    upload would otherwise fire two outbound API calls per language all at
+    once. And a single language's own second-opinion pass is never allowed
+    to take the whole check down with it: run_second_opinion already turns
+    a model-call failure into a visible per-language warning (see its own
+    docstring), but an unexpected bug in the surrounding code (a malformed
+    row, anything not a model-call failure) is now ALSO caught here rather
+    than propagating — an already-successful check must never turn into a
+    500 just because this bonus step broke for one language.
+
+    Mutates and returns the same dict."""
+    semaphore = asyncio.Semaphore(AI_CONCURRENCY)
+
+    async def _run_one(findings_list: list[dict]) -> tuple[float, list[dict]]:
+        async with semaphore:
+            try:
+                return await run_second_opinion(findings_list)
+            except Exception:
+                logger.exception("run_second_opinion failed unexpectedly for one language")
+                return 0.0, [_second_opinion_unexpected_error_warning()]
+
+    tasks = [
+        _run_one(findings_list)
+        for sheet in results["sheets"]
+        for findings_list in sheet["languages"].values()
+    ]
+    if not tasks:
+        return results
+
+    task_results = await asyncio.gather(*tasks)
+
+    extra_cost = 0.0
+    idx = 0
+    for sheet in results["sheets"]:
+        for findings_list in sheet["languages"].values():
+            cost, warnings = task_results[idx]
+            idx += 1
+            extra_cost += cost
+            if warnings:
+                findings_list.append({
+                    "excel_row": 0,
+                    "context": "⚠ Системное предупреждение",
+                    "source": "",
+                    "translation": "",
+                    "findings": warnings,
+                })
+                # _count_real_findings already ran (as part of assembling
+                # `results` before this function was ever called) — a
+                # system-type warning is deliberately still counted (see
+                # its own docstring), so this new warning row needs to be
+                # added to that same total by hand, or it would silently
+                # be missing from the report's own "N находок" summary.
+                results["summary"]["total_findings"] = results["summary"].get("total_findings", 0) + len(warnings)
+
+    results["summary"]["cost_usd"] = results["summary"].get("cost_usd", 0.0) + extra_cost
+    return results
 
 
 async def submit_multi_check_batch(requests: list[dict]) -> str | None:

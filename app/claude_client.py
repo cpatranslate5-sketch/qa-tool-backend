@@ -5,6 +5,7 @@ import re
 import httpx
 
 from app.config import settings
+from app.rule_checks import RULE_BASED_TYPES
 
 # "register" (tone of address) is NOT in here — as of 2026-09-16 it isn't
 # an error-finding check at all any more, so it never appears in the
@@ -49,9 +50,14 @@ CHECK_LABELS = {
         "сообщить"
     ),
     "untranslatable": (
-        "непереводимые термины — имена турниров/событий/игр/брендов/продуктов/акций, а также устоявшиеся "
+        "непереводимые термины — имена турниров/событий/игр/брендов/продуктов/акций, устоявшиеся "
         "маркетинговые слова, которые обычно оставляют как есть (например «VIP», «Lootbox», название турнира вроде "
-        "«Grand Prix»). Сильный сигнал, что термин непереводимый: если он уже в САМОМ ИСХОДНИКЕ оставлен нетронутым "
+        "«Grand Prix»), А ТАКЖЕ устоявшиеся сокращения/аббревиатуры проекта на английском, которые в исходнике "
+        "последовательно используются НЕ расшифрованными (например «FS» вместо «free spins» — если в самом "
+        "исходнике рядом также встречается расшифрованный вариант «free spins», это не противоречие: значит, "
+        "источник сам иногда сокращает, а иногда пишет полностью, и перевод должен зеркалить именно то, что стоит "
+        "в конкретной паре — сокращение остаётся сокращением, а расшифровка переводится как обычный текст). Сильный "
+        "сигнал, что термин непереводимый: если он уже в САМОМ ИСХОДНИКЕ оставлен нетронутым "
         "(написан на другом языке/латиницей внутри текста на другом языке/скрипте) — значит, почти наверняка он "
         "должен остаться таким же нетронутым и в переводе, В СВОЁМ ИСХОДНОМ НАПИСАНИИ (тем же алфавитом/письменностью, "
         "что и в исходнике). Сообщай находку, если термин в переводе реально ИЗМЕНЁН: переведён по смыслу, искажён, "
@@ -70,9 +76,9 @@ CHECK_LABELS = {
     "completeness": (
         "неполнота перевода — ЛЮБОЙ случай, когда содержательный кусок исходного текста не дошёл до перевода: (1) "
         "обычные слова/фраза/предложение по ОШИБКЕ остались НЕПЕРЕВЕДЁННЫМИ, просто скопированы внутри перевода как "
-        "есть, хотя должны были быть переведены (это НЕ относится к отдельным именам/брендам/терминам, которые "
-        "правильно оставлены нетронутыми намеренно — за них отвечает отдельная проверка «непереводимые термины», "
-        "и там это не находка); (2) весь перевод "
+        "есть, хотя должны были быть переведены (это НЕ относится к отдельным именам/брендам/терминам/устоявшимся "
+        "сокращениям вроде «FS», которые правильно оставлены нетронутыми намеренно — за них отвечает отдельная "
+        "проверка «непереводимые термины», и там это не находка); (2) весь перевод "
         "сделан на другом языке, чем требуемый целевой (например, вставлен не тот язык, или перевод не изменился с "
         "другого родственного языка); (3) целое предложение, пункт списка или значимый смысловой кусок ПРОПУЩЕН из "
         "перевода целиком — просто отсутствует в переводе в каком бы то ни было виде. Пункт (3) — это НЕ то же самое, "
@@ -1766,6 +1772,188 @@ async def run_ai_checks_batch(
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
     return filtered, search_cost + _usage_cost(model, usage), stop_reason == "max_tokens", search_warnings
+
+
+# ------------------------------------------------ automatic second opinion ---
+# Александр's ask (2026-09-25): after a multi-check finishes, automatically
+# send each language's already-reported findings — numbered, one language at
+# a time — to BOTH Sonnet and GPT for an independent opinion on how likely
+# each one is a real problem, so the report page can offer a "Отфильтровать
+# отчёт" button that drops the findings neither model is convinced by. This
+# is exactly what he was doing BY HAND (see frontend copyReport.ts: copying
+# the report and pasting it into a chat) — automated, and run whole-language-
+# at-once like that manual flow, NOT like the old Step 3 (see the "Revert
+# Step 3" commit), whose isolated single-row AI calls for hard languages
+# produced inconsistent percentages for the exact same repeated issue. A
+# model reviewing the whole numbered list at once can actually notice and
+# score repeats consistently.
+#
+# Deliberately asks for a percent only, nothing else — the finding's own
+# existing "message" (already shown in the report) doubles as the
+# "Комментарий" column Александр wants, so there's no second AI-authored
+# explanation to generate, parse, or trust.
+
+SECOND_OPINION_PROMPT = """Ниже — пронумерованный список находок по одному языку при проверке качества перевода. У каждой находки указан контекст (строка, источник, перевод) и описание проблемы.
+
+Оцени вероятность того, что каждая находка — реальная проблема, а не нормальный вариант перевода, устоявшийся термин, региональная особенность или ошибка самой проверки. Используй шкалу:
+- 90-100 — явная фактическая или техническая ошибка: перепутана цифра, валюта, единица измерения, потерян или искажён плейсхолдер, опечатка, искажён смысл.
+- 60-89 — ошибка вероятна, либо это неконсистентность в переводе: один и тот же термин в разных местах переведён по-разному без причины. Оба варианта по отдельности могут быть правильными, но вместе — непоследовательность, которую стоит исправить.
+- 30-59 — скорее вопрос стиля или личного предпочтения, не критично.
+- 0-29 — похоже на нормальный, допустимый вариант перевода, вероятно ложное срабатывание.
+
+Ответь ТОЛЬКО валидным JSON-массивом, без какого-либо текста до или после, в формате:
+[{{"n": 1, "percent": 85}}, {{"n": 2, "percent": 20}}]
+
+Каждому номеру находки из списка ниже должен соответствовать ровно один объект в массиве.
+
+Находки:
+{numbered_report}"""
+
+
+def _second_opinion_input(rows: list[dict]) -> tuple[str, list[dict]]:
+    """Builds the numbered plain-text block to send for scoring, and the
+    parallel list of finding dicts each number refers to (finding_refs[i]
+    is what number i+1 refers to). Only real findings whose type ISN'T one
+    of rule_checks.RULE_BASED_TYPES are included — those are scored 100/100
+    directly in code by run_second_opinion below, never sent to a model at
+    all, so they can't come back scored any other way. register_summary
+    (the "Тон обращения" fact) and excel_row==0 system rows are never
+    findings needing a validity opinion, so both are skipped entirely, same
+    as the frontend's manual copy-report numbering (copyReport.ts)."""
+    lines: list[str] = []
+    finding_refs: list[dict] = []
+    for row in rows:
+        if row["excel_row"] == 0:
+            continue
+        scoreable = [
+            f for f in row["findings"]
+            if f.get("type") not in RULE_BASED_TYPES and f.get("type") != "register_summary"
+        ]
+        if not scoreable:
+            continue
+        lines.append(f"Строка {row['excel_row']} — {row.get('context') or 'без контекста'}")
+        lines.append(f"Источник: {row['source']}")
+        lines.append(f"Перевод: {row['translation']}")
+        for f in scoreable:
+            finding_refs.append(f)
+            lines.append(f"{len(finding_refs)}. {f.get('message', '')}")
+        lines.append("")
+    return "\n".join(lines).strip(), finding_refs
+
+
+def _parse_second_opinion(raw: list) -> dict[int, int]:
+    """{finding number: percent clamped to 0-100}, silently skipping any
+    entry that doesn't parse cleanly (wrong shape, non-numeric percent)
+    rather than guessing — a finding number missing from the result just
+    ends up with no percent from this model, which run_second_opinion's own
+    caller treats as "can't be filtered, always keep" (see its docstring),
+    never as a 0."""
+    out: dict[int, int] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        n, percent = entry.get("n"), entry.get("percent")
+        if not isinstance(n, int) or not isinstance(percent, (int, float)) or isinstance(percent, bool):
+            continue
+        out[n] = max(0, min(100, int(percent)))
+    return out
+
+
+def _second_opinion_failure_warning(model_label: str) -> dict:
+    """Same synthetic "type": "system" finding pattern as
+    _model_branch_search_warning above, but for THIS step — surfaced only
+    when a model that WAS configured (its API key is set) failed to
+    contribute a second opinion for this language, so Александр can tell
+    "this model genuinely reviewed and found nothing to remove" apart from
+    "this model's review didn't run at all". A model whose key simply isn't
+    configured contributes silently, same as Step 1's own ensemble — that's
+    an expected, intentional non-contribution, not a failure."""
+    return {
+        "type": "system",
+        "severity": "medium",
+        "message": (
+            f"Автоматическая повторная проверка находок этого языка не сработала для модели {model_label} "
+            "(сбой на её стороне — например, закончились средства на счёте, неверный/просроченный ключ API, "
+            "временная недоступность сервиса). Находки, для которых нет оценки от этой модели, при нажатии "
+            "«Отфильтровать отчёт» останутся в отчёте — они не будут убраны без данных от обеих моделей."
+        ),
+    }
+
+
+def _second_opinion_unexpected_error_warning() -> dict:
+    """Same synthetic-finding pattern as _second_opinion_failure_warning,
+    but for app.excel_multi.apply_second_opinion's own catch-all — an
+    unexpected bug in this step (not a model API call failing, which
+    run_second_opinion already handles per-branch) must never take the
+    whole check down with it, but it also shouldn't fail completely
+    silently. Findings for this language simply keep no sonnet_percent/
+    gpt_percent at all (same "can't be filtered, always keep" fallback as
+    a single failed model branch)."""
+    return {
+        "type": "system",
+        "severity": "medium",
+        "message": (
+            "Автоматическая повторная проверка находок этого языка не выполнилась из-за непредвиденной "
+            "ошибки. Остальная часть проверки отработала нормально — эта проблема касается только "
+            "дополнительной оценки вероятности ошибки для второго мнения (Sonnet/GPT). Находки этого "
+            "языка при нажатии «Отфильтровать отчёт» останутся в отчёте без изменений."
+        ),
+    }
+
+
+async def run_second_opinion(rows: list[dict]) -> tuple[float, list[dict]]:
+    """Attaches sonnet_percent/gpt_percent (0-100 ints) to every real,
+    AI-judged finding across rows, in place. Algorithmic findings
+    (rule_checks.RULE_BASED_TYPES) are set to 100/100 directly here without
+    ever being sent to a model — see _second_opinion_input's own comment for
+    why. A finding whose type a model wasn't asked about, or whose number
+    didn't come back in a model's response at all, simply keeps that
+    model's percent unset.
+
+    Returns (extra cost_usd this added, warning findings — one per model
+    that was expected to contribute but failed; see
+    _second_opinion_failure_warning). Returns (0.0, []) immediately when
+    there's nothing to score for this language at all."""
+    for row in rows:
+        if row["excel_row"] == 0:
+            continue
+        for f in row["findings"]:
+            if f.get("type") in RULE_BASED_TYPES:
+                f["sonnet_percent"] = 100
+                f["gpt_percent"] = 100
+
+    numbered_report, finding_refs = _second_opinion_input(rows)
+    if not finding_refs:
+        return 0.0, []
+
+    prompt = SECOND_OPINION_PROMPT.format(numbered_report=numbered_report)
+    sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
+    gpt_expected = bool(settings.OPENAI_API_KEY)
+
+    async def _sonnet() -> tuple[dict[int, int], float]:
+        text_block, usage, _ = await _call_claude(prompt, model=settings.CLAUDE_MODEL)
+        return _parse_second_opinion(parse_json_array(text_block)), _usage_cost(settings.CLAUDE_MODEL, usage)
+
+    async def _gpt() -> tuple[dict[int, int], float]:
+        text_block, usage, _ = await _call_openai(prompt, model=settings.OPENAI_MODEL)
+        return _parse_second_opinion(parse_json_array(text_block)), _openai_usage_cost(settings.OPENAI_MODEL, usage)
+
+    ((sonnet_percents, sonnet_cost), sonnet_error), ((gpt_percents, gpt_cost), gpt_error) = await asyncio.gather(
+        _run_search_branch(_sonnet()), _run_search_branch(_gpt()),
+    )
+
+    for n, f in enumerate(finding_refs, start=1):
+        if n in sonnet_percents:
+            f["sonnet_percent"] = sonnet_percents[n]
+        if n in gpt_percents:
+            f["gpt_percent"] = gpt_percents[n]
+
+    warnings = []
+    if sonnet_expected and sonnet_error is not None:
+        warnings.append(_second_opinion_failure_warning("Sonnet"))
+    if gpt_expected and gpt_error is not None:
+        warnings.append(_second_opinion_failure_warning("GPT"))
+    return sonnet_cost + gpt_cost, warnings
 
 
 # --------------------------------------------------- Message Batches API ---
