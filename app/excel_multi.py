@@ -1235,22 +1235,31 @@ def build_batch_plan(
             offset = 0
             for chunk_idx, chunk_items in enumerate(_chunk_list(ai_items, _chunk_size_for_lang(lang))):
                 custom_id = f"s{s_idx}-t{lang_idx}-c{chunk_idx}"
-                prompt, cache_prefix, number_to_index = build_batch_prompt(
+                # cache_prefix deliberately NOT passed through to the request
+                # below (see build_batch_prompt's own comment for what it is)
+                # — reverted 2026-09-25 after Александр reported zero real
+                # cost change on a large document. First pass here DID wire
+                # it in, reasoning that Anthropic's cache is shared workspace-
+                # wide between the Batches API and the live path. True, but
+                # beside the point: Anthropic's own docs go further and
+                # explicitly advise AGAINST prompt caching for the Batches
+                # API specifically, because "a cache entry written during
+                # batch processing would likely expire before the follow-up
+                # request runs" — batch jobs can take up to an hour (see this
+                # module's own BATCH_THRESHOLD_CHARS comment), while a cache
+                # entry lives 5 minutes by default, so a large multi-language
+                # check (exactly the kind that crosses BATCH_THRESHOLD_CHARS
+                # and lands here) gets essentially no cache hits, just the
+                # small-but-real ~25% write premium on every chunk's prefix
+                # for no benefit. Caching still applies on the live/
+                # synchronous path (run_ai_checks_batch, under the size
+                # threshold, where concurrent calls really do land within the
+                # 5-minute window) — see _call_claude's own cache_prefix.
+                prompt, _cache_prefix, number_to_index = build_batch_prompt(
                     chunk_items, checks, extra_instructions, lang, source_lang,
                 )
                 if prompt is not None:
-                    # cache_prefix (2026-09-25, Александр's cost-cutting ask)
-                    # is fixed for the whole language regardless of which
-                    # chunk this is — see build_batch_prompt's own comment —
-                    # so every chunk of the same language shares it, and
-                    # Anthropic's cache is shared between this Batches
-                    # submission and the live path too (confirmed against
-                    # Anthropic's own docs, 2026-09-25), not just within one
-                    # batch job. create_message_batch splits it into its own
-                    # cached content block (see _batch_request_content).
-                    requests.append({
-                        "custom_id": custom_id, "prompt": prompt, "model": model, "cache_prefix": cache_prefix,
-                    })
+                    requests.append({"custom_id": custom_id, "prompt": prompt, "model": model})
                 chunks_skeleton.append({
                     "custom_id": custom_id if prompt is not None else None,
                     "number_to_index": {str(k): v for k, v in number_to_index.items()},

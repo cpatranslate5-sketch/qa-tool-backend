@@ -1110,6 +1110,21 @@ assert not _bad_ids, f"custom_id must always be Anthropic-safe, regardless of th
 assert len(_weird_requests) >= 2, "expected a request for each non-source language, weird characters included"
 print(f"[OK] build_batch_plan: custom_id stays ASCII-safe even for language codes with lookalike/unicode characters (e.g. Cyrillic «с» instead of Latin \"c\"): {[r['custom_id'] for r in _weird_requests]}")
 
+# --- reverted 2026-09-25 (see build_batch_plan's own comment): prompt
+# caching does NOT get wired into Message Batches requests — Anthropic's own
+# docs advise against it there (a batch job can take up to an hour, a cache
+# entry lives 5 minutes by default, so it would likely just pay a small
+# write premium for no real benefit). Pin that no request build_batch_plan
+# hands to create_message_batch ever carries a "cache_prefix" key, so this
+# doesn't silently creep back in. ---
+assert all("cache_prefix" not in r for r in _weird_requests), (
+    "Message Batches requests must NOT include cache_prefix — Anthropic's own docs advise against caching on "
+    "this path (cache entries expire long before a batch job gets around to using them); see build_batch_plan's "
+    "own comment, added after Александр reported zero real cost change on a large (batched) document"
+)
+print("[OK] build_batch_plan: Message Batches requests never carry a cache_prefix — caching stays scoped to "
+      "the live/synchronous path only, where it can actually land within Anthropic's 5-minute cache window")
+
 # --- and the defensive side of the same fix: an app-wide handler for
 # httpx.HTTPError (registered in main.py, not the bare Exception class —
 # see its comment for why that distinction is what actually makes CORS
