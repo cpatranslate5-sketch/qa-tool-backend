@@ -1954,6 +1954,38 @@ print("[OK] «опечатки/ошибки»: a synonymous substitution doesn't
       "dictionary match to count as meaning-preserving — only that the overall message stays the same "
       "in context (Александр's real 'уникальный' -> 'unforgettable' example, 2026-09-24)")
 
+# --- Александр's real cross-check with a second chat (2026-09-25): comparing
+# Claude's own 40%/GPT's 90% second-opinion split on two Tajik findings from
+# the same document. Claude was RIGHT to dismiss one (an izafet construction
+# meaning "users of {{country}}" without «аз» is a normal, correct variant —
+# not a finding), but WRONG to dismiss the other: a header lost «аз» ("от" —
+# a MINIMUM) between "пополнение от X" (from X, a floor) and "пополнение на X"
+# (exactly X) — GPT caught it, Claude let it slide. Александр's own diagnosis:
+# the "уникальный"/"unforgettable" leniency fix above (don't flag a
+# synonymous substitution that preserves overall meaning) made Claude treat
+# this word loss as the same kind of harmless compression, in a SHORT header
+# where that reads as "shortened for brevity" — but losing "от"/"до"/etc.
+# changes an actual measurable condition (a minimum/maximum/exact value),
+# not just phrasing, and this exact kind of ambiguity is what causes real
+# user disputes over promo terms. This is the first real case where GPT's
+# second opinion caught something Claude's own missed — Александр's own
+# conclusion is this argues for comparing the two models on more cases
+# before ever dropping GPT, not dropping it now.
+assert "потеря ограничительного слова" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
+for _limiting_word in ("«от»", "«до»", "«не менее»", "«максимум»", "«только»", "«каждый»"):
+    assert _limiting_word in CHECK_LABELS["typo"], f"{_limiting_word} missing from CHECK_LABELS['typo']"
+assert "ДАЖЕ в коротком заголовке" in CHECK_LABELS["typo"], (
+    "the rule must explicitly override the 'looks like harmless compression in a short header' leniency that "
+    "caused the real miss — a bare 'don't flag synonyms' rule without this override would recreate the same bug"
+)
+# must still coexist with (not swallow) the ordinary omission exception right
+# next to it — an article/filler word with no measurable limit is still fine.
+assert "не несущего измеримого ограничения" in CHECK_LABELS["typo"], CHECK_LABELS["typo"]
+print("[OK] «опечатки/ошибки» now explicitly treats the loss of a limiting word at a sum/deadline/quantity "
+      "(«от», «до», «не менее», «максимум», «только», «каждый», etc.) as ALWAYS a meaning error, even in a "
+      "short header that might otherwise read as harmless compression — Александр's real GPT-caught, "
+      "Claude-missed example, 2026-09-25")
+
 # --- untranslatable: Александр's real feedback (2026-09-17) — a confusing
 # self-contradicting finding ("'Grand Prix' shouldn't have been translated,
 # but it correctly stayed 'Grand Prix' — error") shows the model needs an
