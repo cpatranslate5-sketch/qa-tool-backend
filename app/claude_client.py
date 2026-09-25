@@ -210,7 +210,17 @@ def _calibration(checks: list[str]) -> str:
     return f"{CALIBRATION_STRICT_OPENING} {_CALIBRATION_SHARED_TAIL} {tail} {_CONCISENESS_INSTRUCTION}"
 
 
-SINGLE_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
+# Split into PREFIX/SUFFIX for the same reason/see the same comment as
+# FINDINGS_SEARCH_PROMPT's own split above — target_lang_line/calibration/
+# source_lang_note are all fixed per (language, checks) pair, so this
+# prefix repeats byte-for-byte across every call this specific manual
+# single-pair check makes for the same language. extra_instructions can't
+# safely join the cacheable prefix here without moving it earlier than the
+# source/translation text — SINGLE_PROMPT's own field order already has it
+# AFTER the row content, and reordering existing prompt wording is exactly
+# what this split deliberately avoids (see _call_claude's cache_prefix
+# comment). SINGLE_PROMPT itself is still the same exact text as before.
+_SINGLE_PROMPT_PREFIX = """Ты — модуль контроля качества перевода для бюро переводов. Даны исходный текст и перевод.
 Проверяй только критерии из "Что проверять" ниже.
 
 {target_lang_line}
@@ -219,7 +229,8 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 
 {source_lang_note}
 
-Исходный текст:
+"""
+_SINGLE_PROMPT_SUFFIX = """Исходный текст:
 \"\"\"{source}\"\"\"
 
 Перевод:
@@ -236,8 +247,25 @@ SINGLE_PROMPT = """Ты — модуль контроля качества пе�
 [
   {{"type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
 ]"""
+SINGLE_PROMPT = _SINGLE_PROMPT_PREFIX + _SINGLE_PROMPT_SUFFIX
 
-BATCH_PROMPT = """Ты — модуль контроля качества перевода для бюро переводов. Даны пары (контекст, исходный текст, перевод) на один целевой язык.
+# Split into PREFIX/SUFFIX — same reasoning as FINDINGS_SEARCH_PROMPT's own
+# split above, but the biggest win of the five: everything in PREFIX below
+# (target_lang_line, calibration, source_lang_note, extra_instructions,
+# checks_description, other_type_instruction, AND the two long static
+# paragraphs about cross-row duplicate reporting and never citing pair
+# numbers) is fixed for the WHOLE document/run, not just one language —
+# build_batch_prompt already computes every one of these before it even
+# knows which rows are in THIS particular chunk. Only {pairs_block} (the
+# actual rows) and {register_instructions} are truly per-chunk. That means
+# this prefix repeats byte-for-byte across every chunk of every language in
+# one multi-check — including, especially, the hard-language path
+# (MAX_ROWS_PER_AI_CALL_HARD = 1 row/call), where it would otherwise never
+# get to amortize across 15 rows the way a normal language's batches do.
+# BATCH_PROMPT itself is still the exact same text as before — no wording
+# or order changed, see _call_claude's own cache_prefix comment for why
+# that's what makes this safe to ship without a side-by-side accuracy test.
+_BATCH_PROMPT_PREFIX = """Ты — модуль контроля качества перевода для бюро переводов. Даны пары (контекст, исходный текст, перевод) на один целевой язык.
 Проверяй только критерии из "Что проверять" ниже. По умолчанию оценивай каждую пару отдельно от остальных — но если
 описание конкретного критерия ниже прямо просит сравнить пары между собой, следуй этому описанию для этого критерия.
 
@@ -278,7 +306,8 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 не пишешь сам). Если нужно различить конкретные места — используй ТОЛЬКО цитаты самого текста (например, конкретную
 фразу или предложение из перевода), а не номера пар.
 
-Пары для проверки:
+"""
+_BATCH_PROMPT_SUFFIX = """Пары для проверки:
 {pairs_block}
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив по всем парам без markdown и пояснений, строго в этой форме
@@ -289,6 +318,7 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 ]
 (используй "rows" вместо "row" ТОЛЬКО для настоящего повторения одной и той же проблемы в нескольких парах — см.
 выше; для обычной, отдельной находки в одной паре используй "row" как всегда)"""
+BATCH_PROMPT = _BATCH_PROMPT_PREFIX + _BATCH_PROMPT_SUFFIX
 
 # A leaner variant of BATCH_PROMPT for the case where a "batch" happens to
 # hold exactly ONE checkable pair — Александр's real test, 2026-09-22: the
@@ -308,7 +338,20 @@ BATCH_PROMPT = """Ты — модуль контроля качества пер
 # dropping every instruction that only makes sense with 2+ pairs to compare —
 # functionally converging on SINGLE_PROMPT's simplicity without a second,
 # differently-shaped response format to parse.
-BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качества перевода для бюро переводов. Дана одна пара (контекст, исходный текст, перевод).
+# Split into PREFIX/SUFFIX — same reasoning as BATCH_PROMPT's own split
+# above. This is the template the hard-language path actually uses one row
+# at a time (see this constant's own comment above), so caching its prefix
+# matters most here: without it, this exact block of instructions would be
+# billed at full price on EVERY single row for hi/hing/mr/te/etc., with no
+# 15-row batch to spread it across the way normal languages get. Unlike
+# BATCH_PROMPT, checks_description/other_type_instruction sit AFTER the
+# per-row context/source/translation in this template's own field order —
+# so, same rule as SINGLE_PROMPT's own split, they stay out of the
+# cacheable prefix rather than reordering existing wording. extra_instructions
+# CAN join the prefix here, unlike in SINGLE_PROMPT, because this template
+# already places it before the row content. BATCH_PROMPT_SINGLE_ITEM itself
+# is still the exact same text as before.
+_BATCH_PROMPT_SINGLE_ITEM_PREFIX = """Ты — модуль контроля качества перевода для бюро переводов. Дана одна пара (контекст, исходный текст, перевод).
 Проверяй только критерии из "Что проверять" ниже.
 
 {target_lang_line}
@@ -320,7 +363,8 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 Особые указания к задаче (важнее общих правил, если есть):
 {extra_instructions}
 
-Контекст: {context}
+"""
+_BATCH_PROMPT_SINGLE_ITEM_SUFFIX = """Контекст: {context}
 Исходный текст:
 \"\"\"{source}\"\"\"
 
@@ -339,6 +383,7 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 [
   {{"row": 1, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
 ]"""
+BATCH_PROMPT_SINGLE_ITEM = _BATCH_PROMPT_SINGLE_ITEM_PREFIX + _BATCH_PROMPT_SINGLE_ITEM_SUFFIX
 
 
 # ------------------------------------------------------- two-step pipeline ---
@@ -373,7 +418,19 @@ BATCH_PROMPT_SINGLE_ITEM = """Ты — модуль контроля качес�
 # BATCH_PROMPT_SINGLE_ITEM exists for the structured prompt, since there's
 # no cross-row-duplicate machinery to strip out of a free-text search pass
 # in the first place.
-FINDINGS_SEARCH_PROMPT = """Ты — опытный редактор переводов. Даны пары (контекст, исходный текст, перевод).
+# Split into PREFIX/SUFFIX (2026-09-25, Александр's cost-cutting ask) so
+# _search_findings/_search_findings_openai can hand _call_claude the exact
+# leading substring that's byte-identical across every chunk of the SAME
+# language (target_lang_line and source_lang_note are both fixed for a
+# whole run) — Anthropic's prompt caching then bills that repeated prefix
+# at ~10% of its normal price on every call after the first, instead of
+# full price every time. FINDINGS_SEARCH_PROMPT itself (below) is still
+# the exact same byte-for-byte text as before — just prefix+suffix glued
+# back together — so every existing caller/test that reads
+# FINDINGS_SEARCH_PROMPT directly (model_comparison.py, smoketest.py) is
+# unaffected. No wording or ordering changed — see _call_claude's own
+# cache_prefix comment for why this is safe.
+_FINDINGS_SEARCH_PROMPT_PREFIX = """Ты — опытный редактор переводов. Даны пары (контекст, исходный текст, перевод).
 Прочитай их совершенно свободно, БЕЗ заранее заданного списка типов ошибок и БЕЗ формальной шкалы уверенности —
 просто внимательно сверь каждую пару и отметь всё, что кажется тебе неправильным, сомнительным, нелогичным или
 просто заслуживающим внимания редактора: опечатки, грамматика, искажение смысла, пропуски, странности стиля —
@@ -384,7 +441,8 @@ FINDINGS_SEARCH_PROMPT = """Ты — опытный редактор перев�
 
 {source_lang_note}
 
-Пары для проверки:
+"""
+_FINDINGS_SEARCH_PROMPT_SUFFIX = """Пары для проверки:
 {pairs_block}
 
 Для каждой пары, где ты что-то заметил, напиши отдельную строку в формате:
@@ -393,6 +451,7 @@ NUMBER: короткое, но конкретное описание пробл�
 Пары, где всё в порядке, просто пропусти — не пиши по ним ничего. Если проблем нет вообще нигде — верни ровно одну
 строку: "проблем не найдено". Не используй JSON, markdown, вступления или заключения — только такие строки, по
 одной на строку."""
+FINDINGS_SEARCH_PROMPT = _FINDINGS_SEARCH_PROMPT_PREFIX + _FINDINGS_SEARCH_PROMPT_SUFFIX
 
 
 def _checkable_items(items: list[dict]) -> list[tuple[int, dict]]:
@@ -497,13 +556,16 @@ async def _search_findings(
     checkable = _checkable_items(items)
     if not checkable:
         return {}, 0.0
-    prompt = FINDINGS_SEARCH_PROMPT.format(
+    # cache_prefix: see _FINDINGS_SEARCH_PROMPT_PREFIX's own comment — fixed
+    # per (target_lang, source_lang), so it repeats across every chunk of
+    # the same language's Step 1 calls within one run.
+    cache_prefix = _FINDINGS_SEARCH_PROMPT_PREFIX.format(
         target_lang_line=_target_lang_line(target_lang),
         source_lang_note=_source_lang_note(source_lang),
-        pairs_block=_pairs_block(checkable),
     )
+    prompt = cache_prefix + _FINDINGS_SEARCH_PROMPT_SUFFIX.format(pairs_block=_pairs_block(checkable))
     model = model_override or _model_for_lang(target_lang)
-    text_block, usage, _stop_reason = await _call_claude(prompt, model=model)
+    text_block, usage, _stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
     return _parse_search_findings(text_block, checkable), _usage_cost(model, usage)
 
 
@@ -1308,6 +1370,31 @@ def _openai_usage_cost(model: str, usage: dict | None) -> float:
     return usage.get("prompt_tokens", 0) * rates["input"] + usage.get("completion_tokens", 0) * rates["output"]
 
 
+# Anthropic prompt caching (2026-09-25, Александр's cost-cutting ask — see
+# _call_claude's own cache_prefix parameter): a cache WRITE (the first call
+# to send a given prefix, or any call after the ~5-minute window lapses)
+# costs 25% MORE than a normal input token; a cache READ (a later call
+# reusing that exact prefix within the window) costs only 10%. Both are
+# reported separately from plain "input_tokens" in Anthropic's usage dict —
+# only present at all when a call actually used cache_control — so
+# _usage_cost below has to add them in on top of the existing input/output
+# math, not instead of it.
+#
+# Applied flat across every model in MODEL_PRICING_PER_TOKEN, which slightly
+# OVERSTATES the displayed cost for CLAUDE_MODEL_HARD/Opus specifically —
+# Anthropic's docs (checked 2026-09-25) price a cache READ on Opus at 5% of
+# input, not this table's flat 10%, and didn't confirm whether that applies
+# to plain "claude-opus-5" or only a later Opus point release. Same spirit
+# as this function's own "unpriced model degrades to $0 rather than guessing
+# wrong in either direction" — here the real Anthropic bill is completely
+# unaffected either way (this only feeds the "Стоимость: ..." number shown
+# in the report), and erring toward a SMALLER shown discount felt safer than
+# risking the opposite of the real bug Александр hit on 2026-09-17 (this
+# number confidently showing a saving that turned out not to be real).
+CACHE_WRITE_PRICE_MULTIPLIER = 1.25
+CACHE_READ_PRICE_MULTIPLIER = 0.1
+
+
 def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
     """USD cost of one API call from its token usage. Returns 0.0 (rather
     than raising) for an unpriced model or missing usage, so a pricing-table
@@ -1316,6 +1403,8 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
     if not rates or not usage:
         return 0.0
     cost = usage.get("input_tokens", 0) * rates["input"] + usage.get("output_tokens", 0) * rates["output"]
+    cost += usage.get("cache_creation_input_tokens", 0) * rates["input"] * CACHE_WRITE_PRICE_MULTIPLIER
+    cost += usage.get("cache_read_input_tokens", 0) * rates["input"] * CACHE_READ_PRICE_MULTIPLIER
     return cost * BATCH_PRICE_DISCOUNT if batch else cost
 
 
@@ -1330,17 +1419,48 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
 AI_MAX_TOKENS = 32000
 
 
-async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | None, dict, str | None]:
+async def _call_claude(
+    prompt: str, model: str | None = None, cache_prefix: str | None = None,
+) -> tuple[str | None, dict, str | None]:
     """Returns (response_text, usage, stop_reason) — usage is Anthropic's raw
     {"input_tokens": int, "output_tokens": int, ...} dict (empty when no API
     key is configured), used by callers to compute and surface this check's
     actual API cost. stop_reason is "max_tokens" when the response was cut
     off mid-generation (the response is then incomplete/truncated JSON) —
     callers use this to warn rather than silently show a partial result as
-    if it were complete."""
+    if it were complete.
+
+    cache_prefix (2026-09-25, Александр's cost-cutting ask): when given, MUST
+    be an exact leading substring of `prompt` (asserted below) — the fixed,
+    non-row-specific instruction text a caller has already identified as
+    byte-identical across many calls (see each *_PREFIX/*_SUFFIX prompt split
+    above BATCH_PROMPT, SINGLE_PROMPT, etc.). Sent as its own content block
+    with Anthropic's prompt-caching flag, so the model reads EXACTLY the same
+    text either way (cache_prefix + prompt[len(cache_prefix):] == prompt) —
+    this only changes how the request is billed, never what's in it. A call
+    that reuses the same cache_prefix within roughly 5 minutes of a prior one
+    is billed ~10% of the normal price for that block instead of full price;
+    the very first call (or one after the window lapses) pays a small ~25%
+    premium on just that block to write it into the cache. Below Anthropic's
+    minimum cacheable block size (confirmed against Anthropic's own docs,
+    2026-09-25: 1024 tokens for CLAUDE_MODEL/Sonnet, only 512 for
+    CLAUDE_MODEL_HARD/Opus — Opus's lower minimum is a small extra point in
+    favor of caching working out for the hard-language path specifically),
+    cache_control is silently a no-op — billed as ordinary input, no premium
+    and no discount — so passing a short cache_prefix here is always safe,
+    just not always a win. None (the default) sends `prompt` as a single
+    block, unchanged from before this parameter existed."""
     if not settings.ANTHROPIC_API_KEY:
         return None, {}, None
     resolved_model = model or settings.CLAUDE_MODEL
+    if cache_prefix:
+        assert prompt.startswith(cache_prefix), "cache_prefix must be an exact leading substring of prompt"
+        content: str | list[dict] = [
+            {"type": "text", "text": cache_prefix, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": prompt[len(cache_prefix):]},
+        ]
+    else:
+        content = prompt
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -1364,7 +1484,7 @@ async def _call_claude(prompt: str, model: str | None = None) -> tuple[str | Non
                 # model's behavior instead" — there's no replacement
                 # determinism knob, so consistency now has to come from
                 # clear prompt wording, not a request parameter.
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [{"role": "user", "content": content}],
             },
         )
         resp.raise_for_status()
@@ -1550,7 +1670,7 @@ async def run_ai_checks(
             target_lang=target_lang, source_lang=source_lang,
         )
 
-    prompt = SINGLE_PROMPT.format(
+    prompt_kwargs = dict(
         target_lang_line=_target_lang_line(target_lang),
         calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang, checks),
@@ -1564,8 +1684,12 @@ async def run_ai_checks(
         register_array_note=_register_array_note(checks, target_lang=target_lang),
         type_enum="|".join(sorted(_allowed_ai_types(checks))),
     )
+    # cache_prefix: see _SINGLE_PROMPT_PREFIX's own comment — fixed per
+    # (target_lang, checks), independent of this specific pair's text.
+    cache_prefix = _SINGLE_PROMPT_PREFIX.format(**prompt_kwargs)
+    prompt = cache_prefix + _SINGLE_PROMPT_SUFFIX.format(**prompt_kwargs)
     model = _model_for_lang(target_lang)
-    text_block, usage, stop_reason = await _call_claude(prompt, model=model)
+    text_block, usage, stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
     findings = _filter_findings_by_checks(parse_json_array(text_block), checks)
     if stop_reason == "max_tokens":
         findings = findings + [_truncation_warning()]
@@ -1602,7 +1726,7 @@ def build_batch_prompt(
     target_lang: str = "",
     source_lang: str = "",
     prior_findings: dict[int, list[str]] | None = None,
-) -> tuple[str | None, dict[int, int]]:
+) -> tuple[str | None, str | None, dict[int, int]]:
     """
     Builds the prompt for one language's batch of (context, source,
     translation) triples, without calling the API — shared by the
@@ -1625,11 +1749,20 @@ def build_batch_prompt(
     Message Batches path, still single-step — see its own module comment)
     is unaffected by this parameter's existence.
 
-    Returns (prompt, number_to_index) — prompt is None when there's nothing
-    to ask the AI (no AI check types selected, or nothing checkable).
-    number_to_index maps the 1-based "row" numbers used inside the prompt
-    back to the caller's original item indices — pass it to
-    group_batch_findings once you have the model's response.
+    Returns (prompt, cache_prefix, number_to_index) — prompt is None when
+    there's nothing to ask the AI (no AI check types selected, or nothing
+    checkable), and cache_prefix is None right along with it. cache_prefix
+    (2026-09-25, Александр's cost-cutting ask) is the leading substring of
+    `prompt` that's fixed for this whole document/run regardless of which
+    rows ended up in THIS particular chunk (see _BATCH_PROMPT_PREFIX/
+    _BATCH_PROMPT_SINGLE_ITEM_PREFIX's own comments) — pass it straight
+    through to _call_claude's own cache_prefix parameter; a caller that
+    doesn't (the Message Batches path, or a diagnostic like
+    model_comparison.py) can simply ignore it, `prompt` alone is still the
+    exact same text as before this parameter existed. number_to_index maps
+    the 1-based "row" numbers used inside the prompt back to the caller's
+    original item indices — pass it to group_batch_findings once you have
+    the model's response.
     """
     checks_description = _checks_description(checks)
     # Just a truthiness probe here (is there anything to ask the AI at
@@ -1637,11 +1770,11 @@ def build_batch_prompt(
     # exact wording once we know len(checkable), so the real value used in
     # the prompt is recomputed below with the correct single_item flag.
     if not checks_description and not _register_instructions(checks, batch=True, target_lang=target_lang):
-        return None, {}
+        return None, None, {}
 
     checkable = _checkable_items(items)
     if not checkable:
-        return None, {}
+        return None, None, {}
 
     is_single_item = len(checkable) == 1
     register_instructions = _register_instructions(
@@ -1664,7 +1797,8 @@ def build_batch_prompt(
         # per Александр's real test, apparently costly to accuracy) when
         # there's only one pair to look at in the first place.
         only_idx, only_item = checkable[0]
-        prompt = BATCH_PROMPT_SINGLE_ITEM.format(
+        cache_prefix = _BATCH_PROMPT_SINGLE_ITEM_PREFIX.format(**common_kwargs)
+        prompt = cache_prefix + _BATCH_PROMPT_SINGLE_ITEM_SUFFIX.format(
             context=only_item["context"] or "—",
             source=only_item["source"],
             translation=only_item["translation"],
@@ -1673,9 +1807,10 @@ def build_batch_prompt(
         )
     else:
         pairs_block = _pairs_block(checkable, prior_findings)
-        prompt = BATCH_PROMPT.format(pairs_block=pairs_block, **common_kwargs)
+        cache_prefix = _BATCH_PROMPT_PREFIX.format(**common_kwargs)
+        prompt = cache_prefix + _BATCH_PROMPT_SUFFIX.format(pairs_block=pairs_block, **common_kwargs)
     number_to_index = {n: idx for n, (idx, _) in enumerate(checkable, start=1)}
-    return prompt, number_to_index
+    return prompt, cache_prefix, number_to_index
 
 
 def group_batch_findings(raw: list, number_to_index: dict[int, int]) -> dict[int, list[dict]]:
@@ -1769,13 +1904,13 @@ async def run_ai_checks_batch(
             items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
         )
 
-    prompt, number_to_index = build_batch_prompt(
+    prompt, cache_prefix, number_to_index = build_batch_prompt(
         items, checks, extra_instructions, target_lang, source_lang, prior_findings=prior_findings,
     )
     if prompt is None:
         return {}, search_cost, False, search_warnings
     model = model_override or _model_for_lang(target_lang)
-    text_block, usage, stop_reason = await _call_claude(prompt, model=model)
+    text_block, usage, stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
@@ -1801,7 +1936,16 @@ async def run_ai_checks_batch(
 # "Комментарий" column Александр wants, so there's no second AI-authored
 # explanation to generate, parse, or trust.
 
-SECOND_OPINION_PROMPT = """Ниже — пронумерованный список находок по одному языку при проверке качества перевода. У каждой находки указан контекст (строка, источник, перевод) и описание проблемы.
+# Split into PREFIX/SUFFIX — same reasoning as the other four prompts'
+# splits above. This one is the cleanest case: literally everything except
+# the trailing {numbered_report} is fixed, full stop — not just per
+# language but across the ENTIRE app, every run, every language, forever.
+# run_second_opinion fires this once per language (not per chunk), but all
+# ~30 languages in one multi-check go out together via asyncio.gather, well
+# within Anthropic's cache window — so this prefix should hit cache on
+# language #2 onward in the very same run. SECOND_OPINION_PROMPT itself is
+# still the exact same text as before.
+_SECOND_OPINION_PROMPT_PREFIX = """Ниже — пронумерованный список находок по одному языку при проверке качества перевода. У каждой находки указан контекст (строка, источник, перевод) и описание проблемы.
 
 Оцени вероятность того, что каждая находка — реальная проблема, а не нормальный вариант перевода, устоявшийся термин, региональная особенность или ошибка самой проверки. Используй шкалу:
 - 90-100 — явная фактическая или техническая ошибка: перепутана цифра, валюта, единица измерения, потерян или искажён плейсхолдер, опечатка, искажён смысл.
@@ -1815,7 +1959,9 @@ SECOND_OPINION_PROMPT = """Ниже — пронумерованный спис�
 Каждому номеру находки из списка ниже должен соответствовать ровно один объект в массиве.
 
 Находки:
-{numbered_report}"""
+"""
+_SECOND_OPINION_PROMPT_SUFFIX = """{numbered_report}"""
+SECOND_OPINION_PROMPT = _SECOND_OPINION_PROMPT_PREFIX + _SECOND_OPINION_PROMPT_SUFFIX
 
 
 def _second_opinion_input(rows: list[dict]) -> tuple[str, list[dict]]:
@@ -1934,12 +2080,16 @@ async def run_second_opinion(rows: list[dict]) -> tuple[float, list[dict]]:
     if not finding_refs:
         return 0.0, []
 
-    prompt = SECOND_OPINION_PROMPT.format(numbered_report=numbered_report)
+    # cache_prefix: see _SECOND_OPINION_PROMPT_PREFIX's own comment — this
+    # one is fully static (no per-call fields at all), so it's the same
+    # constant across every language in every run, forever.
+    cache_prefix = _SECOND_OPINION_PROMPT_PREFIX
+    prompt = cache_prefix + _SECOND_OPINION_PROMPT_SUFFIX.format(numbered_report=numbered_report)
     sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
     gpt_expected = bool(settings.OPENAI_API_KEY)
 
     async def _sonnet() -> tuple[dict[int, int], float]:
-        text_block, usage, _ = await _call_claude(prompt, model=settings.CLAUDE_MODEL)
+        text_block, usage, _ = await _call_claude(prompt, model=settings.CLAUDE_MODEL, cache_prefix=cache_prefix)
         return _parse_second_opinion(parse_json_array(text_block)), _usage_cost(settings.CLAUDE_MODEL, usage)
 
     async def _gpt() -> tuple[dict[int, int], float]:
@@ -1981,13 +2131,36 @@ def _headers() -> dict:
     }
 
 
+def _batch_request_content(prompt: str, cache_prefix: str | None) -> str | list[dict]:
+    """Same prefix/suffix content-block split _call_claude's own cache_prefix
+    parameter does for the live path — confirmed against Anthropic's own
+    docs (2026-09-25) that the Message Batches API accepts cache_control the
+    same way a regular request does, AND that the cache is shared workspace-
+    wide between batch and non-batch calls (a batch request can hit a cache
+    a live call wrote moments earlier, and vice versa) — not isolated to
+    "requests inside the same batch job" the way it might have been assumed.
+    Below Anthropic's per-model minimum cacheable block size, this is a
+    silent no-op (billed as ordinary input, same as _call_claude's own
+    cache_prefix), so passing one is always safe."""
+    if not cache_prefix:
+        return prompt
+    assert prompt.startswith(cache_prefix), "cache_prefix must be an exact leading substring of prompt"
+    return [
+        {"type": "text", "text": cache_prefix, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": prompt[len(cache_prefix):]},
+    ]
+
+
 async def create_message_batch(requests: list[dict]) -> str | None:
     """requests: list of {"custom_id": str, "prompt": str, "model": str
-    (optional)}. Submits them all as one Anthropic Message Batch — each
-    request can specify its own model (see excel_multi.build_batch_plan,
-    which sets the per-language model via _model_for_lang), falling back to
-    the default CLAUDE_MODEL when omitted — and returns the batch id, or
-    None if there's no API key configured or nothing to submit."""
+    (optional), "cache_prefix": str (optional)}. Submits them all as one
+    Anthropic Message Batch — each request can specify its own model (see
+    excel_multi.build_batch_plan, which sets the per-language model via
+    _model_for_lang), falling back to the default CLAUDE_MODEL when omitted
+    — and returns the batch id, or None if there's no API key configured or
+    nothing to submit. cache_prefix, when a request has one, is split out
+    into its own cached content block (see _batch_request_content) — purely
+    a billing optimization, changes nothing about what's in the request."""
     if not settings.ANTHROPIC_API_KEY or not requests:
         return None
     batch_requests = [
@@ -2001,7 +2174,7 @@ async def create_message_batch(requests: list[dict]) -> str | None:
                 # 400 on newer models (confirmed live against Sonnet), and
                 # recommends prompting instead of a temperature parameter
                 # for consistent output on these models.
-                "messages": [{"role": "user", "content": r["prompt"]}],
+                "messages": [{"role": "user", "content": _batch_request_content(r["prompt"], r.get("cache_prefix"))}],
             },
         }
         for r in requests

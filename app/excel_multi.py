@@ -1235,11 +1235,22 @@ def build_batch_plan(
             offset = 0
             for chunk_idx, chunk_items in enumerate(_chunk_list(ai_items, _chunk_size_for_lang(lang))):
                 custom_id = f"s{s_idx}-t{lang_idx}-c{chunk_idx}"
-                prompt, number_to_index = build_batch_prompt(
+                prompt, cache_prefix, number_to_index = build_batch_prompt(
                     chunk_items, checks, extra_instructions, lang, source_lang,
                 )
                 if prompt is not None:
-                    requests.append({"custom_id": custom_id, "prompt": prompt, "model": model})
+                    # cache_prefix (2026-09-25, Александр's cost-cutting ask)
+                    # is fixed for the whole language regardless of which
+                    # chunk this is — see build_batch_prompt's own comment —
+                    # so every chunk of the same language shares it, and
+                    # Anthropic's cache is shared between this Batches
+                    # submission and the live path too (confirmed against
+                    # Anthropic's own docs, 2026-09-25), not just within one
+                    # batch job. create_message_batch splits it into its own
+                    # cached content block (see _batch_request_content).
+                    requests.append({
+                        "custom_id": custom_id, "prompt": prompt, "model": model, "cache_prefix": cache_prefix,
+                    })
                 chunks_skeleton.append({
                     "custom_id": custom_id if prompt is not None else None,
                     "number_to_index": {str(k): v for k, v in number_to_index.items()},

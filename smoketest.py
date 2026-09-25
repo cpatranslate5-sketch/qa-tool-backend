@@ -355,6 +355,31 @@ assert multi_data["created_at"], multi_data
 assert multi_data["completed_at"], multi_data
 print("[OK] completed multi-check response includes created_at/completed_at")
 
+# --- the automatic Sonnet+GPT second-opinion pass no longer blocks this
+# response (see app.main._run_second_opinion_background) — the check comes
+# back "completed" with second_opinion_pending=true immediately, and only
+# the LATER detail fetch (after the background task has had a chance to
+# run) shows it resolved to false, with every algorithmic finding already
+# scored 100/100 by run_second_opinion's own no-API-call fast path. Using
+# TestClient here, the background task actually finishes before client.post()
+# even returns (it runs as part of the same ASGI response cycle) — so this
+# also doubles as proof it doesn't crash or silently drop the update.
+assert multi_data["second_opinion_pending"] is True, multi_data
+r = check("multi-check detail after live check", client.get(
+    f"/projects/{project_id}/multi-check/{multi_check_id}", params={"manager_id": regular_id}
+))
+detail_after = r.json()
+assert detail_after["second_opinion_pending"] is False, detail_after
+any_finding_scored = any(
+    f.get("sonnet_percent") is not None
+    for sheet in detail_after["sheets"]
+    for rows in sheet["languages"].values()
+    for row in rows
+    for f in row["findings"]
+)
+assert any_finding_scored, detail_after
+print("[OK] multi-check: second_opinion_pending starts true on the POST response and resolves to false in the background, without blocking the response")
+
 # --- extend the catalog to a more realistic size before exercising
 # detect-languages against the real sample file (which spans ~30
 # languages) — mirrors an admin gradually building out their real
@@ -1124,7 +1149,7 @@ import app.claude_client as claude_client_mod
 _previous_call_claude = claude_client_mod._call_claude
 
 
-async def _fake_call_claude_failing(prompt, model=None):
+async def _fake_call_claude_failing(prompt, model=None, cache_prefix=None):
     raise _httpx_for_fault_injection.ConnectError("simulated Anthropic outage")
 
 
@@ -1157,7 +1182,7 @@ claude_client_mod._call_claude = _previous_call_claude
 # friendly "temporary outage" message forever. Locks in that the handler
 # above is registered for httpx.HTTPError specifically, not bare
 # Exception. ---
-async def _fake_call_claude_unrelated_bug(prompt, model=None):
+async def _fake_call_claude_unrelated_bug(prompt, model=None, cache_prefix=None):
     raise RuntimeError("some unrelated real bug, not an Anthropic/network failure")
 
 
@@ -1219,7 +1244,7 @@ class _FakeAuthErrorResponse:
     status_code = 401
 
 
-async def _fake_call_claude_auth_error(prompt, model=None):
+async def _fake_call_claude_auth_error(prompt, model=None, cache_prefix=None):
     raise _httpx_for_fault_injection.HTTPStatusError(
         "401 Unauthorized", request=None, response=_FakeAuthErrorResponse()
     )
@@ -2025,6 +2050,25 @@ print("[OK] «неполнота перевода» now also asks the AI to flag
       "that's dropped or altered between source and translation, per Александр's explicit ask that this "
       "stay AI-judged rather than a hardcoded rule (the forms vary too much to enumerate reliably)")
 
+# --- completeness: Александр's ask (2026-09-25) — an ordinal number for a
+# place/rank ("1st place", "4th-15th place") may lose its grammatical
+# ordinal suffix/ending in translation without that being a finding, even
+# though the source (RU or EN) has it. Added here (Step 2's structured,
+# calibrated criteria) rather than to FINDINGS_SEARCH_PROMPT (Step 1's
+# deliberately unconstrained search pass) — Step 1 is meant to over-catch
+# by design (see its own top comment: "отметить лишнее не страшно... а вот
+# промолчать нежелательно"), and every precedent exception of this kind
+# (the FS-abbreviation carve-out above, the synonym test in "typo") already
+# lives in a CHECK_LABELS description, which is exactly where
+# CALIBRATION_STRICT_OPENING says a "this is actually a fine variant" call
+# belongs. ---
+assert "порядковое числительное" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+assert "1st place" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+assert "ДОПУСТИМО и НЕ находка" in CHECK_LABELS["completeness"], CHECK_LABELS["completeness"]
+print("[OK] «неполнота перевода» now explicitly allows dropping a place/rank ordinal's grammatical "
+      "ending in translation (e.g. \"1st place\" -> just the number), added to Step 2's structured "
+      "criteria rather than Step 1's deliberately-unconstrained search pass")
+
 # --- a plain misspelling in the translation itself ("resulits" for
 # "results") must be in scope too, even though the meaning is still
 # perfectly clear from context — Александр hit this live: the AI didn't
@@ -2118,12 +2162,12 @@ assert "{other_type_instruction}" in BATCH_PROMPT_SINGLE_ITEM
 _squeeze_test_prompts = {"typo": [], "register": []}
 
 
-async def _fake_call_claude_records_prompt_typo(prompt, model=None):
+async def _fake_call_claude_records_prompt_typo(prompt, model=None, cache_prefix=None):
     _squeeze_test_prompts["typo"].append(prompt)
     return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
 
 
-async def _fake_call_claude_records_prompt_register(prompt, model=None):
+async def _fake_call_claude_records_prompt_register(prompt, model=None, cache_prefix=None):
     _squeeze_test_prompts["register"].append(prompt)
     return '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]', {"input_tokens": 10, "output_tokens": 5}, "end_turn"
 
@@ -2320,7 +2364,7 @@ print("[OK] _resolve_repeated_findings: the internal row-index list is turned in
 from app.excel_multi import _check_language_for_sheet
 
 
-async def _fake_call_claude_repeated_batch(prompt, model=None):
+async def _fake_call_claude_repeated_batch(prompt, model=None, cache_prefix=None):
     return (
         '[{"row": 2, "type": "typo", "severity": "low", "message": "мелкая опечатка только здесь"},'
         '{"rows": [1, 3], "type": "untranslatable", "severity": "medium", '
@@ -2444,7 +2488,7 @@ _chunk_call_prompts: list[str] = []
 _chunk_structured_call_count = {"n": 0}
 
 
-async def _fake_call_claude_chunked(prompt, model=None):
+async def _fake_call_claude_chunked(prompt, model=None, cache_prefix=None):
     _chunk_call_prompts.append(prompt)
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "проблем не найдено", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
@@ -2526,7 +2570,7 @@ _hard_chunk_sheet = {"sheet_name": "Sheet1", "languages": ["ru", "mr"], "rows": 
 _hard_chunk_calls = {"n": 0}
 
 
-async def _fake_call_claude_count_calls(prompt, model=None):
+async def _fake_call_claude_count_calls(prompt, model=None, cache_prefix=None):
     _hard_chunk_calls["n"] += 1
     return "[]", {"input_tokens": 20, "output_tokens": 5}, "end_turn"
 
@@ -2563,7 +2607,10 @@ from app.claude_client import build_batch_prompt as _build_batch_prompt_direct
 from app.claude_client import BATCH_PROMPT_SINGLE_ITEM
 
 _one_item = [{"context": "freebet", "source": "Фрибет без отыгрыша", "translation": "पैज न लावता फ्री बेट"}]
-_one_prompt, _one_map = _build_batch_prompt_direct(_one_item, ["typo"], "", "mr", "ru")
+_one_prompt, _one_cache_prefix, _one_map = _build_batch_prompt_direct(_one_item, ["typo"], "", "mr", "ru")
+assert _one_prompt.startswith(_one_cache_prefix), (
+    "build_batch_prompt's cache_prefix must be an exact leading substring of its own returned prompt"
+)
 assert "Повторяется по всему документу" not in _one_prompt, (
     "a single-item prompt must NOT include the cross-row duplicate-detection instructions — there's nothing "
     "to compare against with only one pair, and Александр's real test showed this extra text costs accuracy"
@@ -2576,13 +2623,17 @@ _two_items = [
     {"context": "a", "source": "Hello", "translation": "Привет"},
     {"context": "b", "source": "World", "translation": "Мир"},
 ]
-_two_prompt, _two_map = _build_batch_prompt_direct(_two_items, ["typo"], "", "ru", "en")
+_two_prompt, _two_cache_prefix, _two_map = _build_batch_prompt_direct(_two_items, ["typo"], "", "ru", "en")
 assert "Повторяется по всему документу" in _two_prompt, (
     "a real multi-item batch must still get the full cross-row duplicate-detection instructions — this is "
     "ONLY skipped for the single-item case, not lost for genuine batches"
 )
 assert "Дана одна пара" not in _two_prompt
 assert _two_map == {1: 0, 2: 1}
+assert _two_prompt.startswith(_two_cache_prefix) and "Повторяется по всему документу" in _two_cache_prefix, (
+    "the multi-item cache_prefix should include the cross-row duplicate-detection instructions — they're fixed "
+    "for the whole run, not per-chunk, so they belong in the cacheable part, not just {pairs_block} onward"
+)
 
 # Two review-caught defects, both fixed before shipping: (1) the single-item
 # template must still forbid citing internal row/pair numbers inside a
@@ -2593,7 +2644,7 @@ assert _two_map == {1: 0, 2: 1}
 assert "НИКОГДА не упоминай" in _one_prompt, (
     "the single-item prompt must still forbid citing internal row/pair numbers in a finding's message text"
 )
-_one_prompt_reg, _ = _build_batch_prompt_direct(_one_item, ["typo", "register"], "", "mr", "ru")
+_one_prompt_reg, _, _ = _build_batch_prompt_direct(_one_item, ["typo", "register"], "", "mr", "ru")
 assert "Пары для проверки" not in _one_prompt_reg, (
     f"register instructions for a single-item prompt must NOT reference the (nonexistent, in this template) "
     f"«Пары для проверки» list — got {_one_prompt_reg!r}"
@@ -2602,7 +2653,7 @@ assert '"row": 1' in _one_prompt_reg and "register_value" in _one_prompt_reg, (
     "the single-item register instructions must still ask for a row-numbered register_value entry, matching "
     "the JSON shape group_batch_findings/_extract_register_values expect"
 )
-_two_prompt_reg, _ = _build_batch_prompt_direct(_two_items, ["typo", "register"], "", "ru", "en")
+_two_prompt_reg, _, _ = _build_batch_prompt_direct(_two_items, ["typo", "register"], "", "ru", "en")
 assert "Пары для проверки" in _two_prompt_reg, (
     "a real multi-item batch's register instructions must still reference the pairs list as before"
 )
@@ -2742,7 +2793,7 @@ settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 captured_prompts = []
 
 
-async def _fake_call_claude(prompt, model=None):
+async def _fake_call_claude(prompt, model=None, cache_prefix=None):
     captured_prompts.append(prompt)
     # Simulates a model that ignores "проверяй только typo" and
     # reports an untranslatable-text issue anyway.
@@ -2801,7 +2852,7 @@ assert _filter_findings_by_checks(_other_raw_findings, ["typo"]) == _other_raw_f
 )
 
 
-async def _fake_call_claude_other_type(prompt, model=None):
+async def _fake_call_claude_other_type(prompt, model=None, cache_prefix=None):
     return (
         '[{"type": "typo", "severity": "medium", "message": "обычная опечатка"},'
         '{"type": "other", "severity": "high", "message": "явная ошибка смысла вне списка проверок"}]',
@@ -2848,7 +2899,7 @@ print("[OK] parse_json_array: a JSON array cut off mid-object (max_tokens trunca
       "keeps every complete finding before the cut instead of losing the whole response")
 
 
-async def _fake_call_claude_truncated(prompt, model=None):
+async def _fake_call_claude_truncated(prompt, model=None, cache_prefix=None):
     return ('[{"type": "typo", "severity": "medium", "message": "неверная валюта"}]',
             {"input_tokens": 500, "output_tokens": 100}, "max_tokens")
 
@@ -3121,7 +3172,7 @@ print("[OK] build_register_report: everywhere-the-same reports just the bare wor
 # "register_summary" finding from a mocked AI response, and — critically —
 # the raw register_value entry itself never leaks into the visible
 # findings (it's not a real problem, so it must never look like one) ---
-async def _fake_call_claude_register_single(prompt, model=None):
+async def _fake_call_claude_register_single(prompt, model=None, cache_prefix=None):
     assert REGISTER_VALUE_TYPE in prompt
     return (
         f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "formal", "message": ""}}]',
@@ -3150,7 +3201,7 @@ print("[OK] standalone /check with only \"register\" selected turns a mocked AI 
 # register-only /check must not call the AI AT ALL — a poison mock that
 # raises if invoked proves it, rather than just checking the output looks
 # right (which a lucky no-op response could also produce). ---
-async def _poison_call_claude(prompt, model=None):
+async def _poison_call_claude(prompt, model=None, cache_prefix=None):
     raise AssertionError("the AI must never be called for a register-only check on a language with "
                           "no formal/informal distinction (English) — nothing to ask it")
 
@@ -3187,7 +3238,7 @@ _reg_sheet = {
 }
 
 
-async def _fake_call_claude_register_batch(prompt, model=None):
+async def _fake_call_claude_register_batch(prompt, model=None, cache_prefix=None):
     assert REGISTER_VALUE_TYPE in prompt
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
@@ -3269,7 +3320,7 @@ print("[OK] multi-check Message-Batches path (finalize_batch_results): the same 
 from app.claude_client import REGISTER_MIXED_TYPE
 
 
-async def _fake_call_claude_register_mixed_single(prompt, model=None):
+async def _fake_call_claude_register_mixed_single(prompt, model=None, cache_prefix=None):
     return (
         f'[{{"type": "{REGISTER_VALUE_TYPE}", "severity": "low", "value": "mixed", "message": ""}}]',
         {"input_tokens": 10, "output_tokens": 10},
@@ -3297,7 +3348,7 @@ print("[OK] standalone /check: a single pair the model reports as internally mix
 # (both remaining rows are "formal", so the summary must read plainly
 # "везде на «вы»" with no exceptions at all, as if row 3 didn't exist for
 # that purpose).
-async def _fake_call_claude_register_mixed_batch(prompt, model=None):
+async def _fake_call_claude_register_mixed_batch(prompt, model=None, cache_prefix=None):
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""},'
         '{"row": 2, "type": "register_value", "severity": "low", "value": "mixed", "message": ""},'
@@ -4159,7 +4210,7 @@ from app.claude_client import run_ai_checks_batch as _run_ai_checks_batch_direct
 _two_step_prompts: list[str] = []
 
 
-async def _fake_call_claude_two_step(prompt, model=None):
+async def _fake_call_claude_two_step(prompt, model=None, cache_prefix=None):
     _two_step_prompts.append(prompt)
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: пропущено отрицание в переводе", {"input_tokens": 30, "output_tokens": 10}, "end_turn"
@@ -4211,7 +4262,7 @@ print("[OK] run_ai_checks_batch: the two-step pipeline actually runs Step 1 (fre
 _reg_only_prompts: list[str] = []
 
 
-async def _fake_call_claude_reg_only_two_step(prompt, model=None):
+async def _fake_call_claude_reg_only_two_step(prompt, model=None, cache_prefix=None):
     _reg_only_prompts.append(prompt)
     return (
         '[{"row": 1, "type": "register_value", "severity": "low", "value": "formal", "message": ""}]',
@@ -4244,7 +4295,7 @@ from app.claude_client import run_ai_checks_batch as _run_ai_checks_batch_direct
 _override_seen_models = []
 
 
-async def _fake_call_claude_records_model(prompt, model=None):
+async def _fake_call_claude_records_model(prompt, model=None, cache_prefix=None):
     _override_seen_models.append(model)
     return "[]", {"input_tokens": 5, "output_tokens": 2}, "end_turn"
 
@@ -4297,7 +4348,7 @@ print("[OK] _openai_usage_cost: missing usage/unpriced model degrades to $0 rath
 _previous_call_openai = claude_client_mod._call_openai
 
 
-async def _fake_call_claude_ensemble_sonnet(prompt, model=None):
+async def _fake_call_claude_ensemble_sonnet(prompt, model=None, cache_prefix=None):
     return "1: sonnet-находка", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
 
 
@@ -4324,7 +4375,7 @@ print("[OK] _ensemble_search_findings: Step 1 runs under Sonnet AND GPT concurre
       "configured models succeed")
 
 
-async def _fake_call_claude_ensemble_dup(prompt, model=None):
+async def _fake_call_claude_ensemble_dup(prompt, model=None, cache_prefix=None):
     return "1: одна и та же находка", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
 
 
@@ -4355,7 +4406,7 @@ async def _fake_call_openai_broken(prompt, model=None):
     raise _httpx_for_fault_injection.ConnectError("simulated OpenAI outage")
 
 
-async def _fake_call_claude_broken(prompt, model=None):
+async def _fake_call_claude_broken(prompt, model=None, cache_prefix=None):
     raise _httpx_for_fault_injection.ConnectError("simulated Anthropic outage")
 
 
@@ -4476,7 +4527,7 @@ _e2e_claude_calls: list[str] = []
 _e2e_openai_calls: list[str] = []
 
 
-async def _fake_call_claude_e2e_ensemble(prompt, model=None):
+async def _fake_call_claude_e2e_ensemble(prompt, model=None, cache_prefix=None):
     _e2e_claude_calls.append(prompt)
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: sonnet видит пропуск", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
@@ -4522,7 +4573,7 @@ print("[OK] run_ai_checks_batch: with an OpenAI key configured, Step 1 really do
 _e2e_warn_claude_calls: list[str] = []
 
 
-async def _fake_call_claude_e2e_warn(prompt, model=None):
+async def _fake_call_claude_e2e_warn(prompt, model=None, cache_prefix=None):
     _e2e_warn_claude_calls.append(prompt)
     if prompt.startswith("Ты — опытный редактор переводов"):
         return "1: sonnet видит пропуск", {"input_tokens": 20, "output_tokens": 8}, "end_turn"
@@ -4648,7 +4699,7 @@ def _cmp_name_for(model_id):
     return "haiku"
 
 
-async def _fake_call_claude_for_comparison(prompt, model=None):
+async def _fake_call_claude_for_comparison(prompt, model=None, cache_prefix=None):
     name = _cmp_name_for(model)
     _cmp_counts[name] += 1
     if name == "opus":
@@ -4720,7 +4771,7 @@ print("[OK] run_model_comparison: runs the same real row through Opus/Sonnet/Hai
 _cmp_raw_counts = {"opus": 0}
 
 
-async def _fake_call_claude_wrong_type(prompt, model=None):
+async def _fake_call_claude_wrong_type(prompt, model=None, cache_prefix=None):
     _cmp_raw_counts["opus"] += 1
     # The model DID notice something real — it just used a type name
     # ("grammar") outside the "typo"/"other" enum this run actually asked
@@ -4792,7 +4843,7 @@ assert _DEFAULT_COMPARISON_MODELS == ["sonnet", "haiku"], (
 _models_counts = {"opus": 0, "sonnet": 0, "haiku": 0}
 
 
-async def _fake_call_claude_records_model_name(prompt, model=None):
+async def _fake_call_claude_records_model_name(prompt, model=None, cache_prefix=None):
     _models_counts[_cmp_name_for(model)] += 1
     return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
 
@@ -4896,7 +4947,7 @@ print("[OK] _parse_bare_response: 'ПРОБЛЕМА: да' with an explanation b
 _bare_seen_prompts = []
 
 
-async def _fake_call_claude_bare(prompt, model=None):
+async def _fake_call_claude_bare(prompt, model=None, cache_prefix=None):
     _bare_seen_prompts.append(prompt)
     name = _cmp_name_for(model)
     if name == "sonnet":
@@ -4946,7 +4997,7 @@ print("[OK] run_model_comparison: bare=True sends a genuinely minimal prompt (no
 _two_step_cmp_prompts: dict[str, list[str]] = {"opus": [], "sonnet": [], "haiku": []}
 
 
-async def _fake_call_claude_two_step_cmp(prompt, model=None):
+async def _fake_call_claude_two_step_cmp(prompt, model=None, cache_prefix=None):
     name = _cmp_name_for(model)
     _two_step_cmp_prompts[name].append(prompt)
     if prompt.startswith("Ты — опытный редактор переводов"):
@@ -4993,7 +5044,7 @@ print("[OK] run_model_comparison: two_step=True runs Step 1 (free search) under 
 _cmp_counts2 = {"opus": 0, "sonnet": 0, "haiku": 0}
 
 
-async def _fake_call_claude_counts_only(prompt, model=None):
+async def _fake_call_claude_counts_only(prompt, model=None, cache_prefix=None):
     _cmp_counts2[_cmp_name_for(model)] += 1
     return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
 
@@ -5019,7 +5070,7 @@ print(f"[OK] run_model_comparison: an oversized runs_per_model is capped at MAX_
 _cmp_calls_register = {"n": 0}
 
 
-async def _fake_call_claude_register_only(prompt, model=None):
+async def _fake_call_claude_register_only(prompt, model=None, cache_prefix=None):
     _cmp_calls_register["n"] += 1
     return (
         '[{"row": 1, "type": "register_value", "value": "formal"}]',
@@ -5047,7 +5098,7 @@ print("[OK] run_model_comparison: a register_value entry (the register side-chan
 _cmp_counts3 = {"n": 0}
 
 
-async def _fake_call_claude_should_not_be_called(prompt, model=None):
+async def _fake_call_claude_should_not_be_called(prompt, model=None, cache_prefix=None):
     _cmp_counts3["n"] += 1
     return "[]", {}, "end_turn"
 
@@ -5192,7 +5243,7 @@ _rows_algo_only = [
 ]
 
 
-async def _fake_call_claude_so_should_not_run(prompt, model=None):
+async def _fake_call_claude_so_should_not_run(prompt, model=None, cache_prefix=None):
     raise AssertionError("must not call Claude when there are no AI-judged findings to score")
 
 
@@ -5216,7 +5267,7 @@ print("[OK] run_second_opinion: a language with ONLY algorithmic findings gets t
       "rather than depending on a model correctly following a prompt instruction, and costs nothing")
 
 
-async def _fake_call_claude_so_ok(prompt, model=None):
+async def _fake_call_claude_so_ok(prompt, model=None, cache_prefix=None):
     assert "1. опечатка A" in prompt and "2. не переведено B" in prompt, prompt
     return '[{"n": 1, "percent": 85}, {"n": 2, "percent": 20}]', {"input_tokens": 100, "output_tokens": 20}, "end_turn"
 
@@ -5264,7 +5315,7 @@ _rows_fail = [
 ]
 
 
-async def _fake_call_claude_so_single(prompt, model=None):
+async def _fake_call_claude_so_single(prompt, model=None, cache_prefix=None):
     return '[{"n": 1, "percent": 85}]', {"input_tokens": 100, "output_tokens": 20}, "end_turn"
 
 
@@ -5326,7 +5377,7 @@ _results_for_apply_test = {
 }
 
 
-async def _fake_call_claude_apply(prompt, model=None):
+async def _fake_call_claude_apply(prompt, model=None, cache_prefix=None):
     return '[{"n": 1, "percent": 77}]', {"input_tokens": 50, "output_tokens": 10}, "end_turn"
 
 
@@ -5419,5 +5470,169 @@ print("[OK] apply_second_opinion: an unexpected exception in one language's seco
       "model API call failing, which run_second_opinion already handles per-branch — something else "
       "entirely) is caught per-language, surfaces as a visible warning instead of failing silently, and "
       "never takes the rest of an already-successful multi-check down with it")
+
+# --- Anthropic prompt caching (2026-09-25, Александр's cost-cutting ask —
+# see claude_client._call_claude's own cache_prefix comment). Two things
+# need proving: (1) every *_PREFIX/*_SUFFIX split still reconstructs the
+# EXACT same full prompt text as before — a typo in a split boundary would
+# silently change what the model reads, which is exactly what this whole
+# design is supposed to make impossible; (2) _call_claude/_batch_request_content
+# actually build the two-block cache_control structure Anthropic expects,
+# and never claim a cache_prefix that isn't really a leading substring of
+# the prompt. ---
+from app.claude_client import (
+    _FINDINGS_SEARCH_PROMPT_PREFIX, _FINDINGS_SEARCH_PROMPT_SUFFIX, FINDINGS_SEARCH_PROMPT,
+    _SINGLE_PROMPT_PREFIX, _SINGLE_PROMPT_SUFFIX, SINGLE_PROMPT,
+    _BATCH_PROMPT_PREFIX, _BATCH_PROMPT_SUFFIX, BATCH_PROMPT,
+    _BATCH_PROMPT_SINGLE_ITEM_PREFIX, _BATCH_PROMPT_SINGLE_ITEM_SUFFIX, BATCH_PROMPT_SINGLE_ITEM,
+    _SECOND_OPINION_PROMPT_PREFIX, _SECOND_OPINION_PROMPT_SUFFIX, SECOND_OPINION_PROMPT,
+    _call_claude, _batch_request_content, CACHE_WRITE_PRICE_MULTIPLIER, CACHE_READ_PRICE_MULTIPLIER,
+)
+
+for _prefix, _suffix, _full, _name in [
+    (_FINDINGS_SEARCH_PROMPT_PREFIX, _FINDINGS_SEARCH_PROMPT_SUFFIX, FINDINGS_SEARCH_PROMPT, "FINDINGS_SEARCH_PROMPT"),
+    (_SINGLE_PROMPT_PREFIX, _SINGLE_PROMPT_SUFFIX, SINGLE_PROMPT, "SINGLE_PROMPT"),
+    (_BATCH_PROMPT_PREFIX, _BATCH_PROMPT_SUFFIX, BATCH_PROMPT, "BATCH_PROMPT"),
+    (_BATCH_PROMPT_SINGLE_ITEM_PREFIX, _BATCH_PROMPT_SINGLE_ITEM_SUFFIX, BATCH_PROMPT_SINGLE_ITEM,
+     "BATCH_PROMPT_SINGLE_ITEM"),
+    (_SECOND_OPINION_PROMPT_PREFIX, _SECOND_OPINION_PROMPT_SUFFIX, SECOND_OPINION_PROMPT, "SECOND_OPINION_PROMPT"),
+]:
+    assert _prefix + _suffix == _full, (
+        f"{_name}'s PREFIX+SUFFIX split must reconstruct the exact original template text byte-for-byte — a "
+        f"caching optimization must never change what the model actually reads"
+    )
+print("[OK] every prompt-caching PREFIX/SUFFIX split (FINDINGS_SEARCH_PROMPT, SINGLE_PROMPT, BATCH_PROMPT, "
+      "BATCH_PROMPT_SINGLE_ITEM, SECOND_OPINION_PROMPT) still reconstructs byte-for-byte the exact same full "
+      "prompt text as before caching existed — the model reads identical text either way, only billing changes")
+
+
+class _RecordedCacheRequest:
+    def __init__(self, json_body):
+        self.json_body = json_body
+
+
+class _FakeCacheCaptureResponse:
+    status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"content": [{"type": "text", "text": "[]"}], "usage": {}, "stop_reason": "end_turn"}
+
+
+class _FakeCacheCaptureClient:
+    last_request: "_RecordedCacheRequest | None" = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        _FakeCacheCaptureClient.last_request = _RecordedCacheRequest(json)
+        return _FakeCacheCaptureResponse()
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-cache-test"
+_previous_async_client_for_cache = claude_client_mod.httpx.AsyncClient
+claude_client_mod.httpx.AsyncClient = _FakeCacheCaptureClient
+
+asyncio.run(_call_claude("полный текст промпта", model="claude-sonnet-5"))
+_body_no_cache = _FakeCacheCaptureClient.last_request.json_body
+assert _body_no_cache["messages"][0]["content"] == "полный текст промпта", (
+    "with no cache_prefix, _call_claude must send the prompt as a single plain string, unchanged from before "
+    f"this parameter existed — got {_body_no_cache['messages'][0]['content']!r}"
+)
+
+_full_text = "СТАТИЧНАЯ ЧАСТЬ ПРОМПТА, ПОВТОРЯЮЩАЯСЯ МЕЖДУ ВЫЗОВАМИ. ДИНАМИЧЕСКАЯ ЧАСТЬ, РАЗНАЯ КАЖДЫЙ РАЗ."
+_static_part = "СТАТИЧНАЯ ЧАСТЬ ПРОМПТА, ПОВТОРЯЮЩАЯСЯ МЕЖДУ ВЫЗОВАМИ. "
+asyncio.run(
+    _call_claude(_full_text, model="claude-sonnet-5", cache_prefix=_static_part)
+)
+_body_cached = _FakeCacheCaptureClient.last_request.json_body
+_content_blocks = _body_cached["messages"][0]["content"]
+assert isinstance(_content_blocks, list) and len(_content_blocks) == 2, (
+    f"with a cache_prefix, _call_claude must send content as exactly two blocks — got {_content_blocks!r}"
+)
+assert _content_blocks[0] == {"type": "text", "text": _static_part, "cache_control": {"type": "ephemeral"}}, (
+    f"the first block must be the cache_prefix text with an ephemeral cache_control flag — got {_content_blocks[0]!r}"
+)
+assert _content_blocks[1] == {"type": "text", "text": "ДИНАМИЧЕСКАЯ ЧАСТЬ, РАЗНАЯ КАЖДЫЙ РАЗ."}, (
+    f"the second block must be exactly the remainder of the prompt, with no cache_control — got {_content_blocks[1]!r}"
+)
+assert _content_blocks[0]["text"] + _content_blocks[1]["text"] == _full_text, (
+    "the two blocks concatenated must equal the original prompt exactly — the model must read identical text "
+    "whether or not caching is used"
+)
+
+try:
+    asyncio.run(
+        _call_claude("ABC", model="claude-sonnet-5", cache_prefix="not a real prefix")
+    )
+    raise AssertionError("_call_claude must refuse a cache_prefix that isn't an actual leading substring of prompt")
+except AssertionError as _e:
+    assert "leading substring" in str(_e), f"wrong assertion fired: {_e}"
+
+claude_client_mod.httpx.AsyncClient = _previous_async_client_for_cache
+settings.ANTHROPIC_API_KEY = ""
+print("[OK] _call_claude: with no cache_prefix, sends `prompt` as a single plain string exactly as before; with "
+      "a cache_prefix, splits it into two content blocks (the prefix carrying Anthropic's ephemeral cache_control "
+      "flag, the remainder plain) that concatenate back to the identical original text; and refuses a cache_prefix "
+      "that isn't actually a leading substring of the prompt rather than silently sending mismatched content")
+
+# --- _batch_request_content: same split, but for the Message Batches path
+# (excel_multi.build_batch_plan / create_message_batch) — confirmed against
+# Anthropic's own docs (2026-09-25) that the Batches API accepts cache_control
+# the same way and shares its cache with the live path, so this deserves the
+# same coverage as _call_claude's own split above. ---
+assert _batch_request_content("привет мир", None) == "привет мир", (
+    "with no cache_prefix, _batch_request_content must return the prompt unchanged (plain string)"
+)
+_batch_blocks = _batch_request_content("СТАТИКА-ДИНАМИКА", "СТАТИКА-")
+assert _batch_blocks == [
+    {"type": "text", "text": "СТАТИКА-", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "ДИНАМИКА"},
+], f"_batch_request_content must split into the same two-block shape _call_claude uses — got {_batch_blocks!r}"
+print("[OK] _batch_request_content (Message Batches path): same no-cache-prefix passthrough and two-block cache "
+      "split as _call_claude's own live-path version — the two paths bill identically for the same prompt")
+
+# --- cost accounting must actually add in cache write/read tokens, not just
+# plain input/output — otherwise the "Стоимость: ..." number shown in the
+# report would UNDERSTATE the real bill on every cached call, the same kind
+# of silent-wrong-number bug Александр hit on 2026-09-17 with an unpriced
+# model id (see MODEL_PRICING_PER_TOKEN's own comment), just in the other
+# direction. ---
+_cache_usage = {
+    "input_tokens": 100, "output_tokens": 50,
+    "cache_creation_input_tokens": 2000, "cache_read_input_tokens": 8000,
+}
+_sonnet_rates = MODEL_PRICING_PER_TOKEN["claude-sonnet-5"]
+_expected_cache_cost = (
+    100 * _sonnet_rates["input"] + 50 * _sonnet_rates["output"]
+    + 2000 * _sonnet_rates["input"] * CACHE_WRITE_PRICE_MULTIPLIER
+    + 8000 * _sonnet_rates["input"] * CACHE_READ_PRICE_MULTIPLIER
+)
+_actual_cache_cost = _usage_cost("claude-sonnet-5", _cache_usage)
+assert abs(_actual_cache_cost - _expected_cache_cost) < 1e-12, (
+    f"_usage_cost must price cache_creation_input_tokens at {CACHE_WRITE_PRICE_MULTIPLIER}x and "
+    f"cache_read_input_tokens at {CACHE_READ_PRICE_MULTIPLIER}x the model's normal input rate, ON TOP OF plain "
+    f"input/output tokens — expected {_expected_cache_cost}, got {_actual_cache_cost}"
+)
+# A call that never used caching at all (no cache_* keys in usage) must cost
+# exactly what it always did — this is additive, not a replacement for the
+# existing input/output math.
+_plain_usage = {"input_tokens": 100, "output_tokens": 50}
+_expected_plain_cost = 100 * _sonnet_rates["input"] + 50 * _sonnet_rates["output"]
+assert abs(_usage_cost("claude-sonnet-5", _plain_usage) - _expected_plain_cost) < 1e-12, (
+    "a call with no cache usage at all must be priced exactly as before this feature existed"
+)
+print("[OK] _usage_cost: correctly adds cache-write tokens at 1.25x and cache-read tokens at 0.1x the model's "
+      "normal input rate on top of plain input/output cost, while a call with no cache usage at all is priced "
+      "exactly as it always was")
 
 print("\nALL SMOKETEST CHECKS PASSED")

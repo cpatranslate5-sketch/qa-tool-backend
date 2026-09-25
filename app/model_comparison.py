@@ -141,7 +141,11 @@ async def _one_run(
     prior_findings: dict[int, list[str]] | None = None
     if two_step:
         prior_findings, search_cost = await _run_search_step(item, target_lang, source_lang, model_id, semaphore)
-    prompt, number_to_index = _claude_client.build_batch_prompt(
+    # cache_prefix ignored here on purpose — this diagnostic fires each
+    # candidate model exactly once per test row, so there's nothing for a
+    # cached prefix to be reused AGAINST within the same run; see
+    # build_batch_prompt's own cache_prefix comment.
+    prompt, _cache_prefix, number_to_index = _claude_client.build_batch_prompt(
         [item], checks, target_lang=target_lang, source_lang=source_lang, prior_findings=prior_findings,
     )
     if prompt is None:
