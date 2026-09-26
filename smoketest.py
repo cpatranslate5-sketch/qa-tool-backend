@@ -1563,14 +1563,15 @@ print("[OK] pick_source_lang: resolves the manager's chosen source language agai
       "a differently-granular spelling of the same language in the file, instead of "
       "silently falling back to English")
 
-# --- model tiering: RETIRED 2026-09-23 (Александр's ask — see
-# claude_client.HARD_LANGUAGE_BASES's own comment) — _model_for_lang now
-# always returns CLAUDE_MODEL (Sonnet) for every language, hard or not; the
-# two-step search-then-check pipeline replaced the old per-language Opus
-# routing. _is_hard_language (matched by base subtag, so any region variant
-# qualifies too) is kept ONLY for the chunk-size decision
-# (MAX_ROWS_PER_AI_CALL_HARD) — confirmed below that it's unaffected by the
-# model-routing retirement and still recognizes the same 15-language list. ---
+# --- model tiering: RESTORED 2026-09-26 (Александр's ask — see
+# claude_client.HARD_LANGUAGE_BASES's own comment for the real
+# chunk-size-comparison result that led here) after having been RETIRED
+# 2026-09-23 — _model_for_lang once again routes hard languages to
+# CLAUDE_MODEL_HARD (Opus) and everything else to CLAUDE_MODEL (Sonnet).
+# _is_hard_language (matched by base subtag, so any region variant
+# qualifies too) is shared by both this model choice AND the chunk-size
+# decision (MAX_ROWS_PER_AI_CALL_HARD) — confirmed below that it still
+# recognizes the same 15-language list either way. ---
 from app.claude_client import _model_for_lang, _is_hard_language
 from app.config import settings
 
@@ -1580,14 +1581,14 @@ for hard in [
     "tg-TJ", "ur", "ur-PK",
 ]:
     assert _is_hard_language(hard), hard
-    assert _model_for_lang(hard) == settings.CLAUDE_MODEL, hard
+    assert _model_for_lang(hard) == settings.CLAUDE_MODEL_HARD, hard
 for normal in ["ru", "es-mx", "en", "de-DE", "fr", "kk", "kk-KZ", "uz", "sw-KE", "az-AZ"]:
     assert not _is_hard_language(normal), normal
     assert _model_for_lang(normal) == settings.CLAUDE_MODEL, normal
-print("[OK] _model_for_lang: confirmed EVERY language (hard or not) now routes to CLAUDE_MODEL (Opus retired, "
-      "2026-09-23) — and that _is_hard_language still separately recognizes the same 15-language list "
-      "(ar/bn/el/hi/hing/id/ky/ko/mr/ms/ro/te/th/tg/ur) for the chunk-size decision, unaffected by the "
-      "model-routing change")
+print("[OK] _model_for_lang: confirmed the 15-language hard list (ar/bn/el/hi/hing/id/ky/ko/mr/ms/ro/te/th/tg/ur) "
+      "once again routes to CLAUDE_MODEL_HARD (Opus, restored 2026-09-26) while every other language stays on "
+      "CLAUDE_MODEL (Sonnet), and that _is_hard_language recognizes the exact same list for the separate "
+      "chunk-size decision")
 
 # --- MODEL_PRICING_PER_TOKEN / _usage_cost: Александр's real bug
 # (2026-09-17) — CLAUDE_MODEL on Railway had already moved on to
@@ -2722,21 +2723,25 @@ print(f"[OK] live multi-check path: a language with more rows than MAX_ROWS_PER_
       f"DIFFERENT chunk is correctly left unmerged, since that chunk's AI call never saw the first chunk's "
       f"rows")
 
-# MAX_ROWS_PER_AI_CALL_HARD: a real Marathi miss (2026-09-22) — the exact
-# same pair, same model (Opus, since mr is on HARD_LANGUAGE_BASES), same
-# prompt — was caught when checked ALONE via the single-pair form but
-# MISSED as part of a normal batched multi-check. Confirms MAX_ROWS_PER_AI_CALL
-# (15) is still too many rows at once for the hardest languages specifically,
-# so those now get their own, much smaller chunk size (1 row — only ever
-# actually proven, not a guessed middle value) while every other language
-# keeps the normal size.
+# MAX_ROWS_PER_AI_CALL_HARD / _chunk_size_for_lang: RETIRED 2026-09-26
+# (Александр's explicit call) — a real Marathi miss (2026-09-22) originally
+# proved chunk=1 mattered for hard languages (the exact same pair, same
+# model, same prompt was caught alone but missed batched), but a broader
+# follow-up test (app.model_comparison.run_chunk_size_comparison,
+# 2026-09-26) on 4 different deliberately-planted OBJECTIVE errors showed
+# both Sonnet and Opus catching all four 100% of the time either way — only
+# the rare subtle-nuance category (like "отыгрыш") actually needed chunk=1,
+# and Александр decided that rare benefit isn't worth ~4x the cost on every
+# hard-language row. _chunk_size_for_lang now returns MAX_ROWS_PER_AI_CALL
+# for every language, hard or not — hard languages keep the stronger model
+# (see the _model_for_lang test above) but no longer get a smaller chunk.
 from app.excel_multi import MAX_ROWS_PER_AI_CALL_HARD, _chunk_size_for_lang
 
-assert MAX_ROWS_PER_AI_CALL_HARD == 1
-assert _chunk_size_for_lang("mr") == MAX_ROWS_PER_AI_CALL_HARD, "mr (Marathi) is on HARD_LANGUAGE_BASES"
-assert _chunk_size_for_lang("mr-IN") == MAX_ROWS_PER_AI_CALL_HARD, "region variants of a hard base must match too"
-assert _chunk_size_for_lang("ky") == MAX_ROWS_PER_AI_CALL_HARD, "ky (Kyrgyz) is on HARD_LANGUAGE_BASES"
-assert _chunk_size_for_lang("ru") == MAX_ROWS_PER_AI_CALL, "ru is NOT a hard language — normal chunk size"
+assert MAX_ROWS_PER_AI_CALL_HARD == 1, "kept as a constant in case this trade-off is ever revisited"
+assert _chunk_size_for_lang("mr") == MAX_ROWS_PER_AI_CALL, "mr (Marathi) is hard, but no longer gets a smaller chunk"
+assert _chunk_size_for_lang("mr-IN") == MAX_ROWS_PER_AI_CALL, "region variants of a hard base are unaffected too"
+assert _chunk_size_for_lang("ky") == MAX_ROWS_PER_AI_CALL, "ky (Kyrgyz) is hard, but no longer gets a smaller chunk"
+assert _chunk_size_for_lang("ru") == MAX_ROWS_PER_AI_CALL, "ru was never hard — same chunk size as always"
 assert _chunk_size_for_lang("es-mx") == MAX_ROWS_PER_AI_CALL, "an easy language's region variant is unaffected"
 
 _hard_chunk_rows = [
@@ -2760,15 +2765,15 @@ asyncio.get_event_loop().run_until_complete(
 )
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
-assert _hard_chunk_calls["n"] == 6, (
-    f"a hard language (mr) with 3 rows must make 3 SEPARATE AI chunks (1 row each, MAX_ROWS_PER_AI_CALL_HARD), "
-    f"not 1 batched call — and each chunk now makes 2 AI calls (the two-step pipeline's search step, then its "
-    f"structured step — see claude_client.FINDINGS_SEARCH_PROMPT's own comment), so 3 chunks x 2 = 6 total "
-    f"calls — got {_hard_chunk_calls['n']} calls"
+assert _hard_chunk_calls["n"] == 2, (
+    f"a hard language (mr) with 3 rows must now make ONE batched AI chunk (chunk=1 was retired 2026-09-26), "
+    f"and that one chunk makes 2 AI calls (the two-step pipeline's search step, then its structured step — "
+    f"see claude_client.FINDINGS_SEARCH_PROMPT's own comment) — got {_hard_chunk_calls['n']} calls"
 )
-print("[OK] MAX_ROWS_PER_AI_CALL_HARD: a hard-list language (mr, ky, ...) is checked ONE row at a time — proven "
-      "necessary by a real Marathi miss that a single-pair check caught but a same-model, same-prompt batched "
-      "check didn't — while every other language keeps the normal, larger MAX_ROWS_PER_AI_CALL chunk size")
+print("[OK] _chunk_size_for_lang: a hard-list language (mr, ky, ...) is now batched exactly like every other "
+      "language (chunk=1 retired 2026-09-26 after a broader test showed it only mattered for a rare subtle-"
+      "nuance error category, not worth its cost) — it still gets the stronger Opus model, just not a smaller "
+      "chunk any more")
 
 # BATCH_PROMPT_SINGLE_ITEM: Александр's SHARPER follow-up test, 2026-09-22 —
 # even a 1-ROW document upload (so MAX_ROWS_PER_AI_CALL_HARD's chunking
@@ -4453,10 +4458,11 @@ assert _two_step_cost > 0, _two_step_cost
 # no-contribution, not a failure — see _ensemble_search_findings).
 assert _two_step_warnings == [], _two_step_warnings
 # cost must reflect BOTH calls, not just Step 2's — Step 1 alone (30 in +
-# 10 out tokens at Sonnet's own per-token rate) is a real, non-trivial
-# slice of the total.
+# 10 out tokens at Opus's own per-token rate — "ky" is a hard language, so
+# _model_for_lang picks CLAUDE_MODEL_HARD for both steps here) is a real,
+# non-trivial slice of the total.
 from app.claude_client import _usage_cost as _usage_cost_direct
-_step1_only_cost = _usage_cost_direct(settings.CLAUDE_MODEL, {"input_tokens": 30, "output_tokens": 10})
+_step1_only_cost = _usage_cost_direct(settings.CLAUDE_MODEL_HARD, {"input_tokens": 30, "output_tokens": 10})
 assert _two_step_cost > _step1_only_cost, (
     f"total cost ({_two_step_cost}) must exceed Step 1's own cost alone ({_step1_only_cost}) — both calls "
     f"must be billed, not just the structured step"
@@ -4512,11 +4518,12 @@ async def _fake_call_claude_records_model(prompt, model=None, cache_prefix=None)
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_records_model
-# "mr" is a hard language — _model_for_lang would normally pick
-# CLAUDE_MODEL_HARD (Opus) here (well, before the 2026-09-23 retirement —
-# see HARD_LANGUAGE_BASES's own comment — but the point of this test is
-# still model_override winning over whatever _model_for_lang WOULD have
-# picked, so it's still worth confirming with a hard language). Two calls
+# "mr" is a hard language — _model_for_lang normally picks CLAUDE_MODEL_HARD
+# (Opus) here (restored 2026-09-26 — see HARD_LANGUAGE_BASES's own comment)
+# — the point of this test is model_override winning over that pick
+# regardless, so it's worth confirming with a hard language specifically,
+# where the override actually has to beat a DIFFERENT model than its own
+# default would otherwise be. Two calls
 # now, not one — the two-step pipeline's own Step 1 (search) plus Step 2
 # (the structured prompt) — both must see the override, not just Step 2.
 asyncio.run(_run_ai_checks_batch_direct(
@@ -4732,7 +4739,9 @@ print("[OK] _ensemble_search_findings: with no OPENAI_API_KEY configured, the GP
 # End-to-end through run_ai_checks_batch: confirms the ensemble is really
 # wired into the real call site (not just testable in isolation) — Step 1
 # hits BOTH _call_claude and _call_openai when a GPT key is configured,
-# while Step 2 stays Sonnet-only.
+# while Step 2 never involves GPT at all (whichever Anthropic model
+# _model_for_lang picks for Step 2 — Opus here, "ky" being a hard
+# language — GPT only ever joins Step 1's free search).
 _e2e_claude_calls: list[str] = []
 _e2e_openai_calls: list[str] = []
 
@@ -4764,8 +4773,8 @@ claude_client_mod._call_claude = _previous_call_claude
 claude_client_mod._call_openai = _previous_call_openai
 settings.ANTHROPIC_API_KEY = ""
 settings.OPENAI_API_KEY = ""
-assert len(_e2e_claude_calls) == 2, "Sonnet: Step 1 search + Step 2 structured check"
-assert len(_e2e_openai_calls) == 1, "GPT: only Step 1 search — Step 2 stays Sonnet-only, per Александр's ask"
+assert len(_e2e_claude_calls) == 2, "Anthropic: Step 1 search + Step 2 structured check"
+assert len(_e2e_openai_calls) == 1, "GPT: only Step 1 search — never joins Step 2, per Александр's ask"
 assert "sonnet видит пропуск" in _e2e_claude_calls[1] and "gpt тоже видит пропуск" in _e2e_claude_calls[1], (
     "both models' Step 1 candidates must reach Step 2's own structured prompt text"
 )
@@ -4773,8 +4782,8 @@ assert _e2e_findings == {0: [{"type": "typo", "severity": "medium", "message": "
 assert not _e2e_trunc
 assert _e2e_warnings == [], _e2e_warnings
 print("[OK] run_ai_checks_batch: with an OpenAI key configured, Step 1 really does run under Sonnet AND GPT "
-      "together (one Anthropic call, one OpenAI call) while Step 2 (the structured/calibrated check) stays "
-      "Sonnet-only, exactly as Александр asked")
+      "together (one Anthropic call, one OpenAI call) while Step 2 (the structured/calibrated check) never "
+      "involves GPT, exactly as Александр asked")
 
 # --- Александр's explicit ask (2026-09-23): be able to tell from the ------
 # report itself that a configured model actually failed on Step 1, rather

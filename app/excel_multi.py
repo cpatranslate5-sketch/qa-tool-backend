@@ -15,7 +15,6 @@ from app.claude_client import (
     REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
-    _is_hard_language,
     _model_for_lang,
     _register_mixed_finding,
     _second_opinion_unexpected_error_warning,
@@ -91,25 +90,34 @@ BATCH_THRESHOLD_CHARS = 10_000
 # document-wide dedup any more.
 MAX_ROWS_PER_AI_CALL = 15
 
-# Александр's real-world test, 2026-09-22: the SAME Marathi pair ("फ्रибет
+# Александр's real-world test, 2026-09-22: the SAME Marathi pair ("Фрибет
 # без отыгрыша"), through the SAME model (Opus — mr is on HARD_LANGUAGE_BASES,
 # see claude_client._is_hard_language), with the SAME prompt/instructions —
 # was MISSED when checked as part of a normal batch, but CAUGHT when checked
-# alone via the single-pair form. Confirms the exact mechanism
-# MAX_ROWS_PER_AI_CALL above already exists to fight (splitting attention
-# across many rows in one call), just that 15 rows is still too many for the
-# hardest languages specifically — only ever tested/proven down to 1 row at
-# a time, so that's what this uses rather than guessing an untested middle
-# value like 3 or 5. Costs noticeably more per hard-language row (each call
-# repeats the full instruction text for just one row instead of sharing it
-# across up to 15) — a deliberate quality-over-cost trade-off, same spirit
-# as MAX_ROWS_PER_AI_CALL's own. Easy/normal languages are unaffected —
-# still MAX_ROWS_PER_AI_CALL as before.
+# alone via the single-pair form. app.model_comparison.run_chunk_size_comparison
+# later reproduced this for real (2026-09-26, 5 runs each): Opus alone caught
+# it 67% of the time, Opus batched 0% — confirming the mechanism is real,
+# for this specific kind of subtle terminological/semantic nuance.
+#
+# RETIRED 2026-09-26 anyway (Александр's explicit call): the same diagnostic,
+# run a second time on 4 different deliberately-planted OBJECTIVE errors
+# (a dropped {{placeholder}}, a wrong number, a reversed negation, a real
+# case-ending grammar violation) showed BOTH Opus and Sonnet catching ALL
+# four 100% of the time, batched or not — only the rare subtle-nuance
+# category (like "отыгрыш") seems to actually need chunk=1, and Александр
+# decided that rare benefit isn't worth ~4x the cost on every hard-language
+# row. Hard languages still get the stronger model (CLAUDE_MODEL_HARD/Opus,
+# via claude_client._model_for_lang) — only the row-per-call count changed
+# here, not which model runs. Kept as a constant (rather than deleted
+# outright) in case this trade-off is ever revisited.
 MAX_ROWS_PER_AI_CALL_HARD = 1
 
 
 def _chunk_size_for_lang(target_lang: str) -> int:
-    return MAX_ROWS_PER_AI_CALL_HARD if _is_hard_language(target_lang) else MAX_ROWS_PER_AI_CALL
+    """Same MAX_ROWS_PER_AI_CALL for every language now, hard or not — see
+    MAX_ROWS_PER_AI_CALL_HARD's own comment for why the old chunk=1 special
+    case for hard languages was retired 2026-09-26."""
+    return MAX_ROWS_PER_AI_CALL
 
 
 def _chunk_list(items: list, size: int) -> list[list]:

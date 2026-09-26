@@ -460,8 +460,11 @@ BATCH_PROMPT_SINGLE_ITEM = _BATCH_PROMPT_SINGLE_ITEM_PREFIX + _BATCH_PROMPT_SING
 # false leads) AND still independently catches whatever Step 1 missed,
 # exactly as it always could on its own. This is also why Opus was retired
 # the same day (see HARD_LANGUAGE_BASES's own comment) — two Sonnet calls
-# turned out cheap enough, and together effective enough, to replace what
-# one Opus call alone was covering.
+# turned out cheap enough, and together effective enough, to (seemingly)
+# replace what one Opus call alone was covering. That retirement was
+# itself later reversed, 2026-09-26 — see HARD_LANGUAGE_BASES's own
+# comment for the real test that showed the two-step pipeline under
+# Sonnet alone wasn't actually closing the gap after all.
 #
 # Reuses the same numbered "N. Контекст/Источник/Перевод" pairs_block shape
 # BATCH_PROMPT uses (via _pairs_block) so ONE code path (_search_findings)
@@ -1395,50 +1398,66 @@ def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[
     return [f for f in findings if f.get("type") in allowed]
 
 
-# Languages that get the smaller MAX_ROWS_PER_AI_CALL_HARD chunk size (one
-# row per AI call instead of batching several together — see
-# app.excel_multi._chunk_size_for_lang) rather than a stronger model.
+# Languages that get BOTH extra levers for quality: the smaller
+# MAX_ROWS_PER_AI_CALL_HARD chunk size (one row per AI call instead of
+# batching several together — see app.excel_multi._chunk_size_for_lang)
+# AND the stronger CLAUDE_MODEL_HARD (Opus) model instead of CLAUDE_MODEL
+# (see _model_for_lang below).
 #
-# Used to also route to CLAUDE_MODEL_HARD (Opus) instead of CLAUDE_MODEL —
-# replaced wholesale on 2026-09-18 after comparing real Opus vs Sonnet
-# reports side by side, dropping kazakh/uzbek/swahili/azerbaijani from the
-# old list since Sonnet was already good enough for those. That per-language
-# model split was RETIRED 2026-09-23 (Александр's ask): the two-step
-# search-then-check pipeline below (_search_findings + the existing
-# structured prompt as a second pass) turned out to close most of the real
-# gap Opus was covering, for a fraction of Opus's per-token price even
-# counting the extra call — see _search_findings's own comment for the
-# investigation that led here. _model_for_lang now always returns
-# CLAUDE_MODEL for every language; this set and _is_hard_language are kept
-# only for the chunk-size decision, which is a separate, still-useful lever
-# (proven necessary by the original Marathi miss) unrelated to which model
-# runs. Matched against the BASE language subtag of whatever target_lang a
-# check actually runs with, so "ko-KR", "ko", or any other region variant of
-# Korean all get it alike. "hing" (Hinglish) isn't a real ISO code at all —
-# it's this platform's own code for Hindi-English code-mixed text (see
-# parse_workbook) — but the base-subtag match doesn't care, an exact "hing"
-# simply matches itself.
+# History: originally routed to Opus, tightened on 2026-09-18 after
+# comparing real Opus vs Sonnet reports side by side (dropping kazakh/
+# uzbek/swahili/azerbaijani from the old list, since Sonnet was already
+# good enough for those). RETIRED 2026-09-23 (Александр's ask): the
+# two-step search-then-check pipeline below (_search_findings + the
+# existing structured prompt as a second pass) seemed to close most of
+# the real gap Opus was covering, for a fraction of Opus's per-token
+# price even counting the extra call — see _search_findings's own comment
+# for that investigation. RESTORED 2026-09-26 (Александр's ask) after
+# app.model_comparison.run_chunk_size_comparison — a new diagnostic built
+# specifically to test chunk size in isolation from model choice — showed
+# the retirement had quietly given up the very benefit hard-language
+# checking exists for: on the real Marathi "отыгрыш" row (3 runs per
+# mode), Sonnet under the two-step pipeline missed it whether checked
+# alone OR batched (0/3 either way), while Opus caught it alone 2/3 of
+# the time and lost it batched (0/3) — the original 2026-09-22 anecdote,
+# now confirmed on more than a single run. Checking one row at a time
+# only pays for itself when the model actually has the knowledge to use
+# that extra attention on — Sonnet alone apparently doesn't, for at least
+# this kind of subtle terminological nuance. So hard languages once again
+# get both levers: Opus AND chunk=1 (chunk=1 itself was never retired —
+# only the model side was, and is now un-retired to match). Matched
+# against the BASE language subtag of whatever target_lang a check
+# actually runs with, so "ko-KR", "ko", or any other region variant of
+# Korean all get it alike. "hing" (Hinglish) isn't a real ISO code at
+# all — it's this platform's own code for Hindi-English code-mixed text
+# (see parse_workbook) — but the base-subtag match doesn't care, an exact
+# "hing" simply matches itself.
 HARD_LANGUAGE_BASES = {
     "ar", "bn", "el", "hi", "hing", "id", "ky", "ko", "mr", "ms", "ro", "te", "th", "tg", "ur",
 }
 
 
 def _model_for_lang(target_lang: str) -> str:
-    """Always CLAUDE_MODEL (Sonnet) now — see HARD_LANGUAGE_BASES's own
-    comment for why the old per-language Opus routing was retired. Kept as
-    its own function (rather than inlining settings.CLAUDE_MODEL at every
-    call site) so every real caller stays unaffected if a per-language
-    model split is ever reintroduced, and so model_comparison's
-    model_override tests still have a normal baseline to compare against."""
-    return settings.CLAUDE_MODEL
+    """Hard languages (see HARD_LANGUAGE_BASES) get CLAUDE_MODEL_HARD
+    (Opus); every other language gets CLAUDE_MODEL (Sonnet). Kept as its
+    own function (rather than inlining settings.CLAUDE_MODEL at every
+    call site) so model_comparison's model_override tests still have a
+    normal baseline to compare against, and so this can change again in
+    one place if it ever needs to.
+
+    RESTORED to per-language routing 2026-09-26 (Александр's ask) — see
+    HARD_LANGUAGE_BASES's own comment for the real chunk-size-comparison
+    result that led here, after this briefly always returned CLAUDE_MODEL
+    for every language between 2026-09-23 and today."""
+    return settings.CLAUDE_MODEL_HARD if _is_hard_language(target_lang) else settings.CLAUDE_MODEL
 
 
 def _is_hard_language(target_lang: str) -> bool:
-    """Same base-subtag membership test HARD_LANGUAGE_BASES documents,
-    exposed on its own so app.excel_multi's chunk-size decision (see
-    MAX_ROWS_PER_AI_CALL_HARD) can key off "is this language on the hard
-    list" directly. No longer tied to model choice — see
-    HARD_LANGUAGE_BASES's own comment."""
+    """Same base-subtag membership test HARD_LANGUAGE_BASES documents —
+    used by _model_for_lang above (which model) AND by app.excel_multi's
+    chunk-size decision (see MAX_ROWS_PER_AI_CALL_HARD, which row count).
+    Re-tied to model choice 2026-09-26 — see HARD_LANGUAGE_BASES's own
+    comment."""
     return target_lang.strip().lower().split("-")[0] in HARD_LANGUAGE_BASES
 
 
