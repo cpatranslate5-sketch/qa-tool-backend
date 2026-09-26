@@ -1644,8 +1644,25 @@ from app.claude_client import GRAMMAR_LANGUAGE_HINTS, _grammar_language_hint
 
 ky_line = _target_lang_line("ky")
 assert "баштап" in ky_line and "переменн" in ky_line and "{{" in ky_line, ky_line
+# Second real translator pushback, Kyrgyz only (2026-09-26): «башталган»
+# (a participle) is an equally valid alternative to the «баштап»
+# postposition after a {{variable}} — a genuinely different pattern from
+# the missing-case-ending one (see GRAMMAR_LANGUAGE_HINTS's own comment),
+# so it must show up as its own carve-out, not just be implied by the
+# existing «баштап» one.
+assert "башталган" in ky_line, ky_line
+# Third real translator pushback (2026-09-26, Kazakh; Александр confirmed
+# the same widening applies to Kyrgyz): the deliberately-still-checkable
+# "literal number before баштап/бастап" case (2026-09-24) turned out to
+# have its own narrower false-positive — a numeric RANGE like "1,25 бастап
+# 4,0 дейінгі коэффициенттер" — where a bare number on both ends is
+# standard, unlike a plain single threshold ("от X"), which is unaffected.
+assert "дейин" in ky_line.lower() or "дейін" in ky_line.lower() or "чейин" in ky_line.lower(), ky_line
+assert "диапазон" in ky_line.lower(), ky_line
 kk_line = _target_lang_line("kk")
 assert "бастап" in kk_line and "переменн" in kk_line and "{{" in kk_line, kk_line
+assert "дейін" in kk_line.lower() or "дейин" in kk_line.lower(), kk_line
+assert "диапазон" in kk_line.lower(), kk_line
 kk_region_line = _target_lang_line("kk-KZ")  # a region-qualified code must still match by base subtag
 assert "бастап" in kk_region_line, kk_region_line
 assert _grammar_language_hint("ru") == "" and _grammar_language_hint("uz") == "", (
@@ -1835,6 +1852,21 @@ assert _source_lang_note("en", ["typo"]) == ""  # still gated on a Russian SOURC
 print("[OK] _source_lang_note: «отыгрыш» and «вейджер» are flagged to the model as client-confirmed "
       "synonyms whenever the source is Russian (any target language) — a translation that renders one "
       "through the other's usual equivalent must not be reported as a meaning distortion")
+
+# --- Widened 2026-09-26 (fresh Kazakh translator pushback): "Отыгрывать
+# его не нужно." -> "Оны қайта ұтып алудың қажеті жоқ." was flagged as a
+# terminological shift even though it's neither term's usual equivalent —
+# just a third, natural phrasing of the same wagering-requirement concept.
+# The note must now say plainly that ANY phrasing conveying that
+# requirement is fine, not just a swap between отыгрыш's/вейджер's own
+# usual equivalents. ---
+note_text = _source_lang_note("ru", ["typo"])
+assert "любой" in note_text.lower(), note_text
+assert "терминологический сдвиг" in note_text.lower(), note_text
+print("[OK] _source_lang_note: the отыгрыш/вейджер note now covers ANY natural target-language phrasing of "
+      "the wagering-requirement concept, not just a swap between the two terms' own usual equivalents — a "
+      "different Kazakh phrasing that isn't either term's direct analog must not be flagged as a "
+      "terminological shift either")
 
 # --- placeholders check: a literal "\u00A0" escape token (some of
 # Александр's Crowdin exports write a non-breaking space out this way,

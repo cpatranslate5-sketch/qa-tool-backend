@@ -775,11 +775,29 @@ async def _ensemble_search_findings(
 # translated into), so this rides on the same "source is Russian" gate as
 # the English-embedded-words rule below rather than living in
 # GRAMMAR_LANGUAGE_HINTS.
+#
+# Widened 2026-09-26 (fresh Kazakh translator pushback): "Отыгрывать его не
+# нужно." was translated as "Оны қайта ұтып алудың қажеті жоқ." (roughly
+# "you don't need to win it back again") and flagged as the same kind of
+# "terminological shift" — but this phrasing isn't the usual target-
+# language equivalent of EITHER «отыгрыш» or «вейджер» specifically, it's a
+# third, more natural-sounding way of expressing the same underlying idea
+# (the wagering requirement). Александр's call: what actually matters is
+# that the target-language wording conveys the real-world requirement (bet
+# through a given amount before withdrawal is allowed) — not that it use
+# one specific canonical term consistently. So this is broadened from "a
+# swap between отыгрыш's/вейджер's own usual equivalents" to any
+# target-language phrasing that conveys that same requirement.
 _RU_TERM_SYNONYMS_NOTE = (
     "Отдельное уточнение от клиента: в русском исходнике слова «отыгрыш» и «вейджер» — синонимы, оба "
     "обозначают требование сделать ставки на определённую сумму, прежде чем бонус/фрибет можно вывести. Если "
     "один из этих терминов переведён через понятие, обычно соответствующее другому (например «отыгрыш» "
-    "передан аналогом «вейджера» или наоборот) — это НЕ искажение смысла и не ошибка термина."
+    "передан аналогом «вейджера» или наоборот) — это НЕ искажение смысла и не ошибка термина. Более того, "
+    "здесь важен именно смысл (требование сделать ставки на определённую сумму, прежде чем бонус/фрибет можно "
+    "вывести), а не использование одного конкретного термина — если перевод передаёт этот смысл ЛЮБОЙ другой "
+    "естественно звучащей формулировкой (не обязательно прямым аналогом «отыгрыша» или «вейджера»), это тоже "
+    "НЕ ошибка и не «терминологический сдвиг», даже если в разных местах документа встречаются разные "
+    "формулировки одного и того же требования."
 )
 
 
@@ -843,11 +861,37 @@ LANG_CODE_MEANING_OVERRIDES = {
 # {{dep_amount_currency}}) rather than a number written out in the text.
 # Its actual value isn't known until runtime, so there is no correct
 # ending to attach at translation time — omitting one there is a real
-# grammatical necessity, not a style choice or an oversight. Deliberately
-# narrow: a literal, spelled-out number (e.g. "1,25 бастап 4,0") still
-# gets the platform's normal judgment, unchanged — Александр's own call
-# (2026-09-24), since that case is genuinely more arguable and a blanket
-# exemption there risks quietly reopening real misses instead.
+# grammatical necessity, not a style choice or an oversight. Originally
+# deliberately narrow: a literal, spelled-out number (e.g. "1,25 бастап
+# 4,0") still got the platform's normal judgment, unchanged — Александр's
+# own call (2026-09-24), since that case seemed more arguable and a
+# blanket exemption there risked quietly reopening real misses instead.
+#
+# Second real translator pushback, Kyrgyz only (2026-09-26, same
+# {{variable}}-before-«баштап» construction as above): the translator's own
+# alternative phrasing swaps the postposition «баштап» for the participle
+# «башталган» ("having started from") — e.g. "{{dep_amount_currency}}
+# башталган суммага" instead of "{{dep_amount_currency}} баштап" — which
+# the platform flagged as a grammar error/distorted meaning, not
+# recognizing it as an equally correct way to express the same "starting
+# from X / no less than X" idea. Genuinely a different, previously
+# uncovered pattern from the missing-case-ending one above (it's not about
+# a missing ending at all — «башталган» is simply an alternative
+# construction the model didn't know was valid), so it gets its own
+# sentence rather than folding into the «баштап» carve-out.
+#
+# Third real translator pushback (2026-09-26, Kazakh, but Александр
+# confirmed this applies the same way to Kyrgyz): the ONE case
+# deliberately left checkable on 2026-09-24 — a literal, spelled-out
+# number before «баштап»/«бастап» — turned out to still misfire on a
+# specific, narrower sub-case: a numeric RANGE, i.e. "X баштап/бастап Y
+# дейін/чейин" (e.g. "1,25 бастап 4,0 дейінгі коэффициенттер" — a
+# coefficient/odds range). The translator's own explanation: a bare
+# number on both ends of a range like this is standard, natural usage —
+# unlike a single plain threshold ("от X", where the case ending on X
+# really is expected) — so Александр explicitly widened the carve-out to
+# cover this specific shape (2026-09-26), while the plain single-threshold
+# case with a literal number is UNCHANGED and still gets normal judgment.
 GRAMMAR_LANGUAGE_HINTS: dict[str, str] = {
     "ky": (
         'Важное уточнение для этого языка (подтверждено переводчиками-носителями): перед послелогом '
@@ -858,8 +902,16 @@ GRAMMAR_LANGUAGE_HINTS: dict[str, str] = {
         'итоговое значение на момент перевода неизвестно, поэтому окончание для неё нельзя подобрать заранее: '
         'отсутствие падежного окончания непосредственно перед «баштап» сразу после ТАКОЙ переменной — это НЕ '
         'ошибка, не сообщай о ней. Если же окончание пропущено перед «баштап» после КОНКРЕТНОГО, прямо '
-        'написанного в тексте числа (не переменной) — это по-прежнему настоящая находка, здесь ничего не '
-        'изменилось.\n'
+        'написанного в тексте числа (не переменной) — это, как правило, по-прежнему настоящая находка. '
+        'ИСКЛЮЧЕНИЕ (подтверждено переводчиком, 2026-09-26): если «баштап» — часть числового ДИАПАЗОНА вида '
+        '«X баштап Y чейин/дейин» (например «1,25 баштап 4,0 чейин» — диапазон коэффициентов), окончание перед '
+        '«баштап» не требуется даже при обычном, прямо написанном числе — это тоже НЕ ошибка; это исключение '
+        'касается именно диапазона (с верхней границей через «чейин»/«дейин»), а не обычного одиночного порога '
+        '(«от X») — там окончание для конкретного числа по-прежнему ожидается, как раньше. Отдельное уточнение '
+        '(подтверждено переводчиком, 2026-09-26): вместо послелога «баштап» после переменной-плейсхолдера так '
+        'же корректно использовать причастную форму «башталган» (например «{{...}} башталган суммага» вместо '
+        '«{{...}} баштап») — это не ошибка и не искажение смысла, а равноценный, естественно звучащий вариант '
+        'той же конструкции «начиная с/от X».\n'
     ),
     "kk": (
         'Важное уточнение для этого языка (подтверждено переводчиками-носителями): перед послелогом '
@@ -869,8 +921,13 @@ GRAMMAR_LANGUAGE_HINTS: dict[str, str] = {
         'плейсхолдер вида {{...}} — её итоговое значение на момент перевода неизвестно, поэтому окончание '
         'для неё нельзя подобрать заранее: отсутствие падежного окончания непосредственно перед «бастап» '
         'сразу после ТАКОЙ переменной — это НЕ ошибка, не сообщай о ней. Если же окончание пропущено перед '
-        '«бастап» после КОНКРЕТНОГО, прямо написанного в тексте числа (не переменной, например «1,25 бастап '
-        '4,0») — по-прежнему оценивай это по общим правилам, здесь ничего не изменилось.\n'
+        '«бастап» после КОНКРЕТНОГО, прямо написанного в тексте числа (не переменной) — это, как правило, '
+        'по-прежнему настоящая находка. ИСКЛЮЧЕНИЕ (подтверждено переводчиком, 2026-09-26): если «бастап» — '
+        'часть числового ДИАПАЗОНА вида «X бастап Y дейін» (например «1,25 бастап 4,0 дейінгі коэффициенттер» '
+        '— диапазон коэффициентов), окончание перед «бастап» не требуется даже при обычном, прямо написанном '
+        'числе — это тоже НЕ ошибка; это исключение касается именно диапазона (с верхней границей через '
+        '«дейін»), а не обычного одиночного порога («от X») — там окончание для конкретного числа по-прежнему '
+        'ожидается, как раньше.\n'
     ),
     # Real translator pushback (2026-09-26, French), two related cases,
     # both about a multiplier phrase like "x2500 votre mise" ("x2500 your
