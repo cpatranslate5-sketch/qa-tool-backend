@@ -623,6 +623,20 @@ with open(sample_path, "rb") as f:
         files={"file": ("Promo_Rules_Localization.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         data={"source_lang": "", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "target_langs": "ru,es-mx"},
     ))
+filtered_submit = r.json()
+# Only 2 of the file's ~30 languages selected drops the volume well under
+# BATCH_THRESHOLD_CHARS, so — unlike the unfiltered upload above, which is
+# large enough to go through the (here empty, no-API-key) Batches path —
+# this one now takes the live/background path instead (see
+# app.main._run_live_check_background, added 2026-09-26): "processing" on
+# submission, "completed" a moment later once the background task (which
+# TestClient already runs to completion before client.post() even returns
+# — see the second-opinion assertions above) has updated the record.
+assert filtered_submit["status"] == "processing", filtered_submit
+assert filtered_submit["batch"] is False, filtered_submit
+r = check("multi-check with target_langs filter detail", client.get(
+    f"/projects/{project_id}/multi-check/{filtered_submit['multi_check_id']}", params={"manager_id": regular_id}
+))
 filtered_data = r.json()
 assert filtered_data["status"] == "completed", filtered_data
 assert set(filtered_data["summary"]["languages_checked"]) == {"ru", "es-mx"}, filtered_data["summary"]
@@ -681,6 +695,16 @@ r = check(
         data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "target_langs": "pt"},
     ),
 )
+pt_check_submit = r.json()
+# A tiny 1-row fixture — well under BATCH_THRESHOLD_CHARS, so this takes
+# the live/background path (see app.main._run_live_check_background,
+# added 2026-09-26): "processing" on submission, then "completed" once the
+# background task (already run to completion by the time client.post()
+# returned, same as every other case here) has updated the record.
+assert pt_check_submit["status"] == "processing", pt_check_submit
+r = check("multi-check with an older target_langs spelling detail", client.get(
+    f"/projects/{project_id}/multi-check/{pt_check_submit['multi_check_id']}", params={"manager_id": regular_id}
+))
 pt_check_data = r.json()
 assert pt_check_data["status"] == "completed", pt_check_data
 assert "pt-br" in pt_check_data["summary"]["languages_checked"], pt_check_data["summary"]
@@ -705,6 +729,13 @@ r = check("multi-check with DO NOT TRANSLATE cells", client.post(
     f"/projects/{project_id}/multi-check",
     files={"file": ("dnt.xlsx", dnt_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "numbers"},
+))
+dnt_submit = r.json()
+# Same reasoning as the pt-check fixture above — tiny file, live/background
+# path (see app.main._run_live_check_background).
+assert dnt_submit["status"] == "processing", dnt_submit
+r = check("multi-check with DO NOT TRANSLATE cells detail", client.get(
+    f"/projects/{project_id}/multi-check/{dnt_submit['multi_check_id']}", params={"manager_id": regular_id}
 ))
 dnt_data = r.json()
 assert dnt_data["status"] == "completed", dnt_data
@@ -733,6 +764,13 @@ r = check("multi-check with only a free algorithmic criterion selected", client.
     f"/projects/{project_id}/multi-check",
     files={"file": ("only-algo.xlsx", only_algo_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "punctuation"},
+))
+only_algo_submit = r.json()
+# Same reasoning as the pt-check fixture above — tiny file, live/background
+# path (see app.main._run_live_check_background).
+assert only_algo_submit["status"] == "processing", only_algo_submit
+r = check("multi-check with only a free algorithmic criterion selected detail", client.get(
+    f"/projects/{project_id}/multi-check/{only_algo_submit['multi_check_id']}", params={"manager_id": regular_id}
 ))
 only_algo_data = r.json()
 assert only_algo_data["status"] == "completed", only_algo_data
@@ -1073,6 +1111,17 @@ with open(sample_path, "rb") as f:
             "urgent": "true",
         },
     ))
+urgent_multi_submit = r.json()
+# "Срочно"/urgent forces the live path regardless of size, and the live
+# path itself now runs in the background (see
+# app.main._run_live_check_background, added 2026-09-26) — "processing" on
+# submission, "completed" a moment later.
+assert urgent_multi_submit["status"] == "processing", urgent_multi_submit
+assert urgent_multi_submit["batch"] is False, urgent_multi_submit
+assert not _batch_calls_seen, "urgent=true must not go through the batch queue at all"
+r = check("urgent multi-check detail", client.get(
+    f"/projects/{project_id}/multi-check/{urgent_multi_submit['multi_check_id']}", params={"manager_id": regular_id}
+))
 urgent_multi_data = r.json()
 assert urgent_multi_data["status"] == "completed", urgent_multi_data
 assert not _batch_calls_seen, "urgent=true must not go through the batch queue at all"
@@ -1176,12 +1225,32 @@ small_ws.append(["Hello.", "Привет."])
 small_buf = io.BytesIO()
 small_wb.save(small_buf)
 small_buf.seek(0)
-r = check("an Anthropic failure on the LIVE multi-check path also surfaces cleanly", client.post(
+# The live path itself now runs in the background (see
+# app.main._run_live_check_background, added 2026-09-26 — see the "Failed
+# to fetch" fix), so an Anthropic failure here can no longer surface as a
+# 502 on THIS request — the request already returned "processing" before
+# run_multi_check even started. Instead the record is expected to flip to
+# status "failed" with a short error message, once polled.
+r = check("an Anthropic failure on the LIVE multi-check path submits fine (fails in the background instead)", client.post(
     f"/projects/{project_id}/multi-check",
     files={"file": ("small.xlsx", small_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "typo"},
-), expect=502)
-assert "Не удалось связаться" in r.json()["detail"], r.json()
+))
+live_fail_submit = r.json()
+assert live_fail_submit["status"] == "processing", live_fail_submit
+r = check("its detail then shows status=failed instead of hanging on processing forever", client.get(
+    f"/projects/{project_id}/multi-check/{live_fail_submit['multi_check_id']}", params={"manager_id": regular_id}
+))
+live_fail_detail = r.json()
+assert live_fail_detail["status"] == "failed", live_fail_detail
+assert live_fail_detail["error"], live_fail_detail
+r = check("a failed live check also shows up as failed in the history list, not a misleading '0 findings'", client.get(
+    f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
+))
+assert any(h["id"] == live_fail_submit["multi_check_id"] and h["status"] == "failed" for h in r.json()), r.json()
+check("Мария can delete a failed multi-check", client.delete(
+    f"/projects/{project_id}/multi-check/{live_fail_submit['multi_check_id']}", params={"manager_id": regular_id}
+))
 
 # and on the standalone single-check endpoint
 r = check("an Anthropic failure on the standalone /check endpoint also surfaces cleanly", client.post(

@@ -158,6 +158,78 @@ async def _run_second_opinion_background(multi_check_id: int, results: dict) -> 
         db.close()
 
 
+async def _run_live_check_background(
+    multi_check_id: int,
+    sheets: list[dict],
+    resolved_source: str,
+    selected_checks: list[str],
+    extra_instructions: str,
+    target_filter: set[str] | None,
+) -> None:
+    """Runs the actual AI check (run_multi_check) for the live/"Срочно" path
+    AFTER the initial request has already returned a "processing" response —
+    added 2026-09-26. Before this, that branch did `await run_multi_check(...)`
+    directly inside the request handler, so a medium/large document (with
+    or without "Срочно") could block the response long enough for the
+    browser's own fetch to give up ("Failed to fetch") — the check still
+    finished and saved correctly on the server a while later (that's why it
+    then showed up fine in history), which is exactly what Александр
+    reported kept happening even after the second-opinion pass right above
+    was already moved to the background. This is that same fix, applied one
+    step earlier in the pipeline: the record starts as "processing" (see the
+    multi_check endpoint) with no batch_id — nothing was actually handed to
+    Anthropic's batch queue, this is still the live/full-price path, just no
+    longer blocking the request — and multi_check_detail's own polling
+    branch picks it up the same way it already does for a genuine batch job,
+    distinguished only by the "batch" flag in the response (see
+    CheckRunner.tsx, which uses it to pick a much faster poll interval here
+    since there's no external Anthropic queue to be polite to).
+
+    Runs in its OWN DB session, same as _run_second_opinion_background right
+    above — the request's own session is already closed by the time a
+    background task gets to run.
+
+    On success, chains straight into _run_second_opinion_background so a
+    live check goes through the exact same two-stage background flow a
+    batch job already does. On failure (an Anthropic outage, an unexpected
+    bug), marks the record "failed" with a short human-readable message
+    instead of leaving it stuck on "processing" forever with no explanation
+    — see multi_check_detail's "failed" branch and CheckRunner.tsx's
+    matching render block."""
+    db = SessionLocal()
+    try:
+        try:
+            results = await run_multi_check(
+                sheets, resolved_source, selected_checks, extra_instructions, target_filter,
+            )
+        except Exception:
+            logger.exception("run_multi_check failed in background for multi_check_id=%s", multi_check_id)
+            record = db.get(models.MultiCheck, multi_check_id)
+            if record is not None:
+                record.status = "failed"
+                record.results = {"error": "Не удалось выполнить проверку — попробуйте ещё раз."}
+                record.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                db.commit()
+            return
+
+        results["second_opinion_pending"] = True
+        record = db.get(models.MultiCheck, multi_check_id)
+        if record is None:
+            # Manager deleted/cancelled it while this was still running (see
+            # delete_multi_check) — nothing left to save into.
+            return
+        record.summary = results["summary"]
+        record.results = results
+        record.status = "completed"
+        record.cost_usd = results["summary"].get("cost_usd", 0.0)
+        record.completed_at = datetime.datetime.now(datetime.timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+
+    await _run_second_opinion_background(multi_check_id, results)
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -837,64 +909,56 @@ async def multi_check(
     volume = estimate_check_volume(sheets, resolved_source, target_filter)
 
     if urgent or volume <= BATCH_THRESHOLD_CHARS:
-        results = await run_multi_check(
-            sheets, resolved_source, selected_checks, extra_instructions, target_filter,
-        )
-        # The Sonnet+GPT second-opinion pass no longer runs inline here — it
-        # used to (via a blocking `await apply_second_opinion(results)`),
-        # which added two more sequential API calls per language on top of
-        # everything run_multi_check already did, and made the whole request
-        # slow enough that the browser's fetch sometimes gave up ("Failed to
-        # fetch") even though the check itself had already finished and was
-        # saved — nothing lost, just confusing (was it saved? safe to retry,
-        # or does that mean paying twice?). The check is now saved as
-        # "completed" immediately, with second_opinion_pending=true, and the
-        # second-opinion pass runs in the background (see
-        # _run_second_opinion_background) — the frontend polls multi-check
-        # detail until it flips to false, the same pattern it already uses
-        # for a still-processing batch job.
-        results["second_opinion_pending"] = True
-        finished_at = datetime.datetime.now(datetime.timezone.utc)
+        # The actual AI check now runs in the background too, instead of
+        # being awaited right here — added 2026-09-26, after Александр
+        # reported that "Failed to fetch" kept happening even after the
+        # second-opinion pass below was already backgrounded. Root cause:
+        # this branch used to `await run_multi_check(...)` directly inside
+        # the request handler, so a medium/large document — "Срочно" or
+        # not — could block the response long enough for the browser's own
+        # fetch to give up, even though the check always finished and saved
+        # fine a while later (that's why it then showed up correctly in
+        # history — nothing was ever actually lost, just not delivered back
+        # to that request). The record now starts as "processing" (no
+        # batch_id — this is still the live/full-price path, nothing was
+        # handed to Anthropic's batch queue) and _run_live_check_background
+        # takes it from there; the frontend polls multi-check detail the
+        # same way it already does for a real batch job, distinguished only
+        # by the "batch": false flag (see CheckRunner.tsx, which uses it to
+        # pick a much faster poll interval here).
         record = models.MultiCheck(
             project_id=project_id,
             filename=file.filename or "upload.xlsx",
             source_lang=resolved_source,
             checks_run=selected_checks,
-            summary=results["summary"],
-            results=results,
-            status="completed",
+            summary={},
+            results={},
+            status="processing",
             performed_by_name=manager_name.strip(),
             manager_id=manager_id,
-            cost_usd=results["summary"].get("cost_usd", 0.0),
+            cost_usd=0.0,
             created_at=started_at,
-            completed_at=finished_at,
         )
         db.add(record)
         db.commit()
         db.refresh(record)
-        background_tasks.add_task(_run_second_opinion_background, record.id, results)
+        background_tasks.add_task(
+            _run_live_check_background,
+            record.id, sheets, resolved_source, selected_checks, extra_instructions, target_filter,
+        )
         return {
             "multi_check_id": record.id,
-            "status": "completed",
+            "status": "processing",
+            "filename": record.filename,
             "source_lang": resolved_source,
-            "summary": results["summary"],
-            "sheets": results["sheets"],
-            "cost_usd": record.cost_usd,
-            # Александр asked for the check's report to show how long it
-            # took — the frontend computes this from the two timestamps,
-            # same as it already does for the "processing" elapsed-time
-            # fallback (see created_at there).
+            # Never a real Anthropic batch job — see the comment above and
+            # CheckRunner.tsx, which uses this to skip the batch-only
+            # "обычно занимает до часа" messaging and use a fast poll.
+            "batch": False,
+            "progress": None,
             "created_at": record.created_at.isoformat(),
-            "completed_at": record.completed_at.isoformat(),
-            # Which criteria were actually selected for this run — lets the
-            # UI show a "Критерии: ..." line so a $0 cost is self-explaining
-            # (e.g. only the free algorithmic checks were ticked) instead of
-            # a manager having to guess whether something went wrong.
+            "estimated_minutes": None,
             "checks_run": record.checks_run,
-            # True until the background Sonnet+GPT second-opinion pass (see
-            # _run_second_opinion_background) finishes — the frontend polls
-            # while this is true, same as it does for status=="processing".
-            "second_opinion_pending": True,
         }
 
     requests, skeleton = build_batch_plan(
@@ -1081,16 +1145,49 @@ async def multi_check_detail(
             "status": "processing",
             "filename": record.filename,
             "source_lang": record.source_lang,
+            # Whether this is a real Anthropic batch job (has a batch_id) or
+            # a live/"Срочно" check now running in the background (see
+            # _run_live_check_background) — added 2026-09-26. The two look
+            # the same status-wise but need different messaging/polling on
+            # the frontend: a batch can genuinely take up to an hour and is
+            # polite about how often it checks Anthropic's own batch status,
+            # while a live check has no external queue to be polite to and
+            # is normally done in well under a minute, so CheckRunner.tsx
+            # uses this flag to poll it much faster and skip the "обычно
+            # занимает до часа" wording.
+            "batch": bool(record.batch_id),
             # Real counts from Anthropic (how many of the batch's requests
             # are done), not a guessed time estimate — see excel_multi._batch_progress.
+            # Always None for a live check (no batch to report counts for).
             "progress": progress,
             # Lets the UI show elapsed waiting time as a fallback while the
             # counts above are still flat — see the submission response.
             "created_at": record.created_at.isoformat(),
             # Same rough, non-binding ETA as the submission response — kept
             # live here too so it reflects the freshest historical data on
-            # every poll, not just what was known at submission time.
+            # every poll, not just what was known at submission time. Always
+            # None for a live check (_estimate_batch_minutes returns None
+            # for batch_volume_chars <= 0, which a live check's record
+            # always has — it was never sized for the batch queue).
             "estimated_minutes": _estimate_batch_minutes(db, record.batch_volume_chars),
+        }
+
+    if record.status == "failed":
+        # Only reachable for a live/"Срочно" check that raised inside
+        # _run_live_check_background (a genuine batch failure instead
+        # surfaces as an errored/expired result_type per language, handled
+        # inside finalize_batch_results — it never marks the whole record
+        # "failed"). Added 2026-09-26 alongside backgrounding the live path,
+        # so a background exception doesn't leave the record stuck on
+        # "processing" forever with no explanation — see CheckRunner.tsx's
+        # matching render block.
+        return {
+            "multi_check_id": record.id,
+            "status": "failed",
+            "filename": record.filename,
+            "source_lang": record.source_lang,
+            "error": (record.results or {}).get("error", "Не удалось выполнить проверку."),
+            "created_at": record.created_at.isoformat(),
         }
 
     return {
