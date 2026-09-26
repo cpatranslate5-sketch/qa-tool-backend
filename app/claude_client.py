@@ -34,7 +34,15 @@ CHECK_LABELS = {
         "«resulits» вместо «results»); (2) ЛЮБАЯ объективная грамматическая ошибка целевого языка — неправильный "
         "падеж, управление, согласование, число, род, форма слова, предлог/послелог, синтаксис и т.п. Для этого "
         "пункта НЕ требуется, чтобы ошибка «ломала» понимание — если форма объективно неправильная по грамматике "
-        "целевого языка, это находка, даже когда смысл всё равно можно понять; (3) ошибки смысла — перевод "
+        "целевого языка, это находка, даже когда смысл всё равно можно понять. Важное уточнение про синтаксис "
+        "(реальный случай, французский язык, 2026-09-26): если сегмент выглядит синтаксически незавершённым "
+        "ТОЛЬКО из-за того, что начинается с союза/связки («и», «а», «но», «et», «mais», «and», «but» и т.п.) или "
+        "представляет собой зависимую конструкцию/инфинитив без собственного подлежащего и сказуемого — это, как "
+        "правило, НЕ ошибка, а естественное продолжение предыдущего сегмента: в локализуемых текстах одно "
+        "предложение по смыслу нередко разбито на несколько соседних ячеек, а текста соседних сегментов у тебя нет, "
+        "чтобы это подтвердить. Не сообщай о такой «незавершённости» самой по себе — сообщай только если ВНУТРИ "
+        "самого сегмента есть настоящая грамматическая ошибка (неверная форма слова, согласование, падеж и т.п.), "
+        "никак не связанная с отсутствием своего подлежащего/сказуемого; (3) ошибки смысла — перевод "
         "означает не то, что исходник: пропущенное отрицание, спутанные число/род, неверно переданный термин, "
         "неверно переданное условие/количество/отношение между частями фразы, потерянный или добавленный смысл. "
         "Сюда же относится ДРУГАЯ ВАЛЮТА, чем в исходнике (например, евро вместо доллара, или другой ISO-код) — "
@@ -192,6 +200,37 @@ _CONCISENESS_INSTRUCTION = (
     "Сокращай только форму, а не суть — конкретная фраза и разница должны остаться понятны."
 )
 
+# Александр's ask, 2026-09-26: comments were sometimes coming back ENTIRELY
+# in the target language — fine for the model reasoning internally, but
+# useless to him, since he reads Russian, not (in his real examples)
+# Turkish. Real verbatim examples he hit: "Bitişik yazım: 'haftasonunun' —
+# doğrusu ayrı 'hafta sonunun'.", "Hatalı/doğal olmayan yapı: '...' — düşük
+# çekim/sözdizimi hatalı.", "İsim hatası: kaynakta 'Кельвин Харрис' ...
+# çeviride 'Kelvin Harris' olarak yazılmış, doğrusu 'Calvin Harris'." — not
+# one word of that is Russian. Rather than ban quoting the target-language
+# text (the exact quote is often the most useful, precise part — see
+# _CONCISENESS_INSTRUCTION above), require the surrounding explanation —
+# what the problem IS, in general terms — to always be in Russian, with a
+# short Russian gloss for any target-language word/phrase that isn't
+# self-evident from the quote alone (a spelling fix like "hafta sonunun"
+# needs no gloss; a named-entity mix-up like «Kelvin Harris» → «Calvin
+# Harris» does, since a non-Turkish-speaking reader can't otherwise tell
+# which one is right).
+_RUSSIAN_COMMENT_INSTRUCTION = (
+    "ВАЖНО: поле \"message\" целиком читает русскоговорящий человек, который не обязательно знает целевой "
+    "язык перевода. Само объяснение — в чём проблема — всегда пиши по-русски, даже если целевой язык совсем "
+    "не похож на русский (например турецкий, корейский, арабский). Можно и нужно приводить точную цитату на "
+    "целевом языке в кавычках (это самая полезная, точная часть), но она должна идти ВНУТРИ русского "
+    "предложения, а не заменять его — недопустимо, чтобы всё поле \"message\" было написано на целевом языке "
+    "без русского объяснения вообще. Если цитата на целевом языке сама по себе непонятна русскоговорящему "
+    "без перевода (например путаница имён/названий, например «Kelvin Harris» вместо «Calvin Harris», или "
+    "слово, значение которого не очевидно из контекста) — добавь короткий перевод или пояснение на русском "
+    "прямо рядом с цитатой в скобках. Пример неправильного (слишком) формата: \"Bitişik yazım: 'haftasonunun' "
+    "— doğrusu ayrı 'hafta sonunun'.\" — целиком на турецком, непонятно без словаря. Пример правильного "
+    "формата на том же материале: \"Слитное написание: «haftasonunun» вместо раздельного «hafta sonunun» "
+    "(«выходных»).\""
+)
+
 # When "numbers" is also running (a free, 100%-reliable rule check — see
 # app.rule_checks.check_numbers — auto-included whenever "Оформление" is
 # selected), it already catches every plain digit/date mismatch on its own.
@@ -217,7 +256,10 @@ _CALIBRATION_WITHOUT_NUMBERS_CHECK = (
 
 def _calibration(checks: list[str]) -> str:
     tail = _CALIBRATION_WITH_NUMBERS_CHECK if "numbers" in checks else _CALIBRATION_WITHOUT_NUMBERS_CHECK
-    return f"{CALIBRATION_STRICT_OPENING} {_CALIBRATION_SHARED_TAIL} {tail} {_CONCISENESS_INSTRUCTION}"
+    return (
+        f"{CALIBRATION_STRICT_OPENING} {_CALIBRATION_SHARED_TAIL} {tail} {_CONCISENESS_INSTRUCTION} "
+        f"{_RUSSIAN_COMMENT_INSTRUCTION}"
+    )
 
 
 # Split into PREFIX/SUFFIX for the same reason/see the same comment as
@@ -829,6 +871,26 @@ GRAMMAR_LANGUAGE_HINTS: dict[str, str] = {
         'сразу после ТАКОЙ переменной — это НЕ ошибка, не сообщай о ней. Если же окончание пропущено перед '
         '«бастап» после КОНКРЕТНОГО, прямо написанного в тексте числа (не переменной, например «1,25 бастап '
         '4,0») — по-прежнему оценивай это по общим правилам, здесь ничего не изменилось.\n'
+    ),
+    # Real translator pushback (2026-09-26, French), two related cases,
+    # both about a multiplier phrase like "x2500 votre mise" ("x2500 your
+    # stake/bet"). The platform's own default judgment (missing preposition
+    # "de": should be "x2500 de votre mise") is not wrong on its own — the
+    # translator confirms BOTH forms ("x2500 votre mise" and "x2500 de
+    # votre mise") are actually used and acceptable in this domain, with
+    # "de" being their own preferred choice, not a hard grammatical
+    # requirement. So this must not become "de" is always required — only
+    # that omitting it before "votre mise" (or an equivalent possessive
+    # right after a bare "xN"/"x N" multiplier) is a legitimate, commonly
+    # used alternative, not a punishable error, while still leaving room to
+    # flag a genuinely wrong preposition elsewhere.
+    "fr": (
+        'Важное уточнение для этого языка (подтверждено переводчиком-носителем, реальный случай 2026-09-26): '
+        'в конструкциях вида «x2500 votre mise» (умножение ставки/выигрыша, например «xN votre mise» или '
+        '«x N votre mise») отсутствие предлога «de» перед притяжательным словом («votre», «leur» и т.п.) — '
+        'это НЕ ошибка. И «x2500 votre mise», и «x2500 de votre mise» реально используются и оба приемлемы в '
+        'этой тематике (ставки/беттинг) — «de» лишь один из допустимых вариантов, а не обязательное правило. '
+        'Не сообщай о пропуске «de» именно в такой конструкции («xN»/«x N» + притяжательное слово без «de»).\n'
     ),
 }
 

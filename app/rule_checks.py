@@ -1034,6 +1034,28 @@ def check_hyphen_for_dash(translation: str) -> list[dict]:
     }]
 
 
+def _double_space_locations(translation: str) -> list[tuple[str, str]]:
+    """Returns (word_before, word_after) for every run of 2+ spaces in
+    translation, skipping a run that's purely trailing (nothing but more
+    whitespace follows it to the end of the string) — added 2026-09-26,
+    Александр's ask: a segment can be long enough that a mid-text double
+    space is hard to spot by eye, so naming the two words it sits between
+    lets a translator jump straight to it (e.g. via Ctrl+F), while a
+    trailing one at the very end of the cell isn't worth surfacing at all
+    (see its caller in check_punctuation)."""
+    trimmed_end = len(translation.rstrip())
+    hints: list[tuple[str, str]] = []
+    for m in re.finditer(r" {2,}", translation):
+        if m.start() >= trimmed_end:
+            continue
+        before_match = re.search(r"(\S+)\s*$", translation[: m.start()])
+        after_match = re.search(r"^\s*(\S+)", translation[m.end() :])
+        before_word = before_match.group(1) if before_match else "начала сегмента"
+        after_word = after_match.group(1) if after_match else "конца сегмента"
+        hints.append((before_word, after_word))
+    return hints
+
+
 def check_punctuation(
     source: str, translation: str, lang_code: str = "", checks: list[str] | None = None
 ) -> list[dict]:
@@ -1074,11 +1096,22 @@ def check_punctuation(
             })
 
     if "  " in translation:
-        findings.append({
-            "type": "punctuation",
-            "severity": "low",
-            "message": "В переводе есть двойной пробел.",
-        })
+        double_space_hints = _double_space_locations(translation)
+        # A run of 2+ spaces that's purely trailing (nothing but more
+        # whitespace follows it to the end of the cell) is deliberately
+        # skipped entirely, not just unreported-with-no-location —
+        # Александр's ask, 2026-09-26: a segment can be long enough that
+        # finding a mid-text double space by eye is genuinely hard, but one
+        # sitting after the last real word is trivial to spot (and often
+        # just leftover formatting noise), so it isn't worth a finding at
+        # all here.
+        if double_space_hints:
+            where = "; ".join(f"между «{a}» и «{b}»" for a, b in double_space_hints)
+            findings.append({
+                "type": "punctuation",
+                "severity": "low",
+                "message": f"В переводе есть двойной пробел — {where}.",
+            })
 
     if "sms_charset" not in checks:
         findings += check_em_dash_spacing(translation)

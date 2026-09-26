@@ -1653,7 +1653,7 @@ assert _grammar_language_hint("ru") == "" and _grammar_language_hint("uz") == ""
     "language, including a close Turkic relative like Uzbek, should get text about «баштап»/«бастап» it "
     "has no such postposition for"
 )
-assert set(GRAMMAR_LANGUAGE_HINTS) == {"ky", "kk"}, (
+assert set(GRAMMAR_LANGUAGE_HINTS) == {"ky", "kk", "fr"}, (
     f"scope creep check — if this ever legitimately grows to cover another language, update this "
     f"assertion deliberately rather than let it happen silently: {set(GRAMMAR_LANGUAGE_HINTS)}"
 )
@@ -1661,6 +1661,36 @@ print("[OK] _target_lang_line: Kyrgyz/Kazakh get an explicit carve-out — a mis
       "«баштап»/«бастап» directly after a template variable placeholder is not flagged as an error — "
       "scoped to exactly these two languages (by base subtag, so a region-qualified code like «kk-KZ» "
       "still matches) and to nothing else")
+
+# --- Real translator pushback (2026-09-26, French), two related cases from
+# the same feedback message:
+# (a) "Et avec certains niveaux d'accès, d'entrer dans la zone de travail
+#     privée des équipes" was flagged as a grammatically incomplete
+#     infinitive construction — the translator says it's a continuation of
+#     the previous segment ("il est possible de descendre et d'entrer..."),
+#     a general pattern (any language) now covered by the new sentence
+#     added to CHECK_LABELS["typo"] rather than by a language-specific
+#     hint — checked here via the shared search prompt instead.
+# (b) "x2500 votre mise" was flagged as missing "de" — the translator says
+#     both forms are actually used, "de" being only their own preference,
+#     not a hard rule — covered by the new GRAMMAR_LANGUAGE_HINTS["fr"]
+#     entry, checked the same way as the ky/kk entries above. ---
+fr_line = _target_lang_line("fr")
+assert "votre mise" in fr_line and "de" in fr_line, fr_line
+assert _grammar_language_hint("en") == "" and _grammar_language_hint("es") == "", (
+    "the French-specific «votre mise»/«de» carve-out must not leak into other languages that have "
+    "nothing to do with this exact French phrasing"
+)
+from app.claude_client import CHECK_LABELS
+
+typo_label = CHECK_LABELS["typo"]
+assert "продолжение предыдущего" in typo_label and ("et" in typo_label.lower() or "mais" in typo_label.lower()), (
+    "CHECK_LABELS['typo'] must carry the general (language-agnostic) carve-out for a segment that only "
+    "*looks* syntactically incomplete because it continues the (invisible-to-the-model) previous segment"
+)
+print("[OK] French translator feedback (2026-09-26) addressed two ways: CHECK_LABELS['typo'] now has a "
+      "general, language-agnostic carve-out for a segment that merely continues the previous one, and "
+      "GRAMMAR_LANGUAGE_HINTS['fr'] tells the model the missing «de» in «xN votre mise» is not an error")
 
 # --- numbers check: a correctly localized decimal comma or zero-padded
 # hour must NOT be flagged as a mismatch — Александр hit this live: an
@@ -3670,6 +3700,38 @@ assert check_punctuation("{icon}", "{icon}") == [], (
 print("[OK] check_punctuation: _real_last_char correctly finds the trailing tag/placeholder even when an "
       "earlier one appears first in the same string, and a placeholder-only source or translation (no real "
       "trailing character at all) no longer produces a spurious or garbled finding")
+
+# --- Александр's ask, 2026-09-26: a double space inside a long segment is
+# hard to spot by eye, so the finding must name the word before/after it —
+# but a double space sitting purely at the very end of the cell (after all
+# real text) isn't worth surfacing at all. ---
+from app.rule_checks import _double_space_locations
+
+assert _double_space_locations("Играйте  сейчас") == [("Играйте", "сейчас")], (
+    "a mid-text double space must report the exact word before and after it"
+)
+assert _double_space_locations("Раз  два  три") == [("Раз", "два"), ("два", "три")], (
+    "several separate double spaces in the same segment must each get their own (before, after) pair, in order"
+)
+assert _double_space_locations("Играйте сейчас  ") == [], (
+    "a double space that's purely trailing (nothing but more whitespace to the end of the cell) must be "
+    "skipped entirely — not reported even without a location"
+)
+assert _double_space_locations("Играйте  сейчас  ") == [("Играйте", "сейчас")], (
+    "a mixed case (one real mid-text double space AND a trailing one) must report only the real one"
+)
+mid_finding = check_punctuation("Play now", "Играйте  сейчас")
+assert any(f["type"] == "punctuation" and "Играйте" in f["message"] and "сейчас" in f["message"] for f in mid_finding), (
+    "check_punctuation's own double-space finding must include the word-before/word-after location, not just "
+    "a bare 'there's a double space somewhere' message"
+)
+assert not any("двойной пробел" in f["message"] for f in check_punctuation("Play now.", "Играйте сейчас.  ")), (
+    "a purely trailing double space must not produce a double-space finding at all"
+)
+print("[OK] check_punctuation/_double_space_locations: a double space is now reported with the exact word "
+      "before and after it (so it can be found with Ctrl+F even in a long segment), several in the same "
+      "segment are each reported separately, and one sitting purely at the end of the cell after all real "
+      "text is skipped entirely rather than reported without a location")
 
 # Regression caught in review: _real_last_char's wrapper-stripping loop
 # used to be unbounded ("while changed"), re-scanning the whole shrinking
