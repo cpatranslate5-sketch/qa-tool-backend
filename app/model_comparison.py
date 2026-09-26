@@ -403,3 +403,200 @@ def _format_summary_ru(report: dict) -> str:
         )
     lines.append(f"Итого потрачено на весь тест: ${report['total_cost_usd']:.4f}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Chunk-size comparison — Александр's ask, 2026-09-26 ("надо понять, нужна
+# ли такая переплата"): run_model_comparison above answers "which MODEL
+# catches more", but every hard-language row today already runs on the same
+# model (Sonnet — see claude_client._model_for_lang's own comment, the old
+# per-language Opus routing was retired 2026-09-23). What actually costs
+# extra for a hard language is MAX_ROWS_PER_AI_CALL_HARD=1 vs the normal
+# MAX_ROWS_PER_AI_CALL=15 (see app.excel_multi) — checking each row ALONE
+# instead of batching up to 15 together, which is a real 5-8x more AI calls
+# for the same rows. The one hard evidence that checking a row alone
+# actually catches MORE than batching it ever comes up is a single real
+# anecdote (see excel_multi.MAX_ROWS_PER_AI_CALL_HARD's own comment: the
+# Marathi "отыгрыш" pair, missed in a batch, caught alone, 2026-09-22) — n=1,
+# never measured systematically. This section runs the SAME set of rows
+# both ways (once per row alone, once all together in a single prompt) and
+# reports whether specifically-flagged "known issue" rows get caught more
+# reliably alone than batched, and at what cost multiple.
+# ---------------------------------------------------------------------------
+
+# Cost/runtime guardrails, same spirit as MAX_RUNS_PER_MODEL above but
+# tighter — this test's "individual" mode makes one AI call PER ROW PER RUN
+# (not just per run), so the same runs_per_mode number costs far more here
+# than in run_model_comparison.
+MAX_RUNS_PER_CHUNK_MODE = 5
+MAX_ROWS_FOR_CHUNK_COMPARISON = 20
+
+
+async def _one_batched_run(
+    items: list[dict], checks: list[str], target_lang: str, source_lang: str, model_id: str, semaphore: asyncio.Semaphore,
+) -> tuple[dict[int, list[dict]], float, bool]:
+    """One AI call covering ALL of `items` at once — the "batched" side of
+    the comparison, mirroring production's normal (non-hard-language)
+    MAX_ROWS_PER_AI_CALL=15 chunking. Returns findings keyed by each item's
+    own index into `items` (same index space _checkable_items/
+    group_batch_findings already use), so the caller can tell which
+    specific row(s) got flagged out of the whole batch."""
+    prompt, _cache_prefix, number_to_index = _claude_client.build_batch_prompt(
+        items, checks, target_lang=target_lang, source_lang=source_lang,
+    )
+    if prompt is None:
+        return {}, 0.0, False
+    async with semaphore:
+        text_block, usage, stop_reason = await _claude_client._call_claude(prompt, model=model_id)
+    raw = _claude_client.parse_json_array(text_block)
+    grouped = _claude_client.group_batch_findings(raw, number_to_index)
+    per_item: dict[int, list[dict]] = {}
+    for idx, findings in grouped.items():
+        checked = [f for f in _claude_client._filter_findings_by_checks(findings, checks) if f.get("type") != REGISTER_VALUE_TYPE]
+        if checked:
+            per_item[idx] = checked
+    cost_usd = _claude_client._usage_cost(model_id, usage)
+    return per_item, cost_usd, stop_reason == "max_tokens"
+
+
+async def run_chunk_size_comparison(
+    rows: list[dict],
+    target_lang: str,
+    source_lang: str = "ru",
+    checks: list[str] | None = None,
+    runs_per_mode: int = 3,
+    model: str | None = None,
+) -> dict:
+    """Runs the same set of rows two ways: "individually" (one
+    build_batch_prompt([row]) call per row — today's real production
+    behavior for HARD_LANGUAGE_BASES languages) and "batched" (one
+    build_batch_prompt(all_rows) call for the whole set — today's real
+    production behavior for every other language), `runs_per_mode` times
+    each, and reports a per-row hit rate for both modes plus each mode's
+    total cost.
+
+    rows: each {"context": str, "source": str, "translation": str,
+    "has_known_issue": bool}. Mark has_known_issue=True on any row you
+    already know/suspect carries a real problem (like the Marathi
+    "отыгрыш" row) — the report's headline hit-rate numbers are averaged
+    only over those rows, since a row with no known issue has nothing
+    meaningful to "catch" (the model staying quiet on it could be either
+    correct or a miss, there's no way to tell from outside). Rows without
+    the flag still count fully toward the "batched" prompt's bulk and cost
+    — that bulk is what dilution actually needs to be tested for real, an
+    empty batch of 1 wouldn't test anything the "individual" mode doesn't
+    already cover.
+
+    Same model for both modes (defaults to settings.CLAUDE_MODEL, i.e.
+    whatever production actually uses today for every language, hard or
+    not) — this test is only about chunk size, not model choice; see
+    run_model_comparison above for that separate question.
+
+    Returns {} when no ANTHROPIC_API_KEY is configured, same as
+    run_model_comparison."""
+    if not settings.ANTHROPIC_API_KEY:
+        return {}
+    checks = checks or ["typo"]
+    runs_per_mode = max(1, min(runs_per_mode, MAX_RUNS_PER_CHUNK_MODE))
+    rows = rows[:MAX_ROWS_FOR_CHUNK_COMPARISON]
+    model_id = model or settings.CLAUDE_MODEL
+    items = [{"context": r.get("context") or "", "source": r["source"], "translation": r["translation"]} for r in rows]
+    flags = [bool(r.get("has_known_issue")) for r in rows]
+    semaphore = asyncio.Semaphore(AI_CONCURRENCY)
+
+    # "Individually" — chunk size 1, one call per row per run (reuses
+    # _one_run, the exact same single-item path run_model_comparison
+    # already relies on above).
+    individual_hits = [0] * len(items)
+    individual_cost = 0.0
+    for idx, item in enumerate(items):
+        runs = await asyncio.gather(*[
+            _one_run(item, checks, target_lang, source_lang, model_id, semaphore) for _ in range(runs_per_mode)
+        ])
+        for findings, cost_usd, _truncated, _raw in runs:
+            individual_cost += cost_usd
+            if findings:
+                individual_hits[idx] += 1
+
+    # "Batched" — chunk size = len(items), one call for the WHOLE set per
+    # run (mirrors production batching several rows into a single prompt).
+    batched_hits = [0] * len(items)
+    batched_cost = 0.0
+    batched_truncated = False
+    batched_runs = await asyncio.gather(*[
+        _one_batched_run(items, checks, target_lang, source_lang, model_id, semaphore) for _ in range(runs_per_mode)
+    ])
+    for per_item, cost_usd, truncated in batched_runs:
+        batched_cost += cost_usd
+        batched_truncated = batched_truncated or truncated
+        for idx in range(len(items)):
+            if per_item.get(idx):
+                batched_hits[idx] += 1
+
+    per_row = [
+        {
+            "context": items[i]["context"],
+            "source": items[i]["source"],
+            "translation": items[i]["translation"],
+            "has_known_issue": flags[i],
+            "individual_hit_rate": round(individual_hits[i] / runs_per_mode, 2),
+            "batched_hit_rate": round(batched_hits[i] / runs_per_mode, 2),
+        }
+        for i in range(len(items))
+    ]
+
+    known_idx = [i for i, f in enumerate(flags) if f]
+
+    def _known_rate(hits: list[int]) -> float | None:
+        if not known_idx:
+            return None
+        return round(sum(hits[i] for i in known_idx) / (len(known_idx) * runs_per_mode), 2)
+
+    individual_cost = round(individual_cost, 4)
+    batched_cost = round(batched_cost, 4)
+    report = {
+        "target_lang": target_lang,
+        "checks": checks,
+        "model": model_id,
+        "runs_per_mode": runs_per_mode,
+        "rows_tested": len(items),
+        "individual_cost_usd": individual_cost,
+        "batched_cost_usd": batched_cost,
+        "cost_ratio": round(individual_cost / batched_cost, 2) if batched_cost else None,
+        "batched_truncated": batched_truncated,
+        "known_issue_individual_hit_rate": _known_rate(individual_hits),
+        "known_issue_batched_hit_rate": _known_rate(batched_hits),
+        "per_row": per_row,
+    }
+    report["summary_ru"] = _format_chunk_summary_ru(report)
+    return report
+
+
+def _format_chunk_summary_ru(report: dict) -> str:
+    """Russian-language summary, same spirit as _format_summary_ru above."""
+    lines = [
+        f"Сравнение по-строчной (chunk=1) и пакетной (chunk={report['rows_tested']}) проверки для языка "
+        f"{report['target_lang']}, модель {report['model']} ({report['runs_per_mode']} прогон(ов) на каждый режим):",
+    ]
+    ind_rate = report["known_issue_individual_hit_rate"]
+    bat_rate = report["known_issue_batched_hit_rate"]
+    if ind_rate is not None:
+        lines.append(
+            f"— строки с заведомо известной ошибкой (has_known_issue=true): по одной поймано "
+            f"{int(ind_rate * 100)}%, пакетом — {int(bat_rate * 100)}%"
+        )
+        if ind_rate > bat_rate:
+            lines.append("  → по одной ловит НАДЁЖНЕЕ, чем пакетом, на этих строках")
+        elif ind_rate < bat_rate:
+            lines.append("  → пакетом на этих строках ловит НЕ ХУЖЕ (или лучше), чем по одной")
+        else:
+            lines.append("  → разницы между режимами на этих строках не обнаружено")
+    else:
+        lines.append("— ни одна строка не помечена has_known_issue=true, сравнивать пока нечего — задайте хотя бы одну")
+    lines.append(
+        f"— стоимость: по одной ${report['individual_cost_usd']:.4f}, пакетом ${report['batched_cost_usd']:.4f}"
+        + (f" (по одной дороже в {report['cost_ratio']}×)" if report.get("cost_ratio") else "")
+    )
+    if report["batched_truncated"]:
+        lines.append("[⚠ пакетный ответ был обрезан хотя бы раз — часть строк могла остаться непроверенной]")
+    return "\n".join(lines)

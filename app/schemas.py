@@ -194,3 +194,77 @@ class ModelComparisonIn(BaseModel):
     # haiku only (Александр's ask, 2026-09-23 — no Opus spend for a routine
     # comparison); pass ["opus", "sonnet", "haiku"] to include Opus too.
     models: list[str] = ["sonnet", "haiku"]
+
+
+class ChunkTestRow(BaseModel):
+    """One row for the /debug/chunk-size-comparison test — see
+    app.model_comparison.run_chunk_size_comparison's own docstring."""
+    context: str = ""
+    source: str
+    translation: str
+    # Set true on any row you already know/suspect carries a real problem
+    # (like the Marathi "отыгрыш" row below) — the report's headline hit-rate
+    # is only averaged over rows flagged this way, since there's no way to
+    # tell a genuine "nothing wrong here" from a silent miss on a row with
+    # no known issue.
+    has_known_issue: bool = False
+
+
+class ChunkSizeComparisonIn(BaseModel):
+    """Input for the standalone /debug/chunk-size-comparison endpoint — see
+    app.model_comparison.run_chunk_size_comparison's own comment for what
+    this tests. Unlike /debug/model-comparison (which compares MODEL
+    choice on one fixed row), this compares CHUNK SIZE — checking each row
+    of the same set alone (today's real behavior for HARD_LANGUAGE_BASES
+    languages, one AI call per row) versus checking the whole set together
+    in one prompt (today's real behavior for every other language, up to
+    15 rows per call) — the actual lever behind the cost premium
+    Александр asked about (2026-09-26).
+
+    Row 0's default is the real Marathi "отыгрыш" pair (2026-09-22) — the
+    ONE documented real case of this exact effect (missed in a batch,
+    caught alone) — marked has_known_issue=True. The remaining default
+    rows are synthetic filler (has_known_issue=False), only there to give
+    the "batched" mode something to actually batch against; they don't
+    prove anything on their own. For a result actually worth trusting,
+    Александр should replace some or all of these via "Try it out" with
+    his OWN real rows (any hard language, ideally ones he already suspects
+    are borderline) before drawing conclusions."""
+    rows: list[ChunkTestRow] = [
+        ChunkTestRow(
+            context="freebet", source="Фрибет без отыгрыша", translation="पैज न लावता फ्री बेट", has_known_issue=True,
+        ),
+        ChunkTestRow(context="greeting", source="Добро пожаловать!", translation="स्वागत आहे!"),
+        ChunkTestRow(context="balance", source="Ваш баланс обновлён.", translation="तुमची शिल्लक अद्ययावत झाली आहे."),
+        ChunkTestRow(
+            context="support", source="Если появятся вопросы, напишите в поддержку.",
+            translation="काही प्रश्न असल्यास, आधार सेवेशी संपर्क साधा.",
+        ),
+        ChunkTestRow(
+            context="promo", source="Акция доступна зарегистрированным пользователям.",
+            translation="ही ऑफर नोंदणीकृत वापरकर्त्यांसाठी उपलब्ध आहे.",
+        ),
+        ChunkTestRow(
+            context="terms", source="Организатор акции — администрация сайта.",
+            translation="ऑफरचे आयोजक साइट प्रशासन आहे.",
+        ),
+        ChunkTestRow(
+            context="bonus", source="Бонус будет зачислен в течение 24 часов.",
+            translation="बोनस 24 तासांच्या आत जमा केला जाईल.",
+        ),
+        ChunkTestRow(
+            context="withdrawal", source="Вывод средств занимает до 3 рабочих дней.",
+            translation="पैसे काढण्यास 3 कामकाजी दिवसांपर्यंत वेळ लागतो.",
+        ),
+    ]
+    target_lang: str = "mr"
+    source_lang: str = "ru"
+    checks: list[str] = ["typo"]
+    # Repetitions per mode (not per row) — "individual" mode still makes
+    # one call PER ROW per repetition, so this costs more than the same
+    # number in ModelComparisonIn.runs_per_model. Capped server-side at
+    # app.model_comparison.MAX_RUNS_PER_CHUNK_MODE.
+    runs_per_mode: int = 3
+    # Defaults to whatever production actually uses today (settings.CLAUDE_MODEL)
+    # when left unset — this test is about chunk size, not model choice.
+    model: str | None = None

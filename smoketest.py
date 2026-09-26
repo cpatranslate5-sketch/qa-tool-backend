@@ -5391,6 +5391,182 @@ print("[OK] POST /debug/model-comparison: the two_step=true field reaches run_mo
       "through the request schema — Александр can now trigger this from the interactive /docs page to "
       "verify the two-step pipeline for real, on known examples, before trusting it in production")
 
+# --- app.model_comparison: the chunk-size comparison diagnostic ---------
+# Added 2026-09-26 (Александр's ask: "надо понять, нужна ли такая
+# переплата") — unlike run_model_comparison above (which compares MODEL
+# choice on one fixed row), this compares CHUNK SIZE: checking the same set
+# of rows one at a time (chunk=1, today's real HARD_LANGUAGE_BASES
+# behavior) versus all together in one prompt (chunk=N, today's real
+# behavior otherwise), same model both times.
+from app.model_comparison import MAX_ROWS_FOR_CHUNK_COMPARISON as _MAX_ROWS_FOR_CHUNK_COMPARISON
+from app.model_comparison import MAX_RUNS_PER_CHUNK_MODE as _MAX_RUNS_PER_CHUNK_MODE
+from app.model_comparison import run_chunk_size_comparison as _run_chunk_size_direct
+
+_KNOWN_ROW = {"context": "freebet", "source": "Фрибет без отыгрыша", "translation": "पैज न लावता फ्री बेट", "has_known_issue": True}
+_FILLER_ROW = {"context": "greeting", "source": "Добро пожаловать!", "translation": "स्वागत आहे!", "has_known_issue": False}
+
+
+async def _fake_call_claude_chunk(prompt, model=None, cache_prefix=None):
+    # A prompt containing BOTH rows' own source text is the "batched" (all
+    # rows in one prompt) call; one containing only the known row's source
+    # is an "individual" (chunk=1) call for that row. Models the exact
+    # real-world effect this whole tool exists to test for real: the known
+    # problem is caught every time alone, but diluted away once other rows
+    # share the same prompt.
+    if "Фрибет без отыгрыша" in prompt:
+        if "Добро пожаловать!" in prompt:
+            return "[]", {"input_tokens": 200, "output_tokens": 5}, "end_turn"
+        return (
+            '[{"row": 1, "type": "typo", "severity": "medium", "message": "поймано по одной"}]',
+            {"input_tokens": 60, "output_tokens": 20}, "end_turn",
+        )
+    return "[]", {"input_tokens": 50, "output_tokens": 5}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_chunk
+_chunk_report = asyncio.run(_run_chunk_size_direct(
+    rows=[_KNOWN_ROW, _FILLER_ROW], target_lang="mr", source_lang="ru", checks=["typo"], runs_per_mode=2,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _chunk_report["rows_tested"] == 2, _chunk_report
+assert _chunk_report["known_issue_individual_hit_rate"] == 1.0, (
+    f"the known-issue row must be caught in every individual (chunk=1) run in this fake — got {_chunk_report}"
+)
+assert _chunk_report["known_issue_batched_hit_rate"] == 0.0, (
+    f"the known-issue row must be diluted away in every batched run in this fake — got {_chunk_report}"
+)
+_chunk_per_row = {r["source"]: r for r in _chunk_report["per_row"]}
+assert _chunk_per_row["Фрибет без отыгрыша"]["individual_hit_rate"] == 1.0
+assert _chunk_per_row["Фрибет без отыгрыша"]["batched_hit_rate"] == 0.0
+assert _chunk_report["individual_cost_usd"] > 0 and _chunk_report["batched_cost_usd"] > 0, (
+    "both modes must report a real, non-zero cost — every one of these is a real billed API call, including "
+    "the ones that found nothing"
+)
+assert _chunk_report["cost_ratio"] == round(_chunk_report["individual_cost_usd"] / _chunk_report["batched_cost_usd"], 2)
+assert "по одной поймано 100%, пакетом — 0%" in _chunk_report["summary_ru"], _chunk_report["summary_ru"]
+assert "по одной ловит НАДЁЖНЕЕ" in _chunk_report["summary_ru"], _chunk_report["summary_ru"]
+print("[OK] run_chunk_size_comparison: correctly tells apart individual (chunk=1) vs batched (chunk=N) hit "
+      "rate for a row flagged has_known_issue=true, tallies a real cost for both modes, and the Russian "
+      "summary states plainly which mode caught it more reliably")
+
+# No row flagged has_known_issue=true -> nothing to compare; must say so
+# plainly rather than silently printing misleading 0%/0% rates.
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_chunk
+_no_known_report = asyncio.run(_run_chunk_size_direct(
+    rows=[_FILLER_ROW], target_lang="mr", source_lang="ru", checks=["typo"], runs_per_mode=1,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _no_known_report["known_issue_individual_hit_rate"] is None
+assert _no_known_report["known_issue_batched_hit_rate"] is None
+assert "сравнивать пока нечего" in _no_known_report["summary_ru"], _no_known_report["summary_ru"]
+print("[OK] run_chunk_size_comparison: with no row flagged has_known_issue=true, the headline hit rates are "
+      "None (not a misleading 0%) and the Russian summary says plainly there's nothing to compare yet")
+
+# runs_per_mode and row count must both be capped — this test's individual
+# mode already makes one call PER ROW per run, so an uncapped request here
+# could fire off far more real paid calls than run_model_comparison's own
+# cap protects against.
+_chunk_call_count = {"n": 0}
+
+
+async def _fake_call_claude_chunk_counts_only(prompt, model=None, cache_prefix=None):
+    _chunk_call_count["n"] += 1
+    return "[]", {"input_tokens": 10, "output_tokens": 2}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_chunk_counts_only
+_capped_rows = [{"context": "", "source": f"s{i}", "translation": f"t{i}", "has_known_issue": False} for i in range(30)]
+_capped_report = asyncio.run(_run_chunk_size_direct(
+    rows=_capped_rows, target_lang="mr", source_lang="ru", checks=["typo"], runs_per_mode=999,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _capped_report["rows_tested"] == _MAX_ROWS_FOR_CHUNK_COMPARISON, (
+    f"30 rows must be capped at MAX_ROWS_FOR_CHUNK_COMPARISON ({_MAX_ROWS_FOR_CHUNK_COMPARISON}) — got "
+    f"{_capped_report['rows_tested']}"
+)
+assert _capped_report["runs_per_mode"] == _MAX_RUNS_PER_CHUNK_MODE, (
+    f"runs_per_mode=999 must be capped at MAX_RUNS_PER_CHUNK_MODE ({_MAX_RUNS_PER_CHUNK_MODE}) — got "
+    f"{_capped_report['runs_per_mode']}"
+)
+_expected_calls = _MAX_ROWS_FOR_CHUNK_COMPARISON * _MAX_RUNS_PER_CHUNK_MODE + _MAX_RUNS_PER_CHUNK_MODE
+assert _chunk_call_count["n"] == _expected_calls, (
+    f"expected exactly (rows x runs) individual calls + runs batched calls = {_expected_calls} real calls, "
+    f"got {_chunk_call_count['n']} — an oversized request must never fire an unbounded number of paid calls"
+)
+print(f"[OK] run_chunk_size_comparison: an oversized rows list is capped at MAX_ROWS_FOR_CHUNK_COMPARISON "
+      f"({_MAX_ROWS_FOR_CHUNK_COMPARISON}) and an oversized runs_per_mode is capped at MAX_RUNS_PER_CHUNK_MODE "
+      f"({_MAX_RUNS_PER_CHUNK_MODE}), instead of firing an unbounded number of real paid API calls")
+
+# register_value entries must never count as a catch in the batched mode
+# either (same rule as run_model_comparison above).
+async def _fake_call_claude_chunk_register(prompt, model=None, cache_prefix=None):
+    return (
+        '[{"row": 1, "type": "register_value", "value": "formal"}]',
+        {"input_tokens": 10, "output_tokens": 5}, "end_turn",
+    )
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_chunk_register
+_chunk_register_report = asyncio.run(_run_chunk_size_direct(
+    rows=[_KNOWN_ROW, _FILLER_ROW], target_lang="mr", source_lang="ru", checks=["typo", "register"], runs_per_mode=1,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _chunk_register_report["known_issue_individual_hit_rate"] == 0.0
+assert _chunk_register_report["known_issue_batched_hit_rate"] == 0.0
+print("[OK] run_chunk_size_comparison: a register_value entry never counts as a catch in either mode")
+
+# No ANTHROPIC_API_KEY -> graceful no-op, same as run_model_comparison.
+_chunk_should_not_be_called = {"n": 0}
+
+
+async def _fake_call_claude_chunk_should_not_be_called(prompt, model=None, cache_prefix=None):
+    _chunk_should_not_be_called["n"] += 1
+    return "[]", {}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_chunk_should_not_be_called
+assert settings.ANTHROPIC_API_KEY == ""
+_chunk_empty = asyncio.run(_run_chunk_size_direct(rows=[_KNOWN_ROW], target_lang="mr", source_lang="ru"))
+claude_client_mod._call_claude = _previous_call_claude
+assert _chunk_empty == {}, "with no ANTHROPIC_API_KEY configured, run_chunk_size_comparison must return {} without calling anything"
+assert _chunk_should_not_be_called["n"] == 0
+print("[OK] run_chunk_size_comparison: gracefully returns {} and makes zero calls when no ANTHROPIC_API_KEY "
+      "is configured")
+
+# --- /debug/chunk-size-comparison endpoint -------------------------------
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_chunk
+r = check("POST /debug/chunk-size-comparison (defaults = the real Marathi row + synthetic filler rows)", client.post(
+    "/debug/chunk-size-comparison", json={"runs_per_mode": 1},
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+_ep_chunk_body = r.json()
+assert _ep_chunk_body["target_lang"] == "mr", _ep_chunk_body
+assert _ep_chunk_body["rows_tested"] == 8, (
+    f"the default schema ships the real Marathi row + 7 synthetic filler rows (8 total) — got {_ep_chunk_body}"
+)
+assert _ep_chunk_body["known_issue_individual_hit_rate"] == 1.0, _ep_chunk_body
+assert _ep_chunk_body["known_issue_batched_hit_rate"] == 0.0, _ep_chunk_body
+assert "summary_ru" in _ep_chunk_body
+
+r = check(
+    "POST /debug/chunk-size-comparison without ANTHROPIC_API_KEY -> 503, not a silent empty success",
+    client.post("/debug/chunk-size-comparison", json={}), expect=503,
+)
+print("[OK] POST /debug/chunk-size-comparison: the diagnostic endpoint runs end-to-end with its default rows "
+      "(the real Marathi 'отыгрыш' row plus synthetic filler) when an API key is configured, and returns a "
+      "clear 503 instead of a silently empty/misleading success when no API key is configured")
+
 # ============================================================================
 # Automatic second opinion (Александр's ask, 2026-09-25): after a multi-check
 # finishes, Sonnet AND GPT are each automatically asked how likely every

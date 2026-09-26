@@ -30,7 +30,7 @@ from app.excel_multi import (
     submit_multi_check_batch,
     try_finalize_batch,
 )
-from app.model_comparison import run_model_comparison
+from app.model_comparison import run_chunk_size_comparison, run_model_comparison
 from app.rule_checks import run_rule_checks
 
 logger = logging.getLogger(__name__)
@@ -1287,5 +1287,37 @@ async def debug_model_comparison(payload: schemas.ModelComparisonIn):
             503,
             "ANTHROPIC_API_KEY не настроен на этом сервере — сравнение моделей требует реального обращения к "
             "Anthropic, тестовый режим тут не поможет.",
+        )
+    return result
+
+
+@app.post("/debug/chunk-size-comparison")
+async def debug_chunk_size_comparison(payload: schemas.ChunkSizeComparisonIn):
+    # Standalone diagnostic tool, same spirit as /debug/model-comparison
+    # above (no project/manager plumbing, meant to be triggered by hand via
+    # this backend's own interactive /docs page) — see
+    # app.model_comparison.run_chunk_size_comparison's own comment for what
+    # this tests: checking each row alone (chunk size 1, today's real
+    # behavior for hard languages) vs. checking the same rows together in
+    # one prompt (chunk size 15, today's real behavior otherwise), on the
+    # same model — Александр's ask, 2026-09-26, to find out whether the
+    # current cost premium for hard languages is actually buying anything.
+    # Each call makes real, real-money calls to Anthropic (one per row per
+    # run for "individual" mode, plus one per run for "batched" mode) —
+    # both cost totals in the response say exactly how much this one call
+    # spent.
+    result = await run_chunk_size_comparison(
+        rows=[r.model_dump() for r in payload.rows],
+        target_lang=payload.target_lang,
+        source_lang=payload.source_lang,
+        checks=payload.checks,
+        runs_per_mode=payload.runs_per_mode,
+        model=payload.model,
+    )
+    if not result:
+        raise HTTPException(
+            503,
+            "ANTHROPIC_API_KEY не настроен на этом сервере — сравнение по размеру пачки требует реального "
+            "обращения к Anthropic, тестовый режим тут не поможет.",
         )
     return result
