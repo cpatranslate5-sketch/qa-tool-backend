@@ -1152,7 +1152,7 @@ _weird_lang_buf = io.BytesIO()
 _weird_lang_wb.save(_weird_lang_buf)
 _weird_lang_buf.seek(0)
 _weird_sheets = _parse_workbook_direct(_weird_lang_buf.read())
-_weird_requests, _weird_skeleton = asyncio.run(_build_batch_plan_direct(_weird_sheets, "en", ["typo"], "", None))
+_weird_requests, _weird_skeleton = _build_batch_plan_direct(_weird_sheets, "en", ["typo"], "", None)
 _custom_id_pattern = _re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _bad_ids = [r["custom_id"] for r in _weird_requests if not _custom_id_pattern.match(r["custom_id"])]
 assert not _bad_ids, f"custom_id must always be Anthropic-safe, regardless of the file's own language codes: {_bad_ids}"
@@ -2634,7 +2634,7 @@ _fbr_results = {
         "stop_reason": "end_turn",
     },
 }
-_fbr_out = finalize_batch_results(_fbr_skeleton, _fbr_results)
+_fbr_out = asyncio.run(finalize_batch_results(_fbr_skeleton, _fbr_results))
 _fbr_lang = _fbr_out["sheets"][0]["languages"]["ru"]
 # same expectation as the live-path test: excel_row 5 has nothing of its own to show, only 2 and 3 appear
 assert {r["excel_row"] for r in _fbr_lang} == {2, 3}, _fbr_lang
@@ -2871,7 +2871,7 @@ _bpc_rows = [
     for i in range(MAX_ROWS_PER_AI_CALL + 2)
 ]
 _bpc_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _bpc_rows}
-_bpc_requests, _bpc_skeleton = asyncio.run(build_batch_plan([_bpc_sheet], "en", ["untranslatable"], "", None))
+_bpc_requests, _bpc_skeleton = build_batch_plan([_bpc_sheet], "en", ["untranslatable"], "", None)
 assert len(_bpc_requests) == 2, "expected one request per chunk — 17 rows over a 15-row cap is 2 chunks"
 _bpc_chunks = _bpc_skeleton["sheets"][0]["languages"]["ru"]["chunks"]
 assert len(_bpc_chunks) == 2, _bpc_chunks
@@ -2883,7 +2883,7 @@ _bpc_results = {
     },
     # _bpc_id1 deliberately absent — dropped between submit and poll
 }
-_bpc_out = finalize_batch_results(_bpc_skeleton, _bpc_results)
+_bpc_out = asyncio.run(finalize_batch_results(_bpc_skeleton, _bpc_results))
 _bpc_lang = _bpc_out["sheets"][0]["languages"]["ru"]
 _bpc_by_row = {r["excel_row"]: r["findings"] for r in _bpc_lang}
 # the first chunk's real finding must still show up, even though the second chunk's result never arrived
@@ -2905,7 +2905,7 @@ _bpr_rows = [
     for i in range(MAX_ROWS_PER_AI_CALL + 2)
 ]
 _bpr_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _bpr_rows}
-_bpr_requests, _bpr_skeleton = asyncio.run(build_batch_plan([_bpr_sheet], "en", ["untranslatable"], "", None))
+_bpr_requests, _bpr_skeleton = build_batch_plan([_bpr_sheet], "en", ["untranslatable"], "", None)
 _bpr_chunks = _bpr_skeleton["sheets"][0]["languages"]["ru"]["chunks"]
 assert len(_bpr_chunks) == 2, _bpr_chunks
 _bpr_results = {
@@ -2921,7 +2921,7 @@ _bpr_results = {
         "text": "[]", "usage": {"input_tokens": 10, "output_tokens": 5}, "stop_reason": "end_turn", "result_type": "succeeded",
     },
 }
-_bpr_out = finalize_batch_results(_bpr_skeleton, _bpr_results)
+_bpr_out = asyncio.run(finalize_batch_results(_bpr_skeleton, _bpr_results))
 _bpr_by_row = {r["excel_row"]: r["findings"] for r in _bpr_out["sheets"][0]["languages"]["ru"]}
 # local rows 1 and 3 of chunk 0 -> global indices 0 and 2 -> excel_row 300 and 302
 assert _bpr_by_row[300][0]["message"] == (
@@ -2962,7 +2962,7 @@ _oldshape_results = {
         "usage": {"input_tokens": 15, "output_tokens": 15}, "stop_reason": "end_turn", "result_type": "succeeded",
     },
 }
-_oldshape_out = finalize_batch_results(_oldshape_skeleton, _oldshape_results)
+_oldshape_out = asyncio.run(finalize_batch_results(_oldshape_skeleton, _oldshape_results))
 _oldshape_lang = _oldshape_out["sheets"][0]["languages"]["ru"]
 assert any(
     f["message"] == "старый формат ещё работает" for row in _oldshape_lang for f in row["findings"]
@@ -3148,7 +3148,7 @@ fake_batch_results = {
     "s0-fr-c0": {"text": None, "usage": {}, "stop_reason": None, "result_type": "errored"},
     # "s0-de-c0" deliberately absent
 }
-merged = finalize_batch_results(fake_skeleton, fake_batch_results)
+merged = asyncio.run(finalize_batch_results(fake_skeleton, fake_batch_results))
 by_lang = merged["sheets"][0]["languages"]
 assert any(f["type"] == "system" for row in by_lang["es-mx"] for f in row["findings"]), by_lang["es-mx"]
 assert any(f["type"] == "system" for row in by_lang["fr"] for f in row["findings"]), by_lang["fr"]
@@ -3476,7 +3476,7 @@ print("[OK] multi-check live path (_check_language_for_sheet): a mocked per-row 
 # an awaited call, must produce the identical summary. ---
 from app.excel_multi import build_batch_plan, finalize_batch_results
 
-_reg_requests, _reg_skeleton = asyncio.run(build_batch_plan([_reg_sheet], "en", ["register"], "", None))
+_reg_requests, _reg_skeleton = build_batch_plan([_reg_sheet], "en", ["register"], "", None)
 assert len(_reg_requests) == 1, _reg_requests
 _reg_custom_id = _reg_requests[0]["custom_id"]
 _reg_batch_results = {
@@ -3491,7 +3491,7 @@ _reg_batch_results = {
         "stop_reason": "end_turn",
     }
 }
-_reg_finalized = finalize_batch_results(_reg_skeleton, _reg_batch_results)
+_reg_finalized = asyncio.run(finalize_batch_results(_reg_skeleton, _reg_batch_results))
 _reg_lang_findings = _reg_finalized["sheets"][0]["languages"]["ru"]
 assert len(_reg_lang_findings) == 1, _reg_lang_findings
 _reg_batch_finding = _reg_lang_findings[0]["findings"][0]
@@ -4243,10 +4243,8 @@ assert not any(
 # must carry duplicate_language_columns through its skeleton, and
 # finalize_batch_results must apply the exact same warning logic once the
 # (here: empty, no AI checks requested) batch "finishes".
-_dup_batch_requests, _dup_batch_skeleton = asyncio.run(
-    _dup_build_batch_plan(_dup_target_sheets, "en", ["numbers"], "", None)
-)
-_dup_batch_result = _dup_finalize_batch_results(_dup_batch_skeleton, {})
+_dup_batch_requests, _dup_batch_skeleton = _dup_build_batch_plan(_dup_target_sheets, "en", ["numbers"], "", None)
+_dup_batch_result = asyncio.run(_dup_finalize_batch_results(_dup_batch_skeleton, {}))
 _dup_batch_ru_findings = _dup_batch_result["sheets"][0]["languages"]["ru"]
 assert any(
     row["excel_row"] == 0 and any("ru" in f["message"] for f in row["findings"])
@@ -6031,20 +6029,33 @@ print("[OK] _check_language_for_sheet (live path): with \"term_consistency\" sel
       "naming the other real Excel row, and the GPT cost is folded into this language's own cost_usd")
 
 # --- End-to-end through the Message-Batch (large-upload) path: GPT here
-# never touches Anthropic's batch queue at all — it must already be baked
-# into build_batch_plan's own skeleton (base_rows), with its cost carried
-# separately so finalize_batch_results still adds it into summary.cost_usd,
-# with ZERO Anthropic batch results needed for this specific finding. ---
+# never touches Anthropic's batch queue at all, and — Александр's own
+# worry (2026-09-27): does it silently drop out if it's slower than Opus,
+# especially now that build_batch_plan runs synchronously inside the
+# initial POST /multi-check request? — this is EXACTLY why the real GPT
+# call for term_consistency lives in finalize_batch_results (only ever
+# run once Anthropic's own batch has ended, polled in the background, or
+# for "nothing to submit" with no batch involved either way), never in
+# build_batch_plan itself, which must stay a plain, fast, synchronous
+# function with zero real API calls of its own — see both functions' own
+# comments for the full reasoning. build_batch_plan alone must submit ZERO
+# Anthropic requests for a term_consistency-only check (GPT-only, nothing
+# for Anthropic to do), and produce no term-consistency findings on its
+# own — those only appear once finalize_batch_results actually runs. ---
+_tc_batch_requests, _tc_batch_skeleton = build_batch_plan(
+    [_tc_sheet], "en", ["term_consistency"], "", None,
+)
+assert _tc_batch_requests == [], _tc_batch_requests
+assert all(not r["findings"] for r in _tc_batch_skeleton["sheets"][0]["languages"]["ru"]["rows"]), (
+    "build_batch_plan itself must never call GPT or produce term_consistency findings — only "
+    f"finalize_batch_results does — got {_tc_batch_skeleton}"
+)
+
 settings.OPENAI_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_openai = _fake_call_openai_tc_ok
-_tc_batch_requests, _tc_batch_skeleton = asyncio.run(
-    build_batch_plan([_tc_sheet], "en", ["term_consistency"], "", None)
-)
+_tc_batch_out = asyncio.run(finalize_batch_results(_tc_batch_skeleton, {}))
 claude_client_mod._call_openai = _previous_call_openai
 settings.OPENAI_API_KEY = ""
-# term_consistency never produces an Anthropic request at all (GPT-only)
-assert _tc_batch_requests == [], _tc_batch_requests
-_tc_batch_out = finalize_batch_results(_tc_batch_skeleton, {})
 _tc_batch_by_row = {
     r["excel_row"]: r["findings"] for r in _tc_batch_out["sheets"][0]["languages"]["ru"]
 }
@@ -6053,10 +6064,11 @@ assert any(
     for f in _tc_batch_by_row.get(2, [])
 ), _tc_batch_by_row
 assert _tc_batch_out["summary"]["cost_usd"] > 0.0, _tc_batch_out["summary"]
-print("[OK] build_batch_plan/finalize_batch_results (large-upload path): term_consistency's GPT call never "
-      "touches Anthropic's batch queue (zero batch requests submitted for it) — its finding is already baked "
-      "into the skeleton at plan-build time, and its cost still reaches summary.cost_usd via "
-      "finalize_batch_results even with an EMPTY Anthropic batch result set")
+print("[OK] build_batch_plan stays synchronous and makes zero GPT calls of its own (so a large, many-language "
+      "upload's initial submission is never delayed by term_consistency); finalize_batch_results (only ever "
+      "run once Anthropic's batch has ended, or with no batch at all) is where the real GPT call happens — "
+      "zero Anthropic batch requests needed for term_consistency's own finding, and its cost still reaches "
+      "summary.cost_usd via finalize_batch_results even with an EMPTY Anthropic batch result set")
 
 from app.main import DEFAULT_MULTI_CHECKS
 assert "term_consistency" in DEFAULT_MULTI_CHECKS, DEFAULT_MULTI_CHECKS

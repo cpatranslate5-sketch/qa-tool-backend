@@ -1201,7 +1201,7 @@ def estimate_check_volume(
     return total
 
 
-async def build_batch_plan(
+def build_batch_plan(
     sheets: list[dict],
     source_lang: str,
     checks: list[str],
@@ -1220,12 +1220,20 @@ async def build_batch_plan(
     types were selected at all, in which case there's nothing to submit and
     finalize_batch_results(skeleton, {}) is already the final answer.
 
-    async (2026-09-27) only because of "term_consistency" below — that
-    check is GPT-only and never goes through Anthropic's batch queue at
-    all (see claude_client.run_term_consistency_check's own comment), so
-    unlike everything else in this function it has a real result to await
-    right here, at plan-build time, rather than later in
-    finalize_batch_results.
+    Deliberately stays synchronous and does nothing for "term_consistency"
+    at all — see finalize_batch_results' own comment for why that GPT-only
+    check is computed there instead, not here. Computing it HERE was tried
+    first (2026-09-27) and reverted the same day: this function is awaited
+    directly inside the initial POST /multi-check request, before the
+    manager even gets back a "processing" response — a real GPT call per
+    language, run one at a time in a plain for-loop, would have added
+    unbounded, sequential latency to THAT request for any upload with many
+    languages (Александр's real files have had 30+), risking exactly the
+    kind of gateway timeout the chunk-size-comparison diagnostic hit under
+    heavy call volume. finalize_batch_results already only runs once
+    Anthropic's own batch has ended (polled, in the background) — the
+    right place for another real API call to live, same as
+    app.excel_multi.apply_second_opinion's own accepted trade-off.
     """
     requests: list[dict] = []
     skeleton_sheets = []
@@ -1262,32 +1270,6 @@ async def build_batch_plan(
                     "source": src,
                     "translation": tgt,
                     "findings": findings,
-                })
-
-            # Terminology consistency (see claude_client.
-            # run_term_consistency_check's own comment) is GPT-only and
-            # never touches Anthropic's batch queue, so it's simply awaited
-            # right here — same whole-language-at-once shape as the live
-            # path's own _check_language_for_sheet, just computed eagerly
-            # instead of alongside a semaphore-bounded gather (this
-            # function runs once per upload, not concurrently per
-            # language, so there's no shared concurrency budget to bound
-            # it against here).
-            term_cost_usd = 0.0
-            term_warning = None
-            if "term_consistency" in checks and ai_items:
-                term_grouped, term_cost_usd, term_warning = await run_term_consistency_check(ai_items)
-                term_grouped = _resolve_repeated_findings(term_grouped, relevant_rows)
-                for idx, finds in term_grouped.items():
-                    if 0 <= idx < len(base_rows):
-                        base_rows[idx]["findings"].extend(finds)
-            if term_warning is not None:
-                base_rows.append({
-                    "excel_row": 0,
-                    "context": "⚠ Системное предупреждение",
-                    "source": "",
-                    "translation": "",
-                    "findings": [term_warning],
                 })
 
             # Built from the sheet/position/chunk index only, never from
@@ -1354,11 +1336,6 @@ async def build_batch_plan(
                 "model": model,
                 "chunks": chunks_skeleton,
                 "rows": base_rows,
-                # Already paid for and folded into base_rows above at this
-                # point — carried separately only so finalize_batch_results
-                # can add it into summary.cost_usd (the chunk loop there
-                # only knows about Anthropic usage, never this GPT call).
-                "term_consistency_cost_usd": term_cost_usd,
             }
 
         skeleton_sheets.append({
@@ -1378,7 +1355,7 @@ async def build_batch_plan(
     return requests, skeleton
 
 
-def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, dict]) -> dict:
+async def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, dict]) -> dict:
     """Merges AI findings (once the Anthropic batch has ended) into the
     rule-based skeleton from build_batch_plan, producing the same
     {"sheets": [...], "summary": {...}} shape run_multi_check returns.
@@ -1390,13 +1367,50 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
 
     ai_results_by_custom_id: {custom_id: {"text": str | None, "usage": dict}}
     — see claude_client.get_batch_results. Missing/empty entries (e.g. no
-    batch was actually submitted) simply contribute no findings and no cost."""
+    batch was actually submitted) simply contribute no findings and no cost.
+
+    async since 2026-09-27 — the ONLY reason is "term_consistency" (see
+    claude_client.run_term_consistency_check): it's GPT-only and never
+    rides Anthropic's own batch queue at all, so it has to be run for real
+    somewhere. Deliberately HERE, not in build_batch_plan (see that
+    function's own comment for why computing it at submission time was
+    tried and reverted the same day) — this function only ever runs once
+    Anthropic's batch has actually ended (polled from app.main, in the
+    background) or, for the "nothing to submit" case, once right at
+    submission with no batch involved at all either way. Every language
+    across every sheet runs its term-consistency pass CONCURRENTLY (bounded
+    by the same AI_CONCURRENCY semaphore the rest of this module uses),
+    same asyncio.gather spirit as run_multi_check/apply_second_opinion —
+    never one GPT call per language awaited in a plain sequential loop."""
+    term_semaphore = asyncio.Semaphore(AI_CONCURRENCY)
+    term_checked = "term_consistency" in skeleton.get("checks", [])
+
+    async def _term_consistency_for(lang_skel: dict) -> tuple[dict[int, list[dict]], float, dict | None]:
+        rows = lang_skel["rows"]
+        if not rows:
+            return {}, 0.0, None
+        ai_items = [{"context": r["context"], "source": r["source"], "translation": r["translation"]} for r in rows]
+        async with term_semaphore:
+            grouped, cost, warning = await run_term_consistency_check(ai_items)
+        return _resolve_repeated_findings(grouped, rows), cost, warning
+
+    term_keys: list[tuple[int, str]] = []
+    if term_checked:
+        for s_idx, sheet in enumerate(skeleton["sheets"]):
+            for lang in sheet["languages"]:
+                term_keys.append((s_idx, lang))
+    term_task_results = (
+        await asyncio.gather(*[_term_consistency_for(skeleton["sheets"][s_idx]["languages"][lang]) for s_idx, lang in term_keys])
+        if term_keys else []
+    )
+    term_results_by_key = dict(zip(term_keys, term_task_results))
+
     result_sheets = []
     total_findings = 0
     total_rows_checked = 0
     total_cost_usd = 0.0
 
-    for sheet in skeleton["sheets"]:
+    for s_idx, sheet in enumerate(skeleton["sheets"]):
         languages_out = {}
         dup_cols = sheet.get("duplicate_language_columns") or {}
         first_target_lang = (sheet.get("target_langs") or [None])[0]
@@ -1482,10 +1496,9 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                         # point are still kept, just flagged.
                         truncated_any = True
                 total_cost_usd += _usage_cost(lang_skel.get("model", ""), ai_result.get("usage"), batch=True)
-            # Already spent at build_batch_plan time (term_consistency is
-            # GPT-only and never rides Anthropic's batch queue) — folded in
-            # here so it's counted in summary.cost_usd like everything else.
-            total_cost_usd += lang_skel.get("term_consistency_cost_usd", 0.0)
+
+            term_grouped, term_cost, term_warning = term_results_by_key.get((s_idx, lang), ({}, 0.0, None))
+            total_cost_usd += term_cost
 
             if missing_any:
                 warning_finding = _ai_failure_warning("результат не получен")
@@ -1501,7 +1514,7 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
 
             findings_list = []
             for idx, row in enumerate(lang_skel["rows"]):
-                findings = list(row["findings"]) + ai_grouped.get(idx, [])
+                findings = list(row["findings"]) + ai_grouped.get(idx, []) + term_grouped.get(idx, [])
                 if findings:
                     findings_list.append({
                         "excel_row": row["excel_row"],
@@ -1517,6 +1530,19 @@ def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[str, di
                     "source": "",
                     "translation": "",
                     "findings": [warning_finding],
+                })
+            if term_warning is not None:
+                # GPT WAS configured but the terminology-consistency pass
+                # itself failed for this language (see
+                # claude_client.run_term_consistency_check's own comment) —
+                # an unconfigured key contributes silently instead, same
+                # philosophy as every other GPT-only branch.
+                findings_list.append({
+                    "excel_row": 0,
+                    "context": "⚠ Системное предупреждение",
+                    "source": "",
+                    "translation": "",
+                    "findings": [term_warning],
                 })
             if "register" in skeleton.get("checks", []):
                 by_excel_row = {
@@ -1682,7 +1708,7 @@ async def try_finalize_batch(batch_id: str, skeleton: dict) -> tuple[dict | None
         return None, progress
     results_url = status.get("results_url")
     ai_results_by_custom_id = await get_batch_results(results_url) if results_url else {}
-    return finalize_batch_results(skeleton, ai_results_by_custom_id), progress
+    return await finalize_batch_results(skeleton, ai_results_by_custom_id), progress
 
 
 def _plural_ru(n: int, one: str, few: str, many: str) -> str:

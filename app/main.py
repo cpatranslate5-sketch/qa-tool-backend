@@ -961,7 +961,7 @@ async def multi_check(
             "checks_run": record.checks_run,
         }
 
-    requests, skeleton = await build_batch_plan(
+    requests, skeleton = build_batch_plan(
         sheets, resolved_source, selected_checks, extra_instructions,
         target_filter,
     )
@@ -979,7 +979,7 @@ async def multi_check(
         # algorithmic findings to score — see its own docstring), but it's
         # still deferred to the background for the same reason as the live
         # path above: no request should ever have to wait on it.
-        results = finalize_batch_results(skeleton, {})
+        results = await finalize_batch_results(skeleton, {})
         results["second_opinion_pending"] = True
         finished_at = datetime.datetime.now(datetime.timezone.utc)
         record = models.MultiCheck(
