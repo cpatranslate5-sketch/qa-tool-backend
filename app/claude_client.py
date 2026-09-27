@@ -1509,6 +1509,20 @@ OPENAI_MODEL_PRICING_PER_TOKEN = {
 }
 
 
+# Александр's ask, 2026-09-27: topping up either console (Anthropic's or
+# OpenAI's) is billed with 18% tax on top, on his end (Russia) — the "
+# "Стоимость: ..." figure shown everywhere in this app should reflect what
+# a check actually costs HIM to fund, not the vendor's bare per-token list
+# price these two pricing tables quote. Applied once, right here, as the
+# very last step of both cost functions below — every cost figure anywhere
+# in this app (a live check, a Message Batch, the second-opinion pass, the
+# new term-consistency pass, every /debug diagnostic) already flows
+# through _usage_cost or _openai_usage_cost, so this one constant is the
+# only place this ever needs to be applied. Update this if the tax rate
+# itself ever changes — it's a real-world number, not a modeling choice.
+CONSOLE_TOPUP_TAX_MULTIPLIER = 1.18
+
+
 def _openai_usage_cost(model: str, usage: dict | None) -> float:
     """Same idea as _usage_cost above, but OpenAI's usage dict uses
     prompt_tokens/completion_tokens instead of Anthropic's own
@@ -1518,7 +1532,8 @@ def _openai_usage_cost(model: str, usage: dict | None) -> float:
     rates = OPENAI_MODEL_PRICING_PER_TOKEN.get(model)
     if not rates or not usage:
         return 0.0
-    return usage.get("prompt_tokens", 0) * rates["input"] + usage.get("completion_tokens", 0) * rates["output"]
+    cost = usage.get("prompt_tokens", 0) * rates["input"] + usage.get("completion_tokens", 0) * rates["output"]
+    return cost * CONSOLE_TOPUP_TAX_MULTIPLIER
 
 
 # Anthropic prompt caching (2026-09-25, Александр's cost-cutting ask — see
@@ -1556,7 +1571,8 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
     cost = usage.get("input_tokens", 0) * rates["input"] + usage.get("output_tokens", 0) * rates["output"]
     cost += usage.get("cache_creation_input_tokens", 0) * rates["input"] * CACHE_WRITE_PRICE_MULTIPLIER
     cost += usage.get("cache_read_input_tokens", 0) * rates["input"] * CACHE_READ_PRICE_MULTIPLIER
-    return cost * BATCH_PRICE_DISCOUNT if batch else cost
+    cost = cost * BATCH_PRICE_DISCOUNT if batch else cost
+    return cost * CONSOLE_TOPUP_TAX_MULTIPLIER
 
 
 # Generous headroom for a batch prompt covering many rows of one language

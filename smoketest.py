@@ -1602,16 +1602,17 @@ print("[OK] _model_for_lang: confirmed the 15-language hard list (ar/bn/el/hi/hi
 # model ids now gets a real, non-zero cost instead of silently zeroing
 # out, while an actually-unlisted model id still safely falls back to 0.0
 # rather than guessing at a stale price. ---
-from app.claude_client import _usage_cost, MODEL_PRICING_PER_TOKEN
+from app.claude_client import _usage_cost, MODEL_PRICING_PER_TOKEN, CONSOLE_TOPUP_TAX_MULTIPLIER
 
 assert "claude-sonnet-5" in MODEL_PRICING_PER_TOKEN and "claude-opus-5" in MODEL_PRICING_PER_TOKEN
 sonnet5_cost = _usage_cost("claude-sonnet-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000})
-assert abs(sonnet5_cost - 12.00) < 1e-9, sonnet5_cost  # $2 in + $10 out per Mtok
+# $2 in + $10 out per Mtok, then the real 18% console top-up tax on top
+assert abs(sonnet5_cost - 12.00 * CONSOLE_TOPUP_TAX_MULTIPLIER) < 1e-9, sonnet5_cost
 opus5_cost = _usage_cost("claude-opus-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000})
-assert abs(opus5_cost - 30.00) < 1e-9, opus5_cost  # $5 in + $25 out per Mtok
+assert abs(opus5_cost - 30.00 * CONSOLE_TOPUP_TAX_MULTIPLIER) < 1e-9, opus5_cost  # $5 in + $25 out per Mtok
 # the batch (Message Batches API) discount still applies to these too
 sonnet5_batch_cost = _usage_cost("claude-sonnet-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000}, batch=True)
-assert abs(sonnet5_batch_cost - 6.00) < 1e-9, sonnet5_batch_cost
+assert abs(sonnet5_batch_cost - 6.00 * CONSOLE_TOPUP_TAX_MULTIPLIER) < 1e-9, sonnet5_batch_cost
 # an actually-unpriced model id still safely falls back to 0.0 rather than
 # guessing at a stale/wrong price — the exact safe behavior that made this
 # bug visible as "$0" instead of a silently wrong non-zero number
@@ -4568,12 +4569,13 @@ from app.claude_client import _openai_usage_cost as _openai_usage_cost_direct
 assert _openai_usage_cost_direct("gpt-5-mini", None) == 0.0
 assert _openai_usage_cost_direct("some-unpriced-model", {"prompt_tokens": 100, "completion_tokens": 50}) == 0.0
 _gpt_cost_check = _openai_usage_cost_direct("gpt-5-mini", {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000})
-assert abs(_gpt_cost_check - 2.25) < 1e-9, (
-    f"gpt-5-mini priced at $0.25/$2.00 per million input/output tokens must cost $2.25 for 1M+1M tokens, "
-    f"got {_gpt_cost_check}"
+assert abs(_gpt_cost_check - 2.25 * CONSOLE_TOPUP_TAX_MULTIPLIER) < 1e-9, (
+    f"gpt-5-mini priced at $0.25/$2.00 per million input/output tokens must cost $2.25 for 1M+1M tokens, plus "
+    f"the {CONSOLE_TOPUP_TAX_MULTIPLIER}x console top-up tax on top, got {_gpt_cost_check}"
 )
 print("[OK] _openai_usage_cost: missing usage/unpriced model degrades to $0 rather than raising, and "
-      "gpt-5-mini's real per-token rate ($0.25/$2.00 per million) is applied correctly")
+      "gpt-5-mini's real per-token rate ($0.25/$2.00 per million) is applied correctly, with the console "
+      "top-up tax folded in on top")
 
 _previous_call_openai = claude_client_mod._call_openai
 
@@ -6091,6 +6093,7 @@ from app.claude_client import (
     _BATCH_PROMPT_SINGLE_ITEM_PREFIX, _BATCH_PROMPT_SINGLE_ITEM_SUFFIX, BATCH_PROMPT_SINGLE_ITEM,
     _SECOND_OPINION_PROMPT_PREFIX, _SECOND_OPINION_PROMPT_SUFFIX, SECOND_OPINION_PROMPT,
     _call_claude, _batch_request_content, CACHE_WRITE_PRICE_MULTIPLIER, CACHE_READ_PRICE_MULTIPLIER,
+    CONSOLE_TOPUP_TAX_MULTIPLIER,
 )
 
 for _prefix, _suffix, _full, _name in [
@@ -6220,23 +6223,47 @@ _expected_cache_cost = (
     100 * _sonnet_rates["input"] + 50 * _sonnet_rates["output"]
     + 2000 * _sonnet_rates["input"] * CACHE_WRITE_PRICE_MULTIPLIER
     + 8000 * _sonnet_rates["input"] * CACHE_READ_PRICE_MULTIPLIER
-)
+) * CONSOLE_TOPUP_TAX_MULTIPLIER
 _actual_cache_cost = _usage_cost("claude-sonnet-5", _cache_usage)
 assert abs(_actual_cache_cost - _expected_cache_cost) < 1e-12, (
     f"_usage_cost must price cache_creation_input_tokens at {CACHE_WRITE_PRICE_MULTIPLIER}x and "
     f"cache_read_input_tokens at {CACHE_READ_PRICE_MULTIPLIER}x the model's normal input rate, ON TOP OF plain "
-    f"input/output tokens — expected {_expected_cache_cost}, got {_actual_cache_cost}"
+    f"input/output tokens, then apply the {CONSOLE_TOPUP_TAX_MULTIPLIER}x console top-up tax on top of "
+    f"everything — expected {_expected_cache_cost}, got {_actual_cache_cost}"
 )
 # A call that never used caching at all (no cache_* keys in usage) must cost
-# exactly what it always did — this is additive, not a replacement for the
-# existing input/output math.
+# exactly what it always did before caching existed, PLUS the tax — this is
+# additive, not a replacement for the existing input/output math.
 _plain_usage = {"input_tokens": 100, "output_tokens": 50}
-_expected_plain_cost = 100 * _sonnet_rates["input"] + 50 * _sonnet_rates["output"]
+_expected_plain_cost = (100 * _sonnet_rates["input"] + 50 * _sonnet_rates["output"]) * CONSOLE_TOPUP_TAX_MULTIPLIER
 assert abs(_usage_cost("claude-sonnet-5", _plain_usage) - _expected_plain_cost) < 1e-12, (
-    "a call with no cache usage at all must be priced exactly as before this feature existed"
+    "a call with no cache usage at all must be priced exactly as before the caching feature existed, still "
+    "with the console top-up tax applied"
 )
 print("[OK] _usage_cost: correctly adds cache-write tokens at 1.25x and cache-read tokens at 0.1x the model's "
       "normal input rate on top of plain input/output cost, while a call with no cache usage at all is priced "
-      "exactly as it always was")
+      "exactly as it always was (aside from the tax, applied uniformly to both)")
+
+# --- Александр's ask, 2026-09-27: topping up either console (Anthropic's "
+# or OpenAI's) is billed with 18% tax on top, on his end — every cost
+# figure shown anywhere in this app should reflect that real cost to him,
+# not the vendor's bare per-token list price. Applied once, at the very
+# end of both cost functions, so it's automatically already inside every
+# figure computed anywhere above in this whole file — this just proves
+# the multiplier itself is real and exactly 1.18 on both vendors' cost
+# functions specifically. ---
+assert CONSOLE_TOPUP_TAX_MULTIPLIER == 1.18, CONSOLE_TOPUP_TAX_MULTIPLIER
+_tax_anthropic_pre_tax = 100 * _sonnet_rates["input"] + 50 * _sonnet_rates["output"]
+assert abs(_usage_cost("claude-sonnet-5", _plain_usage) - _tax_anthropic_pre_tax * 1.18) < 1e-12
+from app.claude_client import OPENAI_MODEL_PRICING_PER_TOKEN
+
+_tax_openai_rates = OPENAI_MODEL_PRICING_PER_TOKEN["gpt-5-mini"]
+_tax_openai_usage = {"prompt_tokens": 1000, "completion_tokens": 200}
+_tax_openai_pre_tax = 1000 * _tax_openai_rates["input"] + 200 * _tax_openai_rates["output"]
+assert abs(_openai_usage_cost_direct("gpt-5-mini", _tax_openai_usage) - _tax_openai_pre_tax * 1.18) < 1e-12
+print("[OK] CONSOLE_TOPUP_TAX_MULTIPLIER: both _usage_cost (Anthropic) and _openai_usage_cost (GPT) apply the "
+      "real 18% console top-up tax on top of the vendor's own per-token price — every cost figure in the app "
+      "(a live check, a Message Batch, second opinion, term consistency, every /debug diagnostic) flows "
+      "through one of these two functions, so this one constant is already reflected everywhere")
 
 print("\nALL SMOKETEST CHECKS PASSED")
