@@ -355,12 +355,12 @@ assert multi_data["created_at"], multi_data
 assert multi_data["completed_at"], multi_data
 print("[OK] completed multi-check response includes created_at/completed_at")
 
-# --- the automatic Sonnet+GPT second-opinion pass no longer blocks this
+# --- the automatic Sonnet-only second-opinion pass no longer blocks this
 # response (see app.main._run_second_opinion_background) — the check comes
 # back "completed" with second_opinion_pending=true immediately, and only
 # the LATER detail fetch (after the background task has had a chance to
 # run) shows it resolved to false, with every algorithmic finding already
-# scored 100/100 by run_second_opinion's own no-API-call fast path. Using
+# scored 100 by run_second_opinion's own no-API-call fast path. Using
 # TestClient here, the background task actually finishes before client.post()
 # even returns (it runs as part of the same ASGI response cycle) — so this
 # also doubles as proof it doesn't crash or silently drop the update.
@@ -5592,16 +5592,19 @@ print("[OK] POST /debug/chunk-size-comparison: the diagnostic endpoint runs end-
       "clear 503 instead of a silently empty/misleading success when no API key is configured")
 
 # ============================================================================
-# Automatic second opinion (Александр's ask, 2026-09-25): after a multi-check
-# finishes, Sonnet AND GPT are each automatically asked how likely every
-# already-reported finding is a real problem — same thing Александр was
-# doing by hand (copying the report into a chat, see frontend copyReport.ts)
-# — so the report page can offer a "Отфильтровать отчёт" button. Whole-
-# language-at-once, NOT the old rolled-back Step 3's isolated-per-row
-# scoring (see the "Revert Step 3" commit) — and algorithmic findings
-# (rule_checks.RULE_BASED_TYPES) are scored 100/100 directly in code, never
-# sent to a model at all, so they're guaranteed (not just prompted) to
-# survive any later filtering.
+# Automatic second opinion (Александр's ask, 2026-09-25; made Sonnet-only
+# 2026-09-27): after a multi-check finishes, Sonnet is automatically asked
+# how likely every already-reported finding is a real problem — same thing
+# Александр was doing by hand (copying the report into a chat, see frontend
+# copyReport.ts) — so the report page can offer a "Отфильтровать отчёт"
+# button. Whole-language-at-once, NOT the old rolled-back Step 3's
+# isolated-per-row scoring (see the "Revert Step 3" commit) — and
+# algorithmic findings (rule_checks.RULE_BASED_TYPES) are scored 100
+# directly in code, never sent to a model at all, so they're guaranteed
+# (not just prompted) to survive any later filtering. GPT was part of this
+# pass from 2026-09-25 to 2026-09-27 — removed the same day Александр
+# confirmed Step 1's search ensemble should keep GPT but every later step
+# should stay Sonnet/Opus-only.
 # ============================================================================
 from app.claude_client import _parse_second_opinion as _parse_second_opinion_direct
 from app.claude_client import _second_opinion_input as _second_opinion_input_direct
@@ -5657,33 +5660,21 @@ async def _fake_call_claude_so_should_not_run(prompt, model=None, cache_prefix=N
     raise AssertionError("must not call Claude when there are no AI-judged findings to score")
 
 
-async def _fake_call_openai_so_should_not_run(prompt, model=None):
-    raise AssertionError("must not call GPT when there are no AI-judged findings to score")
-
-
 claude_client_mod._call_claude = _fake_call_claude_so_should_not_run
-claude_client_mod._call_openai = _fake_call_openai_so_should_not_run
 _cost_algo, _warn_algo = asyncio.run(run_second_opinion_direct(_rows_algo_only))
 claude_client_mod._call_claude = _previous_call_claude
-claude_client_mod._call_openai = _previous_call_openai
 assert _cost_algo == 0.0, _cost_algo
 assert _warn_algo == [], _warn_algo
 assert _rows_algo_only[0]["findings"][0]["sonnet_percent"] == 100
-assert _rows_algo_only[0]["findings"][0]["gpt_percent"] == 100
 assert _rows_algo_only[0]["findings"][1]["sonnet_percent"] == 100
-assert _rows_algo_only[0]["findings"][1]["gpt_percent"] == 100
-print("[OK] run_second_opinion: a language with ONLY algorithmic findings gets them scored 100/100 with "
-      "ZERO API calls made at all (both fakes would raise if called) — guaranteed to survive filtering "
+print("[OK] run_second_opinion: a language with ONLY algorithmic findings gets them scored 100 with "
+      "ZERO API calls made at all (the fake would raise if called) — guaranteed to survive filtering "
       "rather than depending on a model correctly following a prompt instruction, and costs nothing")
 
 
 async def _fake_call_claude_so_ok(prompt, model=None, cache_prefix=None):
     assert "1. опечатка A" in prompt and "2. не переведено B" in prompt, prompt
     return '[{"n": 1, "percent": 85}, {"n": 2, "percent": 20}]', {"input_tokens": 100, "output_tokens": 20}, "end_turn"
-
-
-async def _fake_call_openai_so_ok(prompt, model=None):
-    return '[{"n": 1, "percent": 90}, {"n": 2, "percent": 15}]', {"prompt_tokens": 100, "completion_tokens": 20}, "stop"
 
 
 _rows_mixed = [
@@ -5696,27 +5687,23 @@ _rows_mixed = [
     ]},
 ]
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-settings.OPENAI_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_so_ok
-claude_client_mod._call_openai = _fake_call_openai_so_ok
 _cost_mixed, _warn_mixed = asyncio.run(run_second_opinion_direct(_rows_mixed))
 claude_client_mod._call_claude = _previous_call_claude
-claude_client_mod._call_openai = _previous_call_openai
 settings.ANTHROPIC_API_KEY = ""
-settings.OPENAI_API_KEY = ""
 
 _typo_f = _rows_mixed[0]["findings"][0]
 _num_f = _rows_mixed[0]["findings"][1]
 _untr_f = _rows_mixed[1]["findings"][0]
-assert _typo_f["sonnet_percent"] == 85 and _typo_f["gpt_percent"] == 90, _typo_f
-assert _num_f["sonnet_percent"] == 100 and _num_f["gpt_percent"] == 100, _num_f
-assert _untr_f["sonnet_percent"] == 20 and _untr_f["gpt_percent"] == 15, _untr_f
+assert _typo_f["sonnet_percent"] == 85, _typo_f
+assert _num_f["sonnet_percent"] == 100, _num_f
+assert _untr_f["sonnet_percent"] == 20, _untr_f
 assert _cost_mixed > 0, _cost_mixed
 assert _warn_mixed == [], _warn_mixed
 print("[OK] run_second_opinion: with algorithmic findings mixed into the same rows as AI-judged ones, "
-      "the numbering sent to each model skips the algorithmic ones entirely, so a model's response numbered "
+      "the numbering sent to Sonnet skips the algorithmic ones entirely, so Sonnet's response numbered "
       "1/2 lands correctly on the typo and untranslatable findings (not the numbers finding sitting between "
-      "them in the row) — both models' percents attached, real added cost, no warnings")
+      "them in the row) — Sonnet's percent attached, real added cost, no warnings")
 
 _rows_fail = [
     {"excel_row": 4, "context": "c", "source": "s", "translation": "t", "findings": [
@@ -5724,52 +5711,37 @@ _rows_fail = [
     ]},
 ]
 
-
-async def _fake_call_claude_so_single(prompt, model=None, cache_prefix=None):
-    return '[{"n": 1, "percent": 85}]', {"input_tokens": 100, "output_tokens": 20}, "end_turn"
-
-
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-settings.OPENAI_API_KEY = "fake-key-for-smoketest"
-claude_client_mod._call_claude = _fake_call_claude_so_single
-claude_client_mod._call_openai = _fake_call_openai_broken
+claude_client_mod._call_claude = _fake_call_claude_broken
 _cost_fail, _warn_fail = asyncio.run(run_second_opinion_direct(_rows_fail))
 claude_client_mod._call_claude = _previous_call_claude
-claude_client_mod._call_openai = _previous_call_openai
 settings.ANTHROPIC_API_KEY = ""
-settings.OPENAI_API_KEY = ""
 
 _typo_c = _rows_fail[0]["findings"][0]
-assert _typo_c["sonnet_percent"] == 85, _typo_c
-assert "gpt_percent" not in _typo_c, _typo_c
-assert len(_warn_fail) == 1 and "GPT" in _warn_fail[0]["message"] and _warn_fail[0]["type"] == "system", _warn_fail
-print("[OK] run_second_opinion: a configured-but-failing GPT branch produces a visible system-warning "
-      "finding naming GPT and leaves gpt_percent simply UNSET on the affected findings (never guessed at "
-      "or defaulted) while Sonnet's own percent still comes through normally — the frontend then treats a "
-      "missing percent as 'can't safely filter this, always keep it'")
+assert "sonnet_percent" not in _typo_c, _typo_c
+assert len(_warn_fail) == 1 and _warn_fail[0]["type"] == "system", _warn_fail
+assert _cost_fail == 0.0, _cost_fail
+print("[OK] run_second_opinion: a configured-but-failing Sonnet call produces a visible system-warning "
+      "finding and leaves sonnet_percent simply UNSET on the affected findings (never guessed at or "
+      "defaulted) — the frontend then treats a missing percent as 'can't safely filter this, always keep it'")
 
 _rows_nokey = [
     {"excel_row": 9, "context": "c", "source": "s", "translation": "t", "findings": [
         {"type": "typo", "message": "опечатка D"},
     ]},
 ]
-settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-# OPENAI_API_KEY deliberately left unset ("" — the real, un-monkeypatched
-# _call_openai short-circuits on this by itself, same as everywhere else in
-# this file) — proves run_second_opinion doesn't warn just because GPT
-# contributed nothing, only when a CONFIGURED branch actually failed.
-claude_client_mod._call_claude = _fake_call_claude_so_single
+# ANTHROPIC_API_KEY deliberately left unset ("" — the real, un-monkeypatched
+# _call_claude short-circuits on this by itself, same as everywhere else in
+# this file) — proves run_second_opinion doesn't warn just because Sonnet
+# wasn't configured, only when a CONFIGURED call actually failed.
 _cost_nokey, _warn_nokey = asyncio.run(run_second_opinion_direct(_rows_nokey))
-claude_client_mod._call_claude = _previous_call_claude
-settings.ANTHROPIC_API_KEY = ""
 
 _typo_d = _rows_nokey[0]["findings"][0]
-assert _typo_d["sonnet_percent"] == 85, _typo_d
-assert "gpt_percent" not in _typo_d, _typo_d
+assert "sonnet_percent" not in _typo_d, _typo_d
 assert _warn_nokey == [], _warn_nokey
-print("[OK] run_second_opinion: with no OPENAI_API_KEY configured at all, GPT simply contributes no percent "
-      "to any finding and produces NO warning — an unconfigured model is an expected non-contribution, not "
-      "a failure, same philosophy as Step 1's own ensemble")
+print("[OK] run_second_opinion: with no ANTHROPIC_API_KEY configured at all, Sonnet simply contributes no "
+      "percent to any finding and produces NO warning — an unconfigured model is an expected "
+      "non-contribution, not a failure, same philosophy as Step 1's own ensemble")
 
 _results_for_apply_test = {
     "summary": {"cost_usd": 1.23, "total_findings": 2},
@@ -5792,43 +5764,60 @@ async def _fake_call_claude_apply(prompt, model=None, cache_prefix=None):
 
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
-settings.OPENAI_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_apply
-claude_client_mod._call_openai = _fake_call_openai_broken
 _results_after_apply = asyncio.run(apply_second_opinion_direct(_results_for_apply_test))
 claude_client_mod._call_claude = _previous_call_claude
-claude_client_mod._call_openai = _previous_call_openai
 settings.ANTHROPIC_API_KEY = ""
-settings.OPENAI_API_KEY = ""
 
 assert _results_after_apply is _results_for_apply_test, "must mutate and return the SAME dict, not a copy"
 assert _results_after_apply["summary"]["cost_usd"] > 1.23, (
-    "the extra Sonnet+GPT cost must be folded into the check's own total cost_usd, not hidden"
+    "the extra Sonnet cost must be folded into the check's own total cost_usd, not hidden"
 )
 _es_finding = _results_after_apply["sheets"][0]["languages"]["es"][0]["findings"][0]
 assert _es_finding["sonnet_percent"] == 77, _es_finding
-assert "gpt_percent" not in _es_finding, _es_finding
 _hi_finding = _results_after_apply["sheets"][0]["languages"]["hi"][0]["findings"][0]
-assert _hi_finding["sonnet_percent"] == 100 and _hi_finding["gpt_percent"] == 100, _hi_finding
-_es_rows = _results_after_apply["sheets"][0]["languages"]["es"]
-assert any(
-    r["excel_row"] == 0 and any("GPT" in f["message"] for f in r["findings"]) for r in _es_rows
-), "'es' had an AI-judged finding actually sent to the (failing) GPT branch — must get a visible warning row"
+assert _hi_finding["sonnet_percent"] == 100, _hi_finding
 _hi_rows = _results_after_apply["sheets"][0]["languages"]["hi"]
 assert not any(r["excel_row"] == 0 for r in _hi_rows), (
-    "'hi' had ONLY an algorithmic finding (scored 100/100 in code, no API call at all) — GPT's broken "
-    "branch never even ran for it, so it must get no warning"
+    "'hi' had ONLY an algorithmic finding (scored 100 in code, no API call at all) — no warning expected"
 )
-assert _results_after_apply["summary"]["total_findings"] == 3, (
-    "the 'es' language's system-warning row is a real, counted finding (system-type warnings are "
-    "deliberately counted, per _count_real_findings' own policy) — total_findings must go from 2 to 3, "
-    f"not stay stuck at 2. Got {_results_after_apply['summary']['total_findings']}"
-)
+assert _results_after_apply["summary"]["total_findings"] == 2, _results_after_apply["summary"]["total_findings"]
 print("[OK] apply_second_opinion: runs every checked language across every sheet concurrently, folds the "
-      "extra Sonnet+GPT cost into summary.cost_usd on top of whatever the check itself already cost, "
-      "mutates and returns the SAME results dict, appends a visible system-warning row only to languages "
-      "that actually had something sent to a branch that then failed, and keeps summary.total_findings in "
-      "sync with that new warning row instead of silently undercounting")
+      "extra Sonnet cost into summary.cost_usd on top of whatever the check itself already cost, mutates "
+      "and returns the SAME results dict, and never calls a model at all for a language with only "
+      "algorithmic findings")
+
+_results_for_apply_fail_test = {
+    "summary": {"cost_usd": 0.5, "total_findings": 1},
+    "sheets": [{
+        "sheet_name": "Sheet1",
+        "languages": {
+            "de": [{"excel_row": 2, "context": "c", "source": "s", "translation": "t", "findings": [
+                {"type": "typo", "message": "опечатка G"},
+            ]}],
+        },
+    }],
+}
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_broken
+_results_after_apply_fail = asyncio.run(apply_second_opinion_direct(_results_for_apply_fail_test))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _results_after_apply_fail is _results_for_apply_fail_test, "must mutate and return the same dict"
+_de_finding = _results_after_apply_fail["sheets"][0]["languages"]["de"][0]["findings"][0]
+assert "sonnet_percent" not in _de_finding, _de_finding
+_de_rows = _results_after_apply_fail["sheets"][0]["languages"]["de"]
+assert any(
+    r["excel_row"] == 0 and any(f["type"] == "system" for f in r["findings"]) for r in _de_rows
+), "'de' had an AI-judged finding actually sent to the (failing) Sonnet call — must get a visible warning row"
+assert _results_after_apply_fail["summary"]["total_findings"] == 2, (
+    "the 'de' language's system-warning row is a real, counted finding (system-type warnings are "
+    "deliberately counted, per _count_real_findings' own policy) — total_findings must go from 1 to 2, "
+    f"not stay stuck at 1. Got {_results_after_apply_fail['summary']['total_findings']}"
+)
+print("[OK] apply_second_opinion: a configured-but-failing Sonnet call for a language appends a visible "
+      "system-warning row and keeps summary.total_findings in sync with it instead of silently undercounting")
 
 # A genuinely unexpected bug in ONE language's second-opinion pass (not a
 # model API call failing — run_second_opinion already handles that per
@@ -5872,7 +5861,7 @@ assert any(
     ) for r in _broken_findings
 ), "the language whose second-opinion pass raised must get a visible generic-error warning row, not silence"
 _fine_findings = _results_after_crash["sheets"][0]["languages"]["fine-lang"][0]["findings"][0]
-assert _fine_findings["sonnet_percent"] == 100 and _fine_findings["gpt_percent"] == 100, (
+assert _fine_findings["sonnet_percent"] == 100, (
     "the OTHER language's second-opinion pass must complete normally even though a sibling language's own "
     f"pass raised an unexpected exception — got {_fine_findings}"
 )

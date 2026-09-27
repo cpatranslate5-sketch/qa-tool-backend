@@ -111,12 +111,12 @@ def on_startup():
 
 
 async def _run_second_opinion_background(multi_check_id: int, results: dict) -> None:
-    """Runs the automatic Sonnet+GPT second-opinion pass (apply_second_opinion)
+    """Runs the automatic Sonnet-only second-opinion pass (apply_second_opinion)
     AFTER a multi-check's response has already been sent to the browser,
     instead of blocking that response on it.
 
-    Why: apply_second_opinion makes two more sequential API calls per
-    language on top of the check's own AI calls. Blocking the request on
+    Why: apply_second_opinion makes one more API call per language on top
+    of the check's own AI calls. Blocking the request on
     it made the whole thing slow enough that the browser's fetch sometimes
     gave up ("Failed to fetch") even though the backend was still working
     and the result was saved fine a moment later — genuinely confusing
@@ -1081,9 +1081,9 @@ async def multi_check_history(
             finalized, progress = await try_finalize_batch(r.batch_id, r.results["skeleton"])
             if finalized is not None:
                 # Same deferral as the live multi-check path above — the
-                # Sonnet+GPT second opinion runs in the background instead
+                # Sonnet-only second opinion runs in the background instead
                 # of making THIS poll (already loaded with everyone else's
-                # history) wait on two more API calls per language.
+                # history) wait on one more API call per language.
                 finalized["second_opinion_pending"] = True
                 r.results = finalized
                 r.summary = finalized["summary"]
@@ -1206,7 +1206,7 @@ async def multi_check_detail(
         "created_at": record.created_at.isoformat(),
         "completed_at": record.completed_at.isoformat() if record.completed_at else None,
         "checks_run": record.checks_run,
-        # True until the background Sonnet+GPT second-opinion pass finishes
+        # True until the background Sonnet-only second-opinion pass finishes
         # (see _run_second_opinion_background) — the frontend polls this
         # endpoint while it's true, same as it does for status=="processing".
         "second_opinion_pending": bool((record.results or {}).get("second_opinion_pending", False)),

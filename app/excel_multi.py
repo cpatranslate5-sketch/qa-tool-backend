@@ -1582,13 +1582,13 @@ async def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[s
 
 
 async def apply_second_opinion(results: dict) -> dict:
-    """Runs the automatic Sonnet+GPT second-opinion pass (Александр's ask,
-    2026-09-25 — see claude_client.run_second_opinion's own comment for the
-    full rationale) over an already-finished multi-check result: attaches
-    sonnet_percent/gpt_percent to every real finding and folds the extra
-    API cost into summary["cost_usd"], so it's counted as part of the same
-    check instead of hidden. Every checked language across every sheet runs
-    concurrently (same asyncio.gather spirit as run_multi_check's own
+    """Runs the automatic second-opinion pass (Александр's ask, 2026-09-25;
+    made Sonnet-only 2026-09-27 — see claude_client.run_second_opinion's own
+    comment for the full rationale) over an already-finished multi-check
+    result: attaches sonnet_percent to every real finding and folds the
+    extra API cost into summary["cost_usd"], so it's counted as part of the
+    same check instead of hidden. Every checked language across every sheet
+    runs concurrently (same asyncio.gather spirit as run_multi_check's own
     per-language parallelism).
 
     Called once, right after a check's results are first assembled —
@@ -1601,7 +1601,7 @@ async def apply_second_opinion(results: dict) -> dict:
 
     Note for a very large batch upload: this makes the moment a background
     batch finishes (polled from multi_check_history/multi_check_detail)
-    take noticeably longer to respond — two more API calls per language,
+    take noticeably longer to respond — one more API call per language,
     now run synchronously inside that GET request — rather than being
     instant once Anthropic's own batch has ended. Accepted for now as a
     known trade-off rather than building a second async/polling stage on

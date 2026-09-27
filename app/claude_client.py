@@ -2087,14 +2087,19 @@ async def run_ai_checks_batch(
 # ------------------------------------------------ automatic second opinion ---
 # Александр's ask (2026-09-25): after a multi-check finishes, automatically
 # send each language's already-reported findings — numbered, one language at
-# a time — to BOTH Sonnet and GPT for an independent opinion on how likely
-# each one is a real problem, so the report page can offer a "Отфильтровать
-# отчёт" button that drops the findings neither model is convinced by. This
-# is exactly what he was doing BY HAND (see frontend copyReport.ts: copying
-# the report and pasting it into a chat) — automated, and run whole-language-
-# at-once like that manual flow, NOT like the old Step 3 (see the "Revert
-# Step 3" commit), whose isolated single-row AI calls for hard languages
-# produced inconsistent percentages for the exact same repeated issue. A
+# a time — to Sonnet for an independent opinion on how likely each one is a
+# real problem, so the report page can offer a "Отфильтровать отчёт" button
+# that drops the findings Claude isn't convinced by. This is exactly what he
+# was doing BY HAND (see frontend copyReport.ts: copying the report and
+# pasting it into a chat) — automated, and run whole-language-at-once like
+# that manual flow, NOT like the old Step 3 (see the "Revert Step 3"
+# commit), whose isolated single-row AI calls for hard languages produced
+# inconsistent percentages for the exact same repeated issue.
+#
+# Originally sent to BOTH Sonnet and GPT (2026-09-25); made Sonnet-only
+# 2026-09-27 (Александр: "Саму проверку на первом шаге GPT по-прежнему
+# выполняет" — GPT stays in Step 1's search ensemble, but every step after
+# the initial search, including this one, stays on Sonnet/Opus only). A
 # model reviewing the whole numbered list at once can actually notice and
 # score repeats consistently.
 #
@@ -2135,7 +2140,7 @@ def _second_opinion_input(rows: list[dict]) -> tuple[str, list[dict]]:
     """Builds the numbered plain-text block to send for scoring, and the
     parallel list of finding dicts each number refers to (finding_refs[i]
     is what number i+1 refers to). Only real findings whose type ISN'T one
-    of rule_checks.RULE_BASED_TYPES are included — those are scored 100/100
+    of rule_checks.RULE_BASED_TYPES are included — those are scored 100
     directly in code by run_second_opinion below, never sent to a model at
     all, so they can't come back scored any other way. register_summary
     (the "Тон обращения" fact) and excel_row==0 system rows are never
@@ -2180,23 +2185,23 @@ def _parse_second_opinion(raw: list) -> dict[int, int]:
     return out
 
 
-def _second_opinion_failure_warning(model_label: str) -> dict:
+def _second_opinion_failure_warning() -> dict:
     """Same synthetic "type": "system" finding pattern as
     _model_branch_search_warning above, but for THIS step — surfaced only
-    when a model that WAS configured (its API key is set) failed to
-    contribute a second opinion for this language, so Александр can tell
-    "this model genuinely reviewed and found nothing to remove" apart from
-    "this model's review didn't run at all". A model whose key simply isn't
-    configured contributes silently, same as Step 1's own ensemble — that's
-    an expected, intentional non-contribution, not a failure."""
+    when Sonnet failed to contribute a second opinion for this language, so
+    Александр can tell "the model genuinely reviewed and found nothing to
+    remove" apart from "the review didn't run at all". Sonnet-only since
+    2026-09-27 (his own words: the second-opinion filtering pass should be
+    Sonnet only — GPT stays involved in Step 1's search ensemble, never
+    here)."""
     return {
         "type": "system",
         "severity": "medium",
         "message": (
-            f"Автоматическая повторная проверка находок этого языка не сработала для модели {model_label} "
-            "(сбой на её стороне — например, закончились средства на счёте, неверный/просроченный ключ API, "
-            "временная недоступность сервиса). Находки, для которых нет оценки от этой модели, при нажатии "
-            "«Отфильтровать отчёт» останутся в отчёте — они не будут убраны без данных от обеих моделей."
+            "Автоматическая повторная проверка находок этого языка не сработала (сбой на стороне модели — "
+            "например, закончились средства на счёте, неверный/просроченный ключ API, временная "
+            "недоступность сервиса). Находки, для которых нет оценки, при нажатии «Отфильтровать отчёт» "
+            "останутся в отчёте без изменений."
         ),
     }
 
@@ -2205,43 +2210,45 @@ def _second_opinion_unexpected_error_warning() -> dict:
     """Same synthetic-finding pattern as _second_opinion_failure_warning,
     but for app.excel_multi.apply_second_opinion's own catch-all — an
     unexpected bug in this step (not a model API call failing, which
-    run_second_opinion already handles per-branch) must never take the
-    whole check down with it, but it also shouldn't fail completely
-    silently. Findings for this language simply keep no sonnet_percent/
-    gpt_percent at all (same "can't be filtered, always keep" fallback as
-    a single failed model branch)."""
+    run_second_opinion already handles) must never take the whole check
+    down with it, but it also shouldn't fail completely silently. Findings
+    for this language simply keep no sonnet_percent at all (same "can't be
+    filtered, always keep" fallback as a failed model call)."""
     return {
         "type": "system",
         "severity": "medium",
         "message": (
             "Автоматическая повторная проверка находок этого языка не выполнилась из-за непредвиденной "
             "ошибки. Остальная часть проверки отработала нормально — эта проблема касается только "
-            "дополнительной оценки вероятности ошибки для второго мнения (Sonnet/GPT). Находки этого "
+            "дополнительной оценки вероятности ошибки для второго мнения (Sonnet). Находки этого "
             "языка при нажатии «Отфильтровать отчёт» останутся в отчёте без изменений."
         ),
     }
 
 
 async def run_second_opinion(rows: list[dict]) -> tuple[float, list[dict]]:
-    """Attaches sonnet_percent/gpt_percent (0-100 ints) to every real,
-    AI-judged finding across rows, in place. Algorithmic findings
-    (rule_checks.RULE_BASED_TYPES) are set to 100/100 directly here without
-    ever being sent to a model — see _second_opinion_input's own comment for
-    why. A finding whose type a model wasn't asked about, or whose number
-    didn't come back in a model's response at all, simply keeps that
-    model's percent unset.
+    """Attaches sonnet_percent (0-100 int) to every real, AI-judged finding
+    across rows, in place. Algorithmic findings (rule_checks.RULE_BASED_TYPES)
+    are set to 100 directly here without ever being sent to a model — see
+    _second_opinion_input's own comment for why. A finding whose type wasn't
+    asked about, or whose number didn't come back in the response at all,
+    simply keeps sonnet_percent unset.
 
-    Returns (extra cost_usd this added, warning findings — one per model
-    that was expected to contribute but failed; see
-    _second_opinion_failure_warning). Returns (0.0, []) immediately when
-    there's nothing to score for this language at all."""
+    Sonnet-only since 2026-09-27 — Александр's own words: "Саму проверку на
+    первом шаге GPT по-прежнему выполняет" (Step 1's search ensemble stays
+    unchanged), but this second, separate filtering pass drops GPT entirely
+    in favor of Sonnet-only scoring, since all further work after the
+    initial search is meant to stay on Sonnet/Opus.
+
+    Returns (extra cost_usd this added, warning findings — see
+    _second_opinion_failure_warning, at most one entry). Returns (0.0, [])
+    immediately when there's nothing to score for this language at all."""
     for row in rows:
         if row["excel_row"] == 0:
             continue
         for f in row["findings"]:
             if f.get("type") in RULE_BASED_TYPES:
                 f["sonnet_percent"] = 100
-                f["gpt_percent"] = 100
 
     numbered_report, finding_refs = _second_opinion_input(rows)
     if not finding_refs:
@@ -2253,32 +2260,21 @@ async def run_second_opinion(rows: list[dict]) -> tuple[float, list[dict]]:
     cache_prefix = _SECOND_OPINION_PROMPT_PREFIX
     prompt = cache_prefix + _SECOND_OPINION_PROMPT_SUFFIX.format(numbered_report=numbered_report)
     sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
-    gpt_expected = bool(settings.OPENAI_API_KEY)
 
     async def _sonnet() -> tuple[dict[int, int], float]:
         text_block, usage, _ = await _call_claude(prompt, model=settings.CLAUDE_MODEL, cache_prefix=cache_prefix)
         return _parse_second_opinion(parse_json_array(text_block)), _usage_cost(settings.CLAUDE_MODEL, usage)
 
-    async def _gpt() -> tuple[dict[int, int], float]:
-        text_block, usage, _ = await _call_openai(prompt, model=settings.OPENAI_MODEL)
-        return _parse_second_opinion(parse_json_array(text_block)), _openai_usage_cost(settings.OPENAI_MODEL, usage)
-
-    ((sonnet_percents, sonnet_cost), sonnet_error), ((gpt_percents, gpt_cost), gpt_error) = await asyncio.gather(
-        _run_search_branch(_sonnet()), _run_search_branch(_gpt()),
-    )
+    (sonnet_percents, sonnet_cost), sonnet_error = await _run_search_branch(_sonnet())
 
     for n, f in enumerate(finding_refs, start=1):
         if n in sonnet_percents:
             f["sonnet_percent"] = sonnet_percents[n]
-        if n in gpt_percents:
-            f["gpt_percent"] = gpt_percents[n]
 
     warnings = []
     if sonnet_expected and sonnet_error is not None:
-        warnings.append(_second_opinion_failure_warning("Sonnet"))
-    if gpt_expected and gpt_error is not None:
-        warnings.append(_second_opinion_failure_warning("GPT"))
-    return sonnet_cost + gpt_cost, warnings
+        warnings.append(_second_opinion_failure_warning())
+    return sonnet_cost, warnings
 
 
 # --------------------------------------- Terminology consistency (GPT-only) ---

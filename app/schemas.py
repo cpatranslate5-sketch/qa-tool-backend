@@ -159,7 +159,7 @@ class MultiCheckHistoryOut(BaseModel):
     # second request. None for a still-processing check, or for an older
     # record from before this field existed.
     completed_at: str | None = None
-    # True while the background Sonnet+GPT second-opinion pass (see
+    # True while the background Sonnet-only second-opinion pass (see
     # app.main._run_second_opinion_background) hasn't finished yet for this
     # check — false for an older record from before this field existed, same
     # as a missing key in its stored results dict. The frontend polls while
