@@ -698,7 +698,7 @@ def delete_single_check(project_id: int, single_check_id: int, manager_id: int, 
 
 DEFAULT_MULTI_CHECKS = [
     "numbers", "placeholders", "max_length", "register", "typo",
-    "untranslatable", "completeness", "punctuation",
+    "untranslatable", "completeness", "punctuation", "term_consistency",
 ]
 
 
@@ -961,7 +961,7 @@ async def multi_check(
             "checks_run": record.checks_run,
         }
 
-    requests, skeleton = build_batch_plan(
+    requests, skeleton = await build_batch_plan(
         sheets, resolved_source, selected_checks, extra_instructions,
         target_filter,
     )

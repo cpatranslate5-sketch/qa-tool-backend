@@ -9,6 +9,11 @@ DEFAULT_CHECKS = [
     "numbers", "placeholders", "register", "typo",
     "untranslatable", "completeness", "punctuation",
 ]
+# "term_consistency" (see app.claude_client.run_term_consistency_check) is
+# deliberately NOT here — it's a whole-LANGUAGE pass across every row of a
+# file at once, meaningless for CheckIn's single source/translation pair.
+# It only ever runs as part of a multi-check upload — see
+# app.main.DEFAULT_MULTI_CHECKS, where it IS on by default.
 
 
 class ManagerOut(BaseModel):

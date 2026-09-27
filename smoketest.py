@@ -1152,7 +1152,7 @@ _weird_lang_buf = io.BytesIO()
 _weird_lang_wb.save(_weird_lang_buf)
 _weird_lang_buf.seek(0)
 _weird_sheets = _parse_workbook_direct(_weird_lang_buf.read())
-_weird_requests, _weird_skeleton = _build_batch_plan_direct(_weird_sheets, "en", ["typo"], "", None)
+_weird_requests, _weird_skeleton = asyncio.run(_build_batch_plan_direct(_weird_sheets, "en", ["typo"], "", None))
 _custom_id_pattern = _re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _bad_ids = [r["custom_id"] for r in _weird_requests if not _custom_id_pattern.match(r["custom_id"])]
 assert not _bad_ids, f"custom_id must always be Anthropic-safe, regardless of the file's own language codes: {_bad_ids}"
@@ -1316,7 +1316,7 @@ class _FakeBatchResultsClient:
 
 _previous_async_client = claude_client_mod.httpx.AsyncClient
 claude_client_mod.httpx.AsyncClient = _FakeBatchResultsClient
-_results = asyncio.get_event_loop().run_until_complete(claude_client_mod.get_batch_results("fake://results"))
+_results = asyncio.run(claude_client_mod.get_batch_results("fake://results"))
 claude_client_mod.httpx.AsyncClient = _previous_async_client
 assert set(_results.keys()) == {"s0-t0", "s0-t1"}, _results
 print("[OK] get_batch_results skips a malformed .jsonl line instead of crashing the whole batch")
@@ -2307,6 +2307,19 @@ print("[OK] the calibration text also explicitly covers the SAME problem occurri
       "one long, multi-sentence pair (e.g. one Excel cell with a whole paragraph) — every occurrence must "
       "be its own separate finding, quoting which sentence/fragment it's in, never blended into one")
 
+# --- Александр's ask, 2026-09-27: the AI's "typo" check was redundantly
+# re-reporting double/extra spaces that check_punctuation (rule_checks.py)
+# already catches algorithmically and reliably, producing two findings for
+# the exact same underlying issue (one PUNCTUATION, one TYPO). The shared
+# calibration tail now explicitly tells the model never to report double
+# spaces at all, following the same pattern as the pre-existing currency/date
+# formatting exclusion right before it. ---
+assert "Двойные" in CALIBRATION_BASE and "пробел" in CALIBRATION_BASE, CALIBRATION_BASE
+assert "алгоритмическая проверка пунктуации" in CALIBRATION_BASE, CALIBRATION_BASE
+print("[OK] the calibration text now explicitly tells the model never to report double/extra spaces as a "
+      "typo finding, since check_punctuation already catches those algorithmically and reporting them again "
+      "via AI would just duplicate the same finding")
+
 # --- Александр's ask, 2026-09-18: shorten the AI's own written findings —
 # the model's output is the pricier side of the token bill (several times
 # the input rate), so a terser "message" cuts cost without touching what
@@ -2353,11 +2366,11 @@ async def _fake_call_claude_records_prompt_register(prompt, model=None, cache_pr
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_records_prompt_typo
-asyncio.get_event_loop().run_until_complete(
+asyncio.run(
     run_ai_checks("source", "translation", ["typo"], target_lang="ru")
 )
 claude_client_mod._call_claude = _fake_call_claude_records_prompt_register
-asyncio.get_event_loop().run_until_complete(
+asyncio.run(
     run_ai_checks("source", "translation", ["register"], target_lang="ru")
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2564,7 +2577,7 @@ _rep_sheet = {
 }
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_repeated_batch
-_rep_out, _rep_cost = asyncio.get_event_loop().run_until_complete(
+_rep_out, _rep_cost = asyncio.run(
     _check_language_for_sheet(_rep_sheet, "ru", "en", ["typo", "untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2698,7 +2711,7 @@ _chunk_rows = [
 _chunk_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _chunk_rows}
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_chunked
-_chunk_out, _chunk_cost = asyncio.get_event_loop().run_until_complete(
+_chunk_out, _chunk_cost = asyncio.run(
     _check_language_for_sheet(_chunk_sheet, "ru", "en", ["untranslatable"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2760,7 +2773,7 @@ async def _fake_call_claude_count_calls(prompt, model=None, cache_prefix=None):
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_count_calls
-asyncio.get_event_loop().run_until_complete(
+asyncio.run(
     _check_language_for_sheet(_hard_chunk_sheet, "mr", "ru", ["typo"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -2858,7 +2871,7 @@ _bpc_rows = [
     for i in range(MAX_ROWS_PER_AI_CALL + 2)
 ]
 _bpc_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _bpc_rows}
-_bpc_requests, _bpc_skeleton = build_batch_plan([_bpc_sheet], "en", ["untranslatable"], "", None)
+_bpc_requests, _bpc_skeleton = asyncio.run(build_batch_plan([_bpc_sheet], "en", ["untranslatable"], "", None))
 assert len(_bpc_requests) == 2, "expected one request per chunk — 17 rows over a 15-row cap is 2 chunks"
 _bpc_chunks = _bpc_skeleton["sheets"][0]["languages"]["ru"]["chunks"]
 assert len(_bpc_chunks) == 2, _bpc_chunks
@@ -2892,7 +2905,7 @@ _bpr_rows = [
     for i in range(MAX_ROWS_PER_AI_CALL + 2)
 ]
 _bpr_sheet = {"sheet_name": "Sheet1", "languages": ["en", "ru"], "rows": _bpr_rows}
-_bpr_requests, _bpr_skeleton = build_batch_plan([_bpr_sheet], "en", ["untranslatable"], "", None)
+_bpr_requests, _bpr_skeleton = asyncio.run(build_batch_plan([_bpr_sheet], "en", ["untranslatable"], "", None))
 _bpr_chunks = _bpr_skeleton["sheets"][0]["languages"]["ru"]["chunks"]
 assert len(_bpr_chunks) == 2, _bpr_chunks
 _bpr_results = {
@@ -2988,7 +3001,7 @@ async def _fake_call_claude(prompt, model=None, cache_prefix=None):
 
 
 claude_client_mod._call_claude = _fake_call_claude
-findings, ai_cost = asyncio.get_event_loop().run_until_complete(
+findings, ai_cost = asyncio.run(
     run_ai_checks(
         "source", "translation", ["typo"], target_lang="az-az",
     )
@@ -3044,7 +3057,7 @@ async def _fake_call_claude_other_type(prompt, model=None, cache_prefix=None):
 
 
 claude_client_mod._call_claude = _fake_call_claude_other_type
-_other_findings, _ = asyncio.get_event_loop().run_until_complete(
+_other_findings, _ = asyncio.run(
     run_ai_checks("source", "translation", ["typo"], target_lang="az-az")
 )
 claude_client_mod._call_claude = _fake_call_claude
@@ -3088,7 +3101,7 @@ async def _fake_call_claude_truncated(prompt, model=None, cache_prefix=None):
 
 
 claude_client_mod._call_claude = _fake_call_claude_truncated
-findings_trunc, _ = asyncio.get_event_loop().run_until_complete(
+findings_trunc, _ = asyncio.run(
     run_ai_checks("source", "translation", ["typo"], target_lang="az-az")
 )
 assert any(f["type"] == "system" for f in findings_trunc), findings_trunc
@@ -3434,7 +3447,7 @@ async def _fake_call_claude_register_batch(prompt, model=None, cache_prefix=None
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_batch
-_reg_out, _reg_cost = asyncio.get_event_loop().run_until_complete(
+_reg_out, _reg_cost = asyncio.run(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -3463,7 +3476,7 @@ print("[OK] multi-check live path (_check_language_for_sheet): a mocked per-row 
 # an awaited call, must produce the identical summary. ---
 from app.excel_multi import build_batch_plan, finalize_batch_results
 
-_reg_requests, _reg_skeleton = build_batch_plan([_reg_sheet], "en", ["register"], "", None)
+_reg_requests, _reg_skeleton = asyncio.run(build_batch_plan([_reg_sheet], "en", ["register"], "", None))
 assert len(_reg_requests) == 1, _reg_requests
 _reg_custom_id = _reg_requests[0]["custom_id"]
 _reg_batch_results = {
@@ -3543,7 +3556,7 @@ async def _fake_call_claude_register_mixed_batch(prompt, model=None, cache_prefi
 
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
 claude_client_mod._call_claude = _fake_call_claude_register_mixed_batch
-_mixed_out, _mixed_cost = asyncio.get_event_loop().run_until_complete(
+_mixed_out, _mixed_cost = asyncio.run(
     _check_language_for_sheet(_reg_sheet, "ru", "en", ["register"], "", asyncio.Semaphore(5))
 )
 claude_client_mod._call_claude = _previous_call_claude
@@ -4230,7 +4243,9 @@ assert not any(
 # must carry duplicate_language_columns through its skeleton, and
 # finalize_batch_results must apply the exact same warning logic once the
 # (here: empty, no AI checks requested) batch "finishes".
-_dup_batch_requests, _dup_batch_skeleton = _dup_build_batch_plan(_dup_target_sheets, "en", ["numbers"], "", None)
+_dup_batch_requests, _dup_batch_skeleton = asyncio.run(
+    _dup_build_batch_plan(_dup_target_sheets, "en", ["numbers"], "", None)
+)
 _dup_batch_result = _dup_finalize_batch_results(_dup_batch_skeleton, {})
 _dup_batch_ru_findings = _dup_batch_result["sheets"][0]["languages"]["ru"]
 assert any(
@@ -5865,6 +5880,188 @@ print("[OK] apply_second_opinion: an unexpected exception in one language's seco
       "model API call failing, which run_second_opinion already handles per-branch — something else "
       "entirely) is caught per-language, surfaces as a visible warning instead of failing silently, and "
       "never takes the rest of an already-successful multi-check down with it")
+
+# --- Terminology consistency (2026-09-27, Александр's ask): a NEW, GPT-only,
+# whole-language check that looks for the same recurring source term
+# translated into different, non-equivalent variants across different rows
+# of one language — see claude_client.run_term_consistency_check's own
+# comment for why it can't reuse the normal per-chunk pipeline. ---
+from app.claude_client import run_term_consistency_check, TERM_CONSISTENCY_TYPE, MAX_ROWS_FOR_TERM_CONSISTENCY
+
+_tc_empty_grouped, _tc_empty_cost, _tc_empty_warn = asyncio.run(run_term_consistency_check([]))
+assert _tc_empty_grouped == {} and _tc_empty_cost == 0.0 and _tc_empty_warn is None, (
+    _tc_empty_grouped, _tc_empty_cost, _tc_empty_warn
+)
+print("[OK] run_term_consistency_check: an empty item list returns ({}, 0.0, None) immediately, no GPT call")
+
+_tc_items = [
+    {"context": "score1", "source": "Ваши баллы: 10", "translation": "Your points: 10"},
+    {"context": "greeting", "source": "Добро пожаловать!", "translation": "Welcome!"},
+    {"context": "score2", "source": "Начислено баллов: 5", "translation": "Credits awarded: 5"},
+]
+
+# No OPENAI_API_KEY configured at all -> silent, expected non-contribution
+# (same philosophy as every other GPT-only branch in claude_client), never
+# treated as a failure worth warning about. Uses the REAL _call_openai here
+# (not a fake) — its own no-key short-circuit (see its docstring) is
+# exactly the behavior being verified, so faking it would test nothing.
+assert not settings.OPENAI_API_KEY, "expected no OpenAI key configured by default at this point in the script"
+_tc_nokey_grouped, _tc_nokey_cost, _tc_nokey_warn = asyncio.run(run_term_consistency_check(_tc_items))
+assert _tc_nokey_grouped == {} and _tc_nokey_cost == 0.0 and _tc_nokey_warn is None, (
+    _tc_nokey_grouped, _tc_nokey_cost, _tc_nokey_warn
+)
+print("[OK] run_term_consistency_check: with no OPENAI_API_KEY configured, this pass silently contributes "
+      "nothing at all (no real call attempted, no warning) — an unconfigured key is expected, not a failure")
+
+
+async def _fake_call_openai_tc_ok(prompt, model=None):
+    assert "Исходник: «Ваши баллы: 10»" in prompt and "Исходник: «Начислено баллов: 5»" in prompt, prompt
+    return (
+        '[{"rows": [1, 3], "message": "«баллы» переведено как «points» в строке 1 и «credits» в строке 3"}]',
+        {"prompt_tokens": 200, "completion_tokens": 40}, "stop",
+    )
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_openai = _fake_call_openai_tc_ok
+_tc_grouped, _tc_cost, _tc_warn = asyncio.run(run_term_consistency_check(_tc_items))
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+
+assert _tc_warn is None, _tc_warn
+assert _tc_cost > 0.0, _tc_cost
+assert 0 in _tc_grouped and 1 not in _tc_grouped, _tc_grouped
+_tc_finding = _tc_grouped[0][0]
+assert _tc_finding["type"] == TERM_CONSISTENCY_TYPE, _tc_finding
+assert _tc_finding["severity"] == "medium", _tc_finding
+assert _tc_finding["_also_idx"] == [2], (
+    "row 3 in the model's 1-based response must resolve to item index 2 (0-based) in the internal "
+    f"_also_idx list, the exact same shape claude_client.group_batch_findings produces — got {_tc_finding}"
+)
+print("[OK] run_term_consistency_check: a real GPT finding referencing rows [1, 3] comes back keyed on item "
+      "index 0 (the first referenced row), carrying the OTHER row's index in the same \"_also_idx\" shape "
+      "group_batch_findings itself produces, with type/severity filled in even though the prompt only asked "
+      "GPT for \"rows\"/\"message\" — real cost computed from GPT's own usage")
+
+# Resolving that "_also_idx" through app.excel_multi's EXISTING
+# _resolve_repeated_findings (no new merging code needed at all) must turn
+# it into the familiar "(также в строках: N)" tag on the finding attached
+# to the first row's real Excel row number.
+_tc_relevant_rows = [
+    {"excel_row": 10, "context": "score1"},
+    {"excel_row": 11, "context": "greeting"},
+    {"excel_row": 12, "context": "score2"},
+]
+_tc_resolved = _resolve_repeated_findings(_tc_grouped, _tc_relevant_rows)
+assert "_also_idx" not in _tc_resolved[0][0], _tc_resolved
+assert "(также в строках: 12)" in _tc_resolved[0][0]["message"], _tc_resolved
+print("[OK] run_term_consistency_check's output resolves cleanly through the EXISTING "
+      "_resolve_repeated_findings (app.excel_multi) into a \"(также в строках: 12)\" tag on the finding "
+      "attached to Excel row 10 — zero new merging/display code needed for the multi-row case")
+
+
+async def _fake_call_openai_tc_broken(prompt, model=None):
+    raise _httpx_for_fault_injection.ConnectError("simulated GPT outage")
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_openai = _fake_call_openai_tc_broken
+_tc_fail_grouped, _tc_fail_cost, _tc_fail_warn = asyncio.run(run_term_consistency_check(_tc_items))
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _tc_fail_grouped == {} and _tc_fail_cost == 0.0, (_tc_fail_grouped, _tc_fail_cost)
+assert _tc_fail_warn is not None and _tc_fail_warn["type"] == "system", _tc_fail_warn
+print("[OK] run_term_consistency_check: GPT WAS configured but the call itself failed — surfaces a visible "
+      "system-warning finding instead of failing silently or crashing the whole check")
+
+_tc_oversized_items = [
+    {"context": "", "source": f"Строка {i}", "translation": f"Row {i}"}
+    for i in range(MAX_ROWS_FOR_TERM_CONSISTENCY + 20)
+]
+
+
+async def _fake_call_openai_tc_cap_check(prompt, model=None):
+    assert f"{MAX_ROWS_FOR_TERM_CONSISTENCY}. " in prompt, "the last row within the cap must still be sent"
+    assert f"{MAX_ROWS_FOR_TERM_CONSISTENCY + 1}. " not in prompt, (
+        "a row beyond MAX_ROWS_FOR_TERM_CONSISTENCY must never be sent — this pass is capped, not the "
+        "whole upload, so an oversized single language can't turn into an unbounded prompt"
+    )
+    return "[]", {"prompt_tokens": 10, "completion_tokens": 5}, "stop"
+
+
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_openai = _fake_call_openai_tc_cap_check
+asyncio.run(run_term_consistency_check(_tc_oversized_items))
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+print(f"[OK] run_term_consistency_check: an oversized item list is capped at MAX_ROWS_FOR_TERM_CONSISTENCY "
+      f"({MAX_ROWS_FOR_TERM_CONSISTENCY}) rows sent to GPT, rather than an unbounded prompt")
+
+# --- End-to-end through the LIVE path (_check_language_for_sheet): with
+# "term_consistency" ticked, a language-wide inconsistency must show up on
+# the correct row of the real report, with the "(также в строках: ...)" tag,
+# and its GPT cost must be folded into the language's own cost_usd. ---
+_tc_sheet = {
+    "sheet_name": "Sheet1",
+    "languages": ["en", "ru"],
+    "rows": [
+        {"excel_row": 2, "context": "score1", "max_length": None,
+         "values": {"en": "Ваши баллы: 10", "ru": "Your points: 10"}},
+        {"excel_row": 3, "context": "greeting", "max_length": None,
+         "values": {"en": "Добро пожаловать!", "ru": "Welcome!"}},
+        {"excel_row": 4, "context": "score2", "max_length": None,
+         "values": {"en": "Начислено баллов: 5", "ru": "Credits awarded: 5"}},
+    ],
+}
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_openai = _fake_call_openai_tc_ok
+_tc_e2e_out, _tc_e2e_cost = asyncio.run(_check_language_for_sheet(
+    _tc_sheet, "ru", "en", ["term_consistency"], "", asyncio.Semaphore(5),
+))
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+_tc_e2e_by_row = {r["excel_row"]: r["findings"] for r in _tc_e2e_out}
+assert any(
+    f["type"] == TERM_CONSISTENCY_TYPE and "(также в строках: 4)" in f["message"]
+    for f in _tc_e2e_by_row.get(2, [])
+), _tc_e2e_by_row
+assert _tc_e2e_cost > 0.0, _tc_e2e_cost
+print("[OK] _check_language_for_sheet (live path): with \"term_consistency\" selected, a real inconsistency "
+      "across two of the language's rows shows up on the first row with the \"(также в строках: ...)\" tag "
+      "naming the other real Excel row, and the GPT cost is folded into this language's own cost_usd")
+
+# --- End-to-end through the Message-Batch (large-upload) path: GPT here
+# never touches Anthropic's batch queue at all — it must already be baked
+# into build_batch_plan's own skeleton (base_rows), with its cost carried
+# separately so finalize_batch_results still adds it into summary.cost_usd,
+# with ZERO Anthropic batch results needed for this specific finding. ---
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_openai = _fake_call_openai_tc_ok
+_tc_batch_requests, _tc_batch_skeleton = asyncio.run(
+    build_batch_plan([_tc_sheet], "en", ["term_consistency"], "", None)
+)
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+# term_consistency never produces an Anthropic request at all (GPT-only)
+assert _tc_batch_requests == [], _tc_batch_requests
+_tc_batch_out = finalize_batch_results(_tc_batch_skeleton, {})
+_tc_batch_by_row = {
+    r["excel_row"]: r["findings"] for r in _tc_batch_out["sheets"][0]["languages"]["ru"]
+}
+assert any(
+    f["type"] == TERM_CONSISTENCY_TYPE and "(также в строках: 4)" in f["message"]
+    for f in _tc_batch_by_row.get(2, [])
+), _tc_batch_by_row
+assert _tc_batch_out["summary"]["cost_usd"] > 0.0, _tc_batch_out["summary"]
+print("[OK] build_batch_plan/finalize_batch_results (large-upload path): term_consistency's GPT call never "
+      "touches Anthropic's batch queue (zero batch requests submitted for it) — its finding is already baked "
+      "into the skeleton at plan-build time, and its cost still reaches summary.cost_usd via "
+      "finalize_batch_results even with an EMPTY Anthropic batch result set")
+
+from app.main import DEFAULT_MULTI_CHECKS
+assert "term_consistency" in DEFAULT_MULTI_CHECKS, DEFAULT_MULTI_CHECKS
+print("[OK] DEFAULT_MULTI_CHECKS includes \"term_consistency\" — on by default for a new multi-check upload, "
+      "matching Александр's explicit ask (\"по умолчанию с галочкой\")")
 
 # --- Anthropic prompt caching (2026-09-25, Александр's cost-cutting ask —
 # see claude_client._call_claude's own cache_prefix comment). Two things

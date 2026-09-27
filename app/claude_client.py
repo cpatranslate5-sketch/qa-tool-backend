@@ -165,7 +165,10 @@ CALIBRATION_STRICT_OPENING = (
 _CALIBRATION_SHARED_TAIL = (
     "Порядок символа валюты относительно числа, "
     "разделители тысяч/десятичных знаков, а также сам порядок частей даты (день/месяц/год) и то, точкой или "
-    "слэшем они разделены — это НЕ ошибка перевода сама по себе, и об этом никогда не нужно сообщать. Важно: одна "
+    "слэшем они разделены — это НЕ ошибка перевода сама по себе, и об этом никогда не нужно сообщать. Двойные "
+    "(или более) пробелы внутри перевода — тоже никогда не нужно указывать как находку: их уже надёжно и отдельно "
+    "находит алгоритмическая проверка пунктуации, и повторное упоминание в разделе «опечатки» — это просто дубль "
+    "той же самой находки, а не новая проблема. Важно: одна "
     "пара «исходник/перевод» может содержать НЕСКОЛЬКО разных проблем одновременно, в том числе разных типов из "
     "списка ниже — не останавливайся после первой найденной в паре ошибки, полностью проверь пару на КАЖДЫЙ "
     "выбранный критерий и включи в ответ отдельную запись на каждую отдельную настоящую находку, даже если несколько "
@@ -2260,6 +2263,124 @@ async def run_second_opinion(rows: list[dict]) -> tuple[float, list[dict]]:
     if gpt_expected and gpt_error is not None:
         warnings.append(_second_opinion_failure_warning("GPT"))
     return sonnet_cost + gpt_cost, warnings
+
+
+# --------------------------------------- Terminology consistency (GPT-only) ---
+# Александр's ask, 2026-09-27: a NEW check category, on by default, that
+# looks at every row of one language TOGETHER (unlike CHECK_LABELS' checks,
+# which only ever see one chunk of up to MAX_ROWS_PER_AI_CALL rows at a
+# time) and flags a recurring source term that got translated into
+# different, non-equivalent variants across different rows — e.g. "баллы"
+# rendered as "points" in one row and "credits" in another with no real
+# difference in meaning. Deliberately GPT-only, never Anthropic — his own
+# words: "Только на GPT, чтобы была экономия... переплачивать за
+# Sonnet/Opus здесь смысла не вижу". This is why it can't just be folded
+# into CHECK_LABELS/build_batch_prompt (Step 2, which is Anthropic-only by
+# design) or even Step 1's search (which only ever sees one chunk) — it
+# needs its own whole-language pass, called separately from
+# app.excel_multi (both the live path and the Message-Batch "large upload"
+# path, since GPT here never goes through Anthropic's batch queue at all).
+TERM_CONSISTENCY_TYPE = "term_consistency"
+
+# Same 400-ish-row order of magnitude a huge upload's SINGLE language could
+# realistically reach — capped so one pathological upload can't turn this
+# into an unbounded prompt/timeout. Rows beyond the cap simply aren't
+# considered for THIS pass; every other check still covers every row.
+MAX_ROWS_FOR_TERM_CONSISTENCY = 400
+
+# The instructions block is Александр's own verbatim spec (2026-09-27),
+# translated into the same "{"rows": [...], "message": "..."}" response
+# shape BATCH_PROMPT's own cross-row repeat detection already uses (see
+# group_batch_findings) — reused directly below, rather than inventing a
+# new response shape, so app.excel_multi's existing _resolve_repeated_
+# findings turns "rows" into a "(также в строках: ...)" tag with zero new
+# code on that end.
+_TERM_CONSISTENCY_INSTRUCTIONS = (
+    "Проверь консистентность перевода повторяющихся терминов и понятий внутри одного языка по всей "
+    "предоставленной пачке строк.\n"
+    "Если один и тот же термин исходника используется в одинаковом значении и контексте, его перевод должен "
+    "быть терминологически единообразным.\n"
+    "Например: «баллы» не должны без причины переводиться в разных строках разными терминами со значениями "
+    "«points», «scores», «credits» и т. п.\n"
+    "Не считать ошибкой:\n"
+    "- разные грамматические формы одного термина;\n"
+    "- склонение, число, род, падеж;\n"
+    "- артикли, предлоги и служебные элементы;\n"
+    "- естественные морфологические изменения;\n"
+    "- разные переводы, если значение исходного слова действительно различается по контексту.\n"
+    "Фиксируй ошибку только если разные варианты обозначают одно и то же понятие в сопоставимом контексте и "
+    "создают реальную терминологическую неконсистентность.\n"
+    "При обнаружении укажи обе (или все) строки и использованные варианты перевода.\n\n"
+    "Строки пронумерованы ниже в формате «N. [контекст] Исходник: ... | Перевод: ...». Ответь СТРОГО "
+    "JSON-массивом без каких-либо пояснений вокруг, каждый элемент вида {{\"rows\": [n1, n2, ...], "
+    "\"message\": \"...\"}}, где \"rows\" — номера ВСЕХ строк, задействованных в этой конкретной находке "
+    "(минимум два), а \"message\" — конкретное объяснение на русском языке: какой термин исходника и какими "
+    "разными вариантами перевода он передан в указанных строках. Если проблем не найдено, верни пустой "
+    "массив []. Не включай в ответ ничего, кроме самого JSON-массива.\n\n"
+    "Строки:\n{numbered_rows}"
+)
+
+
+def _term_consistency_failure_warning() -> dict:
+    """Same synthetic "type": "system" finding pattern as
+    _second_opinion_failure_warning/_model_branch_search_warning — shown
+    only when GPT WAS configured (its API key is set) but this pass failed
+    for this language, never for an unconfigured key (an expected, silent
+    non-contribution, same philosophy as every other GPT branch here)."""
+    return {
+        "type": "system",
+        "severity": "medium",
+        "message": (
+            "Проверка консистентности терминов (GPT) не выполнилась для этого языка — сбой на стороне "
+            "модели (например, закончились доступные средства на счёте, неверный/просроченный ключ API, "
+            "или временная недоступность сервиса). Остальные критерии проверены как обычно."
+        ),
+    }
+
+
+async def run_term_consistency_check(items: list[dict]) -> tuple[dict[int, list[dict]], float, dict | None]:
+    """Whole-language, GPT-only pass — see TERM_CONSISTENCY_TYPE's own
+    comment for why this can't reuse the normal per-chunk pipeline. Never
+    calls Anthropic at all.
+
+    items: the SAME {"context", "source", "translation"} list the normal
+    per-chunk pipeline builds for this language (app.excel_multi's
+    relevant_rows/ai_items) — every row of the language together, not one
+    chunk, is the whole point.
+
+    Returns (findings keyed by item index — the exact same "_also_idx"-
+    carrying shape claude_client.group_batch_findings produces, so
+    app.excel_multi's existing _resolve_repeated_findings resolves it into
+    real Excel row numbers with no new merging code; extra cost_usd this
+    added; a warning finding — see _term_consistency_failure_warning —
+    only when GPT was configured but this call failed). Returns
+    ({}, 0.0, None) immediately for an empty language, or when
+    OPENAI_API_KEY isn't configured at all (silent non-contribution, same
+    as every other GPT-only branch in this file)."""
+    if not items:
+        return {}, 0.0, None
+    capped = items[:MAX_ROWS_FOR_TERM_CONSISTENCY]
+    numbered_rows = "\n".join(
+        f"{n}. [{it.get('context', '')}] Исходник: «{it['source']}» | Перевод: «{it['translation']}»"
+        for n, it in enumerate(capped, start=1)
+    )
+    prompt = _TERM_CONSISTENCY_INSTRUCTIONS.format(numbered_rows=numbered_rows)
+    gpt_expected = bool(settings.OPENAI_API_KEY)
+    try:
+        text_block, usage, _ = await _call_openai(prompt, model=settings.OPENAI_MODEL)
+    except _BRANCH_FAILURE_EXCEPTIONS:
+        return {}, 0.0, (_term_consistency_failure_warning() if gpt_expected else None)
+    if text_block is None:
+        return {}, 0.0, None
+    raw = parse_json_array(text_block)
+    number_to_index = {n: n - 1 for n in range(1, len(capped) + 1)}
+    grouped = group_batch_findings(raw, number_to_index)
+    for findings in grouped.values():
+        for f in findings:
+            f["type"] = TERM_CONSISTENCY_TYPE
+            f.setdefault("severity", "medium")
+    cost_usd = _openai_usage_cost(settings.OPENAI_MODEL, usage)
+    return grouped, cost_usd, None
 
 
 # --------------------------------------------------- Message Batches API ---
