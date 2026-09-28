@@ -1305,7 +1305,13 @@ async def debug_chunk_size_comparison(payload: schemas.ChunkSizeComparisonIn):
     # Each call makes real, real-money calls to Anthropic (one per row per
     # run for "individual" mode, plus one per run for "batched" mode) —
     # both cost totals in the response say exactly how much this one call
-    # spent.
+    # spent. Optional payload.grouped_chunk_size (2026-09-28, Александр's
+    # ask) adds a THIRD mode — chunks of that size, e.g. 5 — so a middle
+    # ground between the two extremes can be measured on real rows instead
+    # of guessed at, before deciding whether it's worth trading some of the
+    # cost premium away without losing the accuracy chunk=1 is proven to
+    # buy on at least one real example (see MAX_ROWS_PER_AI_CALL_HARD's
+    # own comment).
     result = await run_chunk_size_comparison(
         rows=[r.model_dump() for r in payload.rows],
         target_lang=payload.target_lang,
@@ -1313,6 +1319,7 @@ async def debug_chunk_size_comparison(payload: schemas.ChunkSizeComparisonIn):
         checks=payload.checks,
         runs_per_mode=payload.runs_per_mode,
         model=payload.model,
+        grouped_chunk_size=payload.grouped_chunk_size,
     )
     if not result:
         raise HTTPException(

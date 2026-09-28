@@ -466,6 +466,7 @@ async def run_chunk_size_comparison(
     checks: list[str] | None = None,
     runs_per_mode: int = 3,
     model: str | None = None,
+    grouped_chunk_size: int | None = None,
 ) -> dict:
     """Runs the same set of rows two ways: "individually" (one
     build_batch_prompt([row]) call per row — today's real production
@@ -474,6 +475,18 @@ async def run_chunk_size_comparison(
     production behavior for every other language), `runs_per_mode` times
     each, and reports a per-row hit rate for both modes plus each mode's
     total cost.
+
+    grouped_chunk_size (2026-09-28, Александр's ask): when given (and at
+    least 2, and less than len(rows) — otherwise ignored, since it would
+    just duplicate one of the two existing modes), ALSO runs a third mode
+    that splits rows into chunks of this size (last chunk may be smaller)
+    and makes one _one_batched_run call per chunk per run — a genuine
+    middle ground between "alone" and "everything together", which until
+    now had never actually been measured: the real evidence behind
+    HARD_LANGUAGE_BASES/MAX_ROWS_PER_AI_CALL_HARD only ever compared those
+    two extremes. Reported as "grouped_*" fields alongside the existing
+    "individual_*"/"batched_*" ones, keyed the same way (per-row hit rate,
+    known-issue rate, total cost) so all three can be read side by side.
 
     rows: each {"context": str, "source": str, "translation": str,
     "has_known_issue": bool}. Mark has_known_issue=True on any row you
@@ -533,6 +546,36 @@ async def run_chunk_size_comparison(
             if per_item.get(idx):
                 batched_hits[idx] += 1
 
+    # "Grouped" (2026-09-28, optional third mode) — chunk size =
+    # grouped_chunk_size, one _one_batched_run call PER CHUNK per run (not
+    # one for the whole set, and not one per row) — reuses the exact same
+    # per-chunk call _check_language_for_sheet/_run_ai_chunks make in
+    # production, just run here under the diagnostic's own instrumentation.
+    use_grouped = grouped_chunk_size is not None and 2 <= grouped_chunk_size < len(items)
+    grouped_hits = [0] * len(items)
+    grouped_cost = 0.0
+    grouped_truncated = False
+    if use_grouped:
+        chunks = [items[i:i + grouped_chunk_size] for i in range(0, len(items), grouped_chunk_size)]
+
+        async def _one_grouped_run() -> tuple[list[dict[int, list[dict]]], float, bool]:
+            chunk_results = await asyncio.gather(*[
+                _one_batched_run(chunk, checks, target_lang, source_lang, model_id, semaphore)
+                for chunk in chunks
+            ])
+            return chunk_results
+
+        grouped_runs = await asyncio.gather(*[_one_grouped_run() for _ in range(runs_per_mode)])
+        for chunk_results in grouped_runs:
+            offset = 0
+            for (per_item, cost_usd, truncated), chunk in zip(chunk_results, chunks):
+                grouped_cost += cost_usd
+                grouped_truncated = grouped_truncated or truncated
+                for local_idx in range(len(chunk)):
+                    if per_item.get(local_idx):
+                        grouped_hits[offset + local_idx] += 1
+                offset += len(chunk)
+
     per_row = [
         {
             "context": items[i]["context"],
@@ -541,6 +584,7 @@ async def run_chunk_size_comparison(
             "has_known_issue": flags[i],
             "individual_hit_rate": round(individual_hits[i] / runs_per_mode, 2),
             "batched_hit_rate": round(batched_hits[i] / runs_per_mode, 2),
+            **({"grouped_hit_rate": round(grouped_hits[i] / runs_per_mode, 2)} if use_grouped else {}),
         }
         for i in range(len(items))
     ]
@@ -554,6 +598,7 @@ async def run_chunk_size_comparison(
 
     individual_cost = round(individual_cost, 4)
     batched_cost = round(batched_cost, 4)
+    grouped_cost = round(grouped_cost, 4) if use_grouped else None
     report = {
         "target_lang": target_lang,
         "checks": checks,
@@ -564,6 +609,10 @@ async def run_chunk_size_comparison(
         "batched_cost_usd": batched_cost,
         "cost_ratio": round(individual_cost / batched_cost, 2) if batched_cost else None,
         "batched_truncated": batched_truncated,
+        "grouped_chunk_size": grouped_chunk_size if use_grouped else None,
+        "grouped_cost_usd": grouped_cost,
+        "grouped_truncated": grouped_truncated if use_grouped else None,
+        "known_issue_grouped_hit_rate": _known_rate(grouped_hits) if use_grouped else None,
         "known_issue_individual_hit_rate": _known_rate(individual_hits),
         "known_issue_batched_hit_rate": _known_rate(batched_hits),
         "per_row": per_row,
@@ -593,6 +642,24 @@ def _format_chunk_summary_ru(report: dict) -> str:
             lines.append("  → разницы между режимами на этих строках не обнаружено")
     else:
         lines.append("— ни одна строка не помечена has_known_issue=true, сравнивать пока нечего — задайте хотя бы одну")
+    grouped_size = report.get("grouped_chunk_size")
+    if grouped_size:
+        grp_rate = report["known_issue_grouped_hit_rate"]
+        lines.append(f"— группами по {grouped_size} строк:")
+        if grp_rate is not None and ind_rate is not None:
+            lines.append(f"  на тех же строках с известной ошибкой поймано {int(grp_rate * 100)}%")
+            if grp_rate >= ind_rate:
+                lines.append(f"  → группами по {grouped_size} ловит НЕ ХУЖЕ, чем по одной — можно попробовать это как компромисс")
+            elif grp_rate > bat_rate:
+                lines.append(
+                    f"  → группами по {grouped_size} ловит хуже, чем по одной, но лучше, чем полной пачкой — "
+                    f"частичный компромисс"
+                )
+            else:
+                lines.append(f"  → группами по {grouped_size} эффекта не даёт, ловит так же плохо, как полной пачкой")
+        lines.append(f"  стоимость: ${report['grouped_cost_usd']:.4f}")
+        if report.get("grouped_truncated"):
+            lines.append("  [⚠ хотя бы один ответ группового режима был обрезан]")
     lines.append(
         f"— стоимость: по одной ${report['individual_cost_usd']:.4f}, пакетом ${report['batched_cost_usd']:.4f}"
         + (f" (по одной дороже в {report['cost_ratio']}×)" if report.get("cost_ratio") else "")

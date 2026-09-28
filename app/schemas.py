@@ -273,3 +273,14 @@ class ChunkSizeComparisonIn(BaseModel):
     # Defaults to whatever production actually uses today (settings.CLAUDE_MODEL)
     # when left unset — this test is about chunk size, not model choice.
     model: str | None = None
+    # 2026-09-28 (Александр's ask): a THIRD mode alongside "individual"
+    # (chunk=1) and "batched" (chunk=len(rows)) — groups rows into chunks
+    # of this size (e.g. 5) and reports a hit rate for that too, so a
+    # middle ground between the two extremes can actually be measured
+    # instead of guessed at. None (default) skips this third mode entirely
+    # — the endpoint behaves exactly as before. See
+    # app.model_comparison.run_chunk_size_comparison's own comment for why
+    # only the two extremes existed until now: the real Marathi evidence
+    # only ever compared "alone" vs "everything together", nothing in
+    # between.
+    grouped_chunk_size: int | None = None

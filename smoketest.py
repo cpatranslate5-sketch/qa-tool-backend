@@ -5638,6 +5638,87 @@ print("[OK] run_chunk_size_comparison: correctly tells apart individual (chunk=1
       "rate for a row flagged has_known_issue=true, tallies a real cost for both modes, and the Russian "
       "summary states plainly which mode caught it more reliably")
 
+assert _chunk_report.get("grouped_chunk_size") is None and _chunk_report.get("grouped_cost_usd") is None, (
+    "with grouped_chunk_size left unset (the default), the third mode must stay completely absent from the "
+    f"report, not just empty — got {_chunk_report}"
+)
+assert "grouped_hit_rate" not in _chunk_report["per_row"][0], (
+    "a per_row entry must not even carry the grouped_hit_rate key when grouped_chunk_size wasn't requested"
+)
+print("[OK] run_chunk_size_comparison: leaving grouped_chunk_size unset keeps the report byte-for-byte what it "
+      "was before this third mode existed — no grouped_* keys anywhere")
+
+# --- Third mode (2026-09-28, Александр's ask): an adjustable middle
+# ground between chunk=1 and the full batch, so it can be MEASURED instead
+# of guessed at. 4 rows, grouped_chunk_size=2 -> chunks of [known+filler1]
+# and [filler2+filler3]. The fake below only "catches" the known row when
+# at most 1 OTHER row shares its prompt — individually (0 other rows) and
+# grouped-by-2 (1 other row) both catch it, the full batch (3 other rows)
+# does not — a realistic "grouping by a small size loses nothing" case.
+_G_KNOWN = {"context": "freebet", "source": "Фрибет без отыгрыша", "translation": "पैज न लावता फ्री बेट", "has_known_issue": True}
+_G_F1 = {"context": "f1", "source": "филлерслово один", "translation": "filler one", "has_known_issue": False}
+_G_F2 = {"context": "f2", "source": "филлерслово два", "translation": "filler two", "has_known_issue": False}
+_G_F3 = {"context": "f3", "source": "филлерслово три", "translation": "filler three", "has_known_issue": False}
+
+
+async def _fake_call_claude_group_chunk(prompt, model=None, cache_prefix=None):
+    if "Фрибет без отыгрыша" not in prompt:
+        return "[]", {"input_tokens": 30, "output_tokens": 5}, "end_turn"
+    filler_count = prompt.count("филлерслово")
+    if filler_count <= 1:
+        return (
+            '[{"row": 1, "type": "typo", "severity": "medium", "message": "поймано"}]',
+            {"input_tokens": 60, "output_tokens": 20}, "end_turn",
+        )
+    return "[]", {"input_tokens": 200, "output_tokens": 5}, "end_turn"
+
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_group_chunk
+_grouped_report = asyncio.run(_run_chunk_size_direct(
+    rows=[_G_KNOWN, _G_F1, _G_F2, _G_F3], target_lang="mr", source_lang="ru", checks=["typo"], runs_per_mode=1,
+    grouped_chunk_size=2,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+
+assert _grouped_report["grouped_chunk_size"] == 2, _grouped_report
+assert _grouped_report["known_issue_individual_hit_rate"] == 1.0, _grouped_report
+assert _grouped_report["known_issue_batched_hit_rate"] == 0.0, _grouped_report
+assert _grouped_report["known_issue_grouped_hit_rate"] == 1.0, (
+    f"grouping the known row with just ONE other row (chunk size 2) must catch it just as reliably as "
+    f"checking it fully alone in this fake — got {_grouped_report}"
+)
+assert _grouped_report["per_row"][0]["grouped_hit_rate"] == 1.0
+assert _grouped_report["grouped_cost_usd"] > 0, "every grouped-mode call is a real billed call too"
+assert not _grouped_report.get("grouped_truncated")
+assert "группами по 2" in _grouped_report["summary_ru"] and "ловит НЕ ХУЖЕ" in _grouped_report["summary_ru"], (
+    _grouped_report["summary_ru"]
+)
+print("[OK] run_chunk_size_comparison: the new optional grouped_chunk_size mode splits rows into chunks of "
+      "that size (one _one_batched_run call per chunk, not per row and not for the whole set), tallies a real "
+      "per-chunk cost, and the Russian summary correctly reports when this middle ground catches a known issue "
+      "just as reliably as checking it fully alone")
+
+# A grouped_chunk_size that doesn't actually sit strictly between the two
+# existing extremes (too small to differ from "individual", or as big as
+# "batched" already) must be silently ignored rather than duplicating one
+# of the other modes under a new name.
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_group_chunk
+_grouped_ignored_report = asyncio.run(_run_chunk_size_direct(
+    rows=[_G_KNOWN, _G_F1, _G_F2, _G_F3], target_lang="mr", source_lang="ru", checks=["typo"], runs_per_mode=1,
+    grouped_chunk_size=4,
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _grouped_ignored_report.get("grouped_chunk_size") is None, (
+    f"grouped_chunk_size >= the number of rows tested must be ignored (it would just duplicate the 'batched' "
+    f"mode under a new name) — got {_grouped_ignored_report}"
+)
+print("[OK] run_chunk_size_comparison: a grouped_chunk_size that wouldn't actually differ from the existing "
+      "'batched' mode (>= rows tested) is silently ignored rather than reported as a fake third data point")
+
 # No row flagged has_known_issue=true -> nothing to compare; must say so
 # plainly rather than silently printing misleading 0%/0% rates.
 settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
@@ -5744,6 +5825,7 @@ assert _ep_chunk_body["rows_tested"] == 8, (
 assert _ep_chunk_body["known_issue_individual_hit_rate"] == 1.0, _ep_chunk_body
 assert _ep_chunk_body["known_issue_batched_hit_rate"] == 0.0, _ep_chunk_body
 assert "summary_ru" in _ep_chunk_body
+assert _ep_chunk_body.get("grouped_chunk_size") is None, "grouped_chunk_size omitted from the request must stay absent"
 
 r = check(
     "POST /debug/chunk-size-comparison without ANTHROPIC_API_KEY -> 503, not a silent empty success",
@@ -5752,6 +5834,21 @@ r = check(
 print("[OK] POST /debug/chunk-size-comparison: the diagnostic endpoint runs end-to-end with its default rows "
       "(the real Marathi 'отыгрыш' row plus synthetic filler) when an API key is configured, and returns a "
       "clear 503 instead of a silently empty/misleading success when no API key is configured")
+
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_chunk
+r = check("POST /debug/chunk-size-comparison with grouped_chunk_size=3", client.post(
+    "/debug/chunk-size-comparison", json={"runs_per_mode": 1, "grouped_chunk_size": 3},
+))
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+_ep_grouped_body = r.json()
+assert _ep_grouped_body["grouped_chunk_size"] == 3, _ep_grouped_body
+assert _ep_grouped_body["grouped_cost_usd"] > 0, _ep_grouped_body
+assert "grouped_hit_rate" in _ep_grouped_body["per_row"][0], _ep_grouped_body
+print("[OK] POST /debug/chunk-size-comparison: grouped_chunk_size reaches run_chunk_size_comparison end-to-end "
+      "through the request schema — Александр can now test an intermediate chunk size (e.g. 5) on his own real "
+      "rows from the interactive /docs page, instead of only ever comparing the two extremes")
 
 # ============================================================================
 # Automatic second opinion (Александр's ask, 2026-09-25; made Sonnet-only
