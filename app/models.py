@@ -214,6 +214,13 @@ class MultiCheck(Base):
     # job's expected wait can be estimated from how long past jobs of a
     # similar size actually took — see app.main._estimate_batch_minutes.
     batch_volume_chars: Mapped[int] = mapped_column(Integer, default=0)
+    # 2026-09-29 (Александр): the manager's review of this report before
+    # sending it to translators — {finding_key: {"decision": "accept"|"reject"
+    # |None, "links": "<Crowdin link(s)>", "note": "<manager's note>"}}, plus
+    # one "note|<lang>" entry per language for a general note. finding_key is
+    # "<sheet index>|<lang>|<excel row>|<finding index in that row>" (see the
+    # frontend's filteredReport.ts reviewKey). Old reports start empty.
+    review: Mapped[dict] = mapped_column(JSON, default=dict)
     # When this record's batch actually finished (flipped to "completed") —
     # together with created_at and batch_volume_chars, this is the
     # historical data _estimate_batch_minutes learns from. NULL for a
@@ -221,3 +228,25 @@ class MultiCheck(Base):
     completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="multi_checks")
+    share_links: Mapped[list["ShareLink"]] = relationship(
+        back_populates="multi_check", cascade="all, delete-orphan",
+    )
+
+
+class ShareLink(Base):
+    """A public, read-only link to ONE language of ONE multi-check report,
+    for translators (2026-09-29, Александр). The random token is the only
+    key — the page it opens (app.main.shared_report_page) shows nothing but
+    that language's ACCEPTED findings, rendered live from the current review,
+    so later edits show up for everyone who has the link. No expiry; the
+    manager can revoke it."""
+    __tablename__ = "share_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    multi_check_id: Mapped[int] = mapped_column(ForeignKey("multi_checks.id"), nullable=False)
+    lang: Mapped[str] = mapped_column(String(40), nullable=False)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    multi_check: Mapped["MultiCheck"] = relationship(back_populates="share_links")

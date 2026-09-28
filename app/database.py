@@ -224,6 +224,9 @@ def _run_migrations():
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN batch_volume_chars INTEGER NOT NULL DEFAULT 0"))
             if "completed_at" not in cols:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN completed_at TIMESTAMPTZ"))
+            # 2026-09-29: manager's per-finding review (see models.MultiCheck.review).
+            if "review" not in cols:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN review JSON"))
 
     # The target-language checkbox catalog is now its own table, fully
     # decoupled from tone_rules — Александр asked for the checkbox list to

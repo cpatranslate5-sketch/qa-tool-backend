@@ -1,15 +1,17 @@
 import datetime
+import secrets
 import logging
 
 import httpx
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import domain_note_for_names, run_ai_checks
+from app.share_page import SHARE_PAGE_HEADERS, render_not_found, render_shared_report
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
@@ -1182,7 +1184,95 @@ async def multi_check_detail(
         # (see _run_second_opinion_background) — the frontend polls this
         # endpoint while it's true, same as it does for status=="processing".
         "second_opinion_pending": bool((record.results or {}).get("second_opinion_pending", False)),
+        # Manager's per-finding review for the translators' table (2026-09-29).
+        "review": record.review or {},
+        # Active translator links, {lang: token} (see models.ShareLink).
+        "shares": {sl.lang: sl.token for sl in record.share_links if not sl.revoked},
     }
+
+
+@app.put("/projects/{project_id}/multi-check/{multi_check_id}/review")
+def update_multi_check_review(
+    project_id: int, multi_check_id: int, payload: schemas.MultiCheckReviewIn, db: Session = Depends(get_db),
+):
+    """Saves one finding's decision ("Включить" / "Отклонить"), its Crowdin
+    link(s) and the manager's note — or, for key "note|<lang>", that
+    language's general note. 2026-09-29, Александр. Same folder scoping as
+    multi_check_detail."""
+    _get_project(project_id, db)
+    record = db.get(models.MultiCheck, multi_check_id)
+    if record is None or record.project_id != project_id or record.manager_id != payload.manager_id:
+        raise HTTPException(404, "Проверка не найдена.")
+    key = payload.key.strip()
+    if not key or len(key) > 300:
+        raise HTTPException(400, "Некорректный ключ замечания.")
+    if payload.decision not in (None, "accept", "reject"):
+        raise HTTPException(400, "Некорректное решение.")
+    links = (payload.links or "").strip()[:4000]
+    note = (payload.note or "").strip()[:4000]
+    review = dict(record.review or {})
+    if payload.decision is None and not links and not note:
+        review.pop(key, None)
+    else:
+        review[key] = {"decision": payload.decision, "links": links, "note": note}
+    record.review = review  # reassign so SQLAlchemy notices the JSON change
+    db.commit()
+    return {"ok": True, "review": review}
+
+
+def _own_multi_check(project_id: int, multi_check_id: int, manager_id: int, db: Session) -> models.MultiCheck:
+    _get_project(project_id, db)
+    record = db.get(models.MultiCheck, multi_check_id)
+    if record is None or record.project_id != project_id or record.manager_id != manager_id:
+        raise HTTPException(404, "Проверка не найдена.")
+    return record
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/share")
+def create_share_link(project_id: int, multi_check_id: int, payload: schemas.ShareLinkIn, db: Session = Depends(get_db)):
+    """Returns this language's active translator link, creating it if there
+    isn't one yet (2026-09-29, Александр). Never expires; see revoke below."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    lang = payload.lang.strip()
+    if not lang or len(lang) > 40:
+        raise HTTPException(400, "Не указан язык.")
+    langs = {l for sh in (record.results or {}).get("sheets", []) for l in sh.get("languages_checked", [])}
+    if lang not in langs:
+        raise HTTPException(400, "Такого языка нет в этом отчёте.")
+    existing = next((sl for sl in record.share_links if sl.lang == lang and not sl.revoked), None)
+    if existing is None:
+        existing = models.ShareLink(token=secrets.token_urlsafe(24), multi_check_id=record.id, lang=lang)
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+    return {"lang": lang, "token": existing.token, "path": f"/share/{existing.token}"}
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/share/revoke")
+def revoke_share_link(project_id: int, multi_check_id: int, payload: schemas.ShareLinkIn, db: Session = Depends(get_db)):
+    """Turns off this language's translator link — it stops opening at once.
+    A new link can be created afterwards (it gets a new address)."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    for sl in record.share_links:
+        if sl.lang == payload.lang.strip() and not sl.revoked:
+            sl.revoked = True
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/share/{token}", response_class=HTMLResponse, include_in_schema=False)
+def shared_report_page(token: str, db: Session = Depends(get_db)):
+    """The public, read-only translator page — see app.share_page. Only the
+    random token identifies it; nothing else about the folder/project/report
+    is reachable from here."""
+    link = None
+    if 10 <= len(token) <= 64:
+        link = db.query(models.ShareLink).filter(models.ShareLink.token == token).first()
+    if link is None or link.revoked or link.multi_check is None or link.multi_check.status != "completed":
+        return HTMLResponse(render_not_found(), status_code=404, headers=SHARE_PAGE_HEADERS)
+    mc = link.multi_check
+    page = render_shared_report(mc.filename, link.lang, mc.results or {}, mc.review or {})
+    return HTMLResponse(page, headers=SHARE_PAGE_HEADERS)
 
 
 @app.get("/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx")

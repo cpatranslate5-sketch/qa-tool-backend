@@ -290,3 +290,18 @@ class ChunkSizeComparisonIn(BaseModel):
     # only ever compared "alone" vs "everything together", nothing in
     # between.
     grouped_chunk_size: int | None = None
+
+
+class MultiCheckReviewIn(BaseModel):
+    """One finding's review decision in a multi-check report (see
+    models.MultiCheck.review). decision None clears it."""
+    manager_id: int
+    key: str
+    decision: str | None = None  # "accept" | "reject" | None
+    links: str = ""
+    note: str = ""
+
+
+class ShareLinkIn(BaseModel):
+    manager_id: int
+    lang: str
