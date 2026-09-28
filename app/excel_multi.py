@@ -1823,6 +1823,35 @@ def _format_minutes_ru(minutes: float) -> str:
     return f"{whole} {_plural_ru(whole, 'минута', 'минуты', 'минут')}"
 
 
+def _color_tags_in_columns(ws, first_row: int, columns) -> None:
+    """Colors tags/placeholders ({name}, <b>, %s, [link]…) inside the
+    «Проблема» / «Источник» / «Перевод» cells (2026-09-30, Александр), so they
+    stand out from ordinary text. Uses Excel rich text; if this openpyxl
+    version can't do that, the cells simply stay plain."""
+    try:
+        from openpyxl.cell.rich_text import CellRichText, TextBlock
+        from openpyxl.cell.text import InlineFont
+    except Exception:  # pragma: no cover - older openpyxl
+        return
+    from app.rule_checks import PLACEHOLDER_RE
+    tag_font = InlineFont(color="C026D3", b=True)
+    for r in range(first_row, ws.max_row + 1):
+        for c in columns:
+            cell = ws.cell(row=r, column=c)
+            v = cell.value
+            if not isinstance(v, str) or not PLACEHOLDER_RE.search(v):
+                continue
+            parts, last = [], 0
+            for m in PLACEHOLDER_RE.finditer(v):
+                if m.start() > last:
+                    parts.append(v[last:m.start()])
+                parts.append(TextBlock(tag_font, m.group(0)))
+                last = m.end()
+            if last < len(v):
+                parts.append(v[last:])
+            cell.value = CellRichText(*parts)
+
+
 def build_report_workbook(
     filename: str, source_lang: str, results: dict, duration_minutes: float | None = None
 ) -> bytes:
@@ -1872,6 +1901,8 @@ def build_report_workbook(
     # filter control Excel already gives him, defaulting to showing
     # everything exactly as it does today. Only makes sense once there's at
     # least one data row below the header.
+    _color_tags_in_columns(ws, header_row + 1, (7, 8, 9))
+
     if ws.max_row > header_row:
         ws.auto_filter.ref = f"A{header_row}:K{ws.max_row}"
         ws.freeze_panes = f"A{header_row + 1}"

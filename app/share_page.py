@@ -47,7 +47,8 @@ _CSS = """
   .page { max-width: 880px; margin: 0 auto; }
   h1 { font-size: 1.35rem; margin: 0 0 4px; }
   .muted { color: #6b7280; font-size: 0.88rem; }
-  .label, .num { font-weight: 700; color: #7a1f2b; }
+  .label, .num { font-weight: 700; color: #1d4ed8; }
+  .tag { color: #c026d3; font-weight: 600; }
   .general { background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 10px; padding: 10px 14px; margin: 14px 0; }
   .general .row { margin-top: 4px; white-space: pre-wrap; }
   .item { background: #fff; border: 1px solid #dde1e7; border-radius: 10px; padding: 12px 14px; margin-top: 12px;
@@ -83,6 +84,23 @@ _CSS = """
 
 def _e(v) -> str:
     return html.escape(str(v or ""), quote=True)
+
+
+# Tags/placeholders in texts ({name}, <b>, %s, [link]…) are colored so they
+# stand out — same pattern as app.rule_checks.PLACEHOLDER_RE.
+from app.rule_checks import PLACEHOLDER_RE as _TAG_RE
+
+
+def _t(v) -> str:
+    """Escaped text with its tags wrapped in <span class="tag">."""
+    s = str(v or "")
+    out, last = [], 0
+    for m in _TAG_RE.finditer(s):
+        out.append(_e(s[last:m.start()]))
+        out.append(f'<span class="tag">{_e(m.group(0))}</span>')
+        last = m.end()
+    out.append(_e(s[last:]))
+    return "".join(out)
 
 
 def _links_html(raw: str) -> str:
@@ -280,10 +298,10 @@ def render_shared_report(
             platform_html = ""
         else:
             body_html = (
-                f'<div class="field"><span class="label">Источник:</span> {_e(row.get("source"))}</div>'
-                f'<div class="field"><span class="label">Перевод:</span> {_e(row.get("translation"))}</div>'
+                f'<div class="field"><span class="label">Источник:</span> {_t(row.get("source"))}</div>'
+                f'<div class="field"><span class="label">Перевод:</span> {_t(row.get("translation"))}</div>'
             )
-            platform_html = f'<div class="comment"><span class="label">Комментарий платформы:</span> {_e(f.get("message"))}</div>'
+            platform_html = f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(f.get("message"))}</div>'
         items_html.append(
             f'<div class="{" ".join(c for c in classes if c)}" data-key="{_e(key)}">'
             f'<div class="num">№{num}</div>'
