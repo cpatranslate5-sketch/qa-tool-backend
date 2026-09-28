@@ -255,3 +255,28 @@ class ShareLink(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     multi_check: Mapped["MultiCheck"] = relationship(back_populates="share_links")
+
+
+class SavedCase(Base):
+    """«Сохранённое» (2026-10-01, Александр): interesting findings a manager
+    saved from a report with the 💾 button — one row of one language, with
+    its source, translation and the platform's comments, copied here so it
+    survives even if the report itself is deleted later. Shared by every
+    folder, like the language dictionary; anyone can delete a case."""
+    __tablename__ = "saved_cases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # "<multi_check id>|<sheet index>|<lang>|<excel row>" — the same block
+    # can't be saved twice.
+    source_key: Mapped[str] = mapped_column(String(200), unique=True, index=True, nullable=False)
+    multi_check_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    project_name: Mapped[str] = mapped_column(String(200), default="")
+    filename: Mapped[str] = mapped_column(String(300), default="")
+    lang: Mapped[str] = mapped_column(String(40), default="")
+    excel_row: Mapped[int] = mapped_column(Integer, default=0)
+    context: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(Text, default="")
+    translation: Mapped[str] = mapped_column(Text, default="")
+    findings: Mapped[list] = mapped_column(JSON, default=list)
+    saved_by_name: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)

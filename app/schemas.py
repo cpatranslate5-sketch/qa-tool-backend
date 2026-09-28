@@ -305,15 +305,27 @@ class MultiCheckReviewIn(BaseModel):
 class TranslatorResponseIn(BaseModel):
     """A translator's answer to one finding on the share-link page."""
     key: str
-    decision: str | None = None  # "accept" | "reject" | None
+    decision: str | None = None  # "done" (правка внесена) | "na" (не актуально) | None
     comment: str = ""
 
 
-class ShareQuestionIn(BaseModel):
-    """Resolving a «?» finding on the share-link page."""
+class ShareOkkIn(BaseModel):
+    """The head of QA's decision on the share-link page."""
     key: str
-    action: str | None = None  # "keep" | "remove" | None (just save the note)
-    note: str = ""
+    action: str | None = None  # "keep" | "remove" | None (just save the comment)
+    comment: str = ""  # «Комментарий для переводчика»
+
+
+class ShareCheckedIn(BaseModel):
+    key: str
+    checked: bool = False
+
+
+class SaveCaseIn(BaseModel):
+    manager_id: int
+    sheet_idx: int
+    lang: str
+    excel_row: int
 
 
 class ShareLinkIn(BaseModel):

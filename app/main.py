@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import domain_note_for_names, run_ai_checks
-from app.share_page import accepted_keys, keys_with_decision, render_not_found, render_shared_report, share_page_headers
+from app.share_page import pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
@@ -1190,6 +1190,11 @@ async def multi_check_detail(
         "shares": {sl.lang: sl.token for sl in record.share_links if not sl.revoked},
         # Translators' answers from their share-link pages (2026-09-30).
         "translator_review": record.translator_review or {},
+        # Blocks of this report already in «Сохранённое» ("<sheet>|<lang>|<row>").
+        "saved_keys": [
+            sc.source_key.split("|", 1)[1]
+            for sc in db.query(models.SavedCase).filter(models.SavedCase.multi_check_id == record.id).all()
+        ],
     }
 
 
@@ -1213,10 +1218,13 @@ def update_multi_check_review(
     links = (payload.links or "").strip()[:4000]
     note = (payload.note or "").strip()[:4000]
     review = dict(record.review or {})
-    if payload.decision is None and not links and not note:
+    # Keep what the head of QA did on the share page ("sent", "okk_comment").
+    entry = dict(review.get(key) or {})
+    entry.update({"decision": payload.decision, "links": links, "note": note})
+    if payload.decision is None and not links and not note and not entry.get("sent") and not entry.get("okk_comment"):
         review.pop(key, None)
     else:
-        review[key] = {"decision": payload.decision, "links": links, "note": note}
+        review[key] = entry
     record.review = review  # reassign so SQLAlchemy notices the JSON change
     db.commit()
     return {"ok": True, "review": review}
@@ -1255,9 +1263,14 @@ def revoke_share_link(project_id: int, multi_check_id: int, payload: schemas.Sha
     """Turns off this language's translator link — it stops opening at once.
     A new link can be created afterwards (it gets a new address)."""
     record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    lang = payload.lang.strip()
     for sl in record.share_links:
-        if sl.lang == payload.lang.strip() and not sl.revoked:
+        if sl.lang == lang and not sl.revoked:
             sl.revoked = True
+    # Deleting the link resets the translator's reactions for this language
+    # (Александр, 2026-10-01); the manager's and QA head's decisions stay.
+    tr = {k: v for k, v in (record.translator_review or {}).items() if (k.split("|") + ["", ""])[1] != lang}
+    record.translator_review = tr
     db.commit()
     return {"ok": True}
 
@@ -1289,29 +1302,47 @@ def _active_share_link(token: str, db: Session) -> models.ShareLink:
     return link
 
 
-@app.post("/share/{token}/question", include_in_schema=False)
-def shared_report_question(token: str, payload: schemas.ShareQuestionIn, db: Session = Depends(get_db)):
-    """A finding the manager marked «?» (question, 2026-09-30, Александр):
-    whoever opens the link can edit the manager's note, then «Оставить
-    переводчику» (action "keep" → it becomes a normal accepted finding) or
-    «Убрать» (action "remove" → it's dropped from the translator's page).
-    action None only saves the note."""
+@app.post("/share/{token}/okk", include_in_schema=False)
+def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Depends(get_db)):
+    """The head of QA's step on the share page (2026-10-01, Александр): every
+    finding the manager marked ✓ or ? first waits here with «Оставить
+    переводчику» / «Убрать». action None only saves the «Комментарий для
+    переводчика»; "keep" sends the finding on to the translator (the
+    manager's note is then hidden from the page); "remove" drops it."""
     link = _active_share_link(token, db)
     mc = link.multi_check
     key = payload.key.strip()
-    if key not in keys_with_decision(link.lang, mc.results or {}, mc.review or {}, "question"):
+    if key not in pending_keys(link.lang, mc.results or {}, mc.review or {}):
         raise HTTPException(400, "Это замечание уже решено.")
     if payload.action not in (None, "keep", "remove"):
         raise HTTPException(400, "Некорректное действие.")
     review = dict(mc.review or {})
     entry = dict(review.get(key) or {})
-    entry["note"] = (payload.note or "").strip()[:4000]
+    entry["okk_comment"] = (payload.comment or "").strip()[:4000]
     if payload.action == "keep":
         entry["decision"] = "accept"
+        entry["sent"] = True
     elif payload.action == "remove":
         entry["decision"] = "reject"
     review[key] = entry
     mc.review = review  # reassign so SQLAlchemy notices the JSON change
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/share/{token}/checked", include_in_schema=False)
+def shared_report_checked(token: str, payload: schemas.ShareCheckedIn, db: Session = Depends(get_db)):
+    """The manager's tick «правка проверена» next to a translator's answer."""
+    link = _active_share_link(token, db)
+    mc = link.multi_check
+    key = payload.key.strip()
+    tr = dict(mc.translator_review or {})
+    if key not in sent_keys(link.lang, mc.results or {}, mc.review or {}) or not (tr.get(key) or {}).get("decision"):
+        raise HTTPException(400, "Сначала нужен ответ переводчика.")
+    entry = dict(tr[key])
+    entry["checked"] = bool(payload.checked)
+    tr[key] = entry
+    mc.translator_review = tr
     db.commit()
     return {"ok": True}
 
@@ -1323,18 +1354,95 @@ def shared_report_respond(token: str, payload: schemas.TranslatorResponseIn, db:
     link's language can be answered."""
     link = _active_share_link(token, db)
     mc = link.multi_check
-    if payload.decision not in (None, "accept", "reject"):
+    if payload.decision not in (None, "done", "na"):
         raise HTTPException(400, "Некорректное решение.")
     key = payload.key.strip()
-    if key not in accepted_keys(link.lang, mc.results or {}, mc.review or {}):
+    if key not in sent_keys(link.lang, mc.results or {}, mc.review or {}):
         raise HTTPException(400, "Такого замечания нет.")
     comment = (payload.comment or "").strip()[:4000]
     tr = dict(mc.translator_review or {})
+    prev = tr.get(key) or {}
     if payload.decision is None and not comment:
         tr.pop(key, None)
     else:
-        tr[key] = {"decision": payload.decision, "comment": comment}
+        tr[key] = {"decision": payload.decision, "comment": comment, "checked": bool(prev.get("checked")) and bool(payload.decision)}
     mc.translator_review = tr  # reassign so SQLAlchemy notices the JSON change
+    db.commit()
+    return {"ok": True}
+
+
+# ------------------------------------------------------------ «Сохранённое» ---
+# Interesting cases saved from reports with the 💾 button (2026-10-01,
+# Александр). Shared by every folder, like the language dictionary.
+
+def _saved_case_out(sc: models.SavedCase) -> dict:
+    return {
+        "id": sc.id,
+        "project_name": sc.project_name,
+        "filename": sc.filename,
+        "lang": sc.lang,
+        "excel_row": sc.excel_row,
+        "context": sc.context,
+        "source": sc.source,
+        "translation": sc.translation,
+        "findings": sc.findings or [],
+        "saved_by_name": sc.saved_by_name,
+        "created_at": sc.created_at.isoformat() if sc.created_at else None,
+    }
+
+
+@app.get("/saved-cases")
+def list_saved_cases(db: Session = Depends(get_db)):
+    rows = db.query(models.SavedCase).order_by(models.SavedCase.created_at.desc(), models.SavedCase.id.desc()).all()
+    return {"cases": [_saved_case_out(r) for r in rows]}
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/save-case")
+def save_case(project_id: int, multi_check_id: int, payload: schemas.SaveCaseIn, db: Session = Depends(get_db)):
+    """Copies one block (one row of one language) of a report into
+    «Сохранённое». Saving the same block again just returns it."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    manager = _get_manager(payload.manager_id, db)
+    sheets = (record.results or {}).get("sheets", [])
+    if not (0 <= payload.sheet_idx < len(sheets)):
+        raise HTTPException(400, "Блок не найден.")
+    rows = (sheets[payload.sheet_idx].get("languages") or {}).get(payload.lang) or []
+    row = next((r for r in rows if r.get("excel_row") == payload.excel_row and payload.excel_row != 0), None)
+    if row is None:
+        raise HTTPException(400, "Блок не найден.")
+    source_key = f"{record.id}|{payload.sheet_idx}|{payload.lang}|{payload.excel_row}"
+    existing = db.query(models.SavedCase).filter(models.SavedCase.source_key == source_key).first()
+    if existing is None:
+        project = db.get(models.Project, project_id)
+        existing = models.SavedCase(
+            source_key=source_key,
+            multi_check_id=record.id,
+            project_name=project.name if project else "",
+            filename=record.filename or "",
+            lang=payload.lang,
+            excel_row=payload.excel_row,
+            context=row.get("context") or "",
+            source=row.get("source") or "",
+            translation=row.get("translation") or "",
+            findings=[
+                {"type": f.get("type"), "severity": f.get("severity"), "message": f.get("message")}
+                for f in row.get("findings") or []
+            ],
+            saved_by_name=manager.name,
+        )
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+    return _saved_case_out(existing)
+
+
+@app.delete("/saved-cases/{case_id}")
+def delete_saved_case(case_id: int, manager_id: int, db: Session = Depends(get_db)):
+    _get_manager(manager_id, db)
+    row = db.get(models.SavedCase, case_id)
+    if row is None:
+        raise HTTPException(404, "Этот кейс уже удалён.")
+    db.delete(row)
     db.commit()
     return {"ok": True}
 
