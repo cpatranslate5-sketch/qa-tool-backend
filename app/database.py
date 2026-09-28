@@ -67,6 +67,9 @@ def _run_migrations():
             # would break every future insert (the ORM no longer sets it).
             if "glossary" in cols:
                 conn.execute(text("ALTER TABLE projects DROP COLUMN glossary"))
+            # 2026-09-29: admin-written project description (see models.Project).
+            if "description" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''"))
             # The structured glossary (glossary_filename/glossary_uploaded_at
             # + the glossary_terms table) was later removed entirely too —
             # see the migration further below that drops it, alongside

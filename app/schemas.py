@@ -57,6 +57,11 @@ class ProjectIn(BaseModel):
     copy_from_project_id: int | None = None
 
 
+class ProjectDescriptionIn(BaseModel):
+    manager_id: int
+    description: str = ""
+
+
 class ProjectDeleteIn(BaseModel):
     manager_id: int
     code: str
@@ -66,6 +71,7 @@ class ProjectOut(BaseModel):
     id: int
     name: str
     created_by_name: str
+    description: str = ""
 
     class Config:
         from_attributes = True

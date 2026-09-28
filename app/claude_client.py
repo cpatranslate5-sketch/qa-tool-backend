@@ -1613,6 +1613,42 @@ def _is_hard_language(target_lang: str) -> bool:
     return target_lang.strip().lower().split("-")[0] in HARD_LANGUAGE_BASES
 
 
+# ------------------------------------------------------ subject domain ---
+# 2026-09-29 (Александр): everything in the "1win" folder/project is
+# betting & gambling. Without this, a model seeing one isolated string
+# ("Этот исход изменился: {arg 1} → {arg 2}") takes the everyday dictionary
+# sense of a word ("исход" = outcome of a match) and flags a correct
+# betting term ("wybór" = selection) as a meaning error. Injected into the
+# task's "Особые указания" (see app.main._with_domain_note), which sits in
+# the cached, fixed part of every prompt — so it costs almost nothing.
+DOMAIN_KEYWORDS_BETTING = ("1win",)
+
+BETTING_DOMAIN_NOTE = (
+    "ТЕМАТИКА: все тексты этой задачи — локализация беттинг- и казино-платформы (ставки на спорт, купон, "
+    "коэффициенты, бонусы, акции, турниры, слоты, live-казино, crash-игры). Толкуй слова в значении ЭТОЙ "
+    "области, а не в бытовом. Прежде чем назвать перевод термина искажением, проверь, какое значение у "
+    "слова в беттинге/гемблинге, и оценивай по нему. Значения терминов (не переводы): «исход» — вариант "
+    "ставки в событии (П1, ничья, тотал больше и т.п.), позиция в купоне, а НЕ итог матча; «экспресс» — "
+    "ставка из нескольких событий, «ординар» — ставка на одно событие; «купон» — список выбранных исходов "
+    "перед ставкой; «коэффициент» (odds) — множитель выплаты за ставку; «тотал», «фора» — типы рынков; "
+    "«отыгрыш» (вейджер, wagering) — требование прокрутить бонус определённое число раз перед выводом, а "
+    "НЕ «повторная игра» и НЕ «без ставки»; «фрибет» — бесплатная ставка, «фриспины» (FS) — бесплатные "
+    "вращения в слотах; «продажа ставки» / кэшаут — досрочный расчёт ставки; «множитель» — коэффициент "
+    "выигрыша в слоте/crash-игре; «депозит»/«пополнение» — внесение денег, «вывод» — снятие; «провайдер» — "
+    "разработчик игр; «турнирная таблица»/лидерборд — рейтинг участников акции. Названия игр, провайдеров, "
+    "турниров и акций — собственные имена. Если одно и то же понятие в других строках задачи переведено "
+    "определённым образом, ориентируйся на этот вариант как на принятый в проекте."
+)
+
+
+def domain_note_for_names(*names: str | None) -> str:
+    """The subject-domain note for a check, from its project/folder names."""
+    joined = " ".join(n for n in names if n).lower()
+    if any(k in joined for k in DOMAIN_KEYWORDS_BETTING):
+        return BETTING_DOMAIN_NOTE
+    return ""
+
+
 # ------------------------------------------------ per-language routing ---
 # 2026-09-29, Александр's redesign: every target language is checked end to
 # end by ONE fixed model — Step 1 search, Step 2 check (which now also rates

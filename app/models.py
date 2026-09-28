@@ -73,6 +73,10 @@ class Project(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     created_by_name: Mapped[str] = mapped_column(String(120), default="")
+    # 2026-09-29 (Александр): free-text project description written by the
+    # admin (subject area, audience, special requirements) — sent to the AI
+    # with every check in this project, see app.main._with_domain_note.
+    description: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")

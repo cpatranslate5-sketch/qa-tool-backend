@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.auth import hash_code, verify_code
-from app.claude_client import run_ai_checks
+from app.claude_client import domain_note_for_names, run_ai_checks
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
@@ -231,6 +231,30 @@ async def _run_live_check_background(
         db.close()
 
 
+def _with_domain_note(
+    extra_instructions: str, *names: str | None, project_description: str | None = None,
+) -> str:
+    """Builds the task's "Особые указания" block that goes into every AI
+    prompt: the project's own admin-written description (see
+    models.Project.description), the built-in subject-domain note (e.g.
+    betting for the "1win" folder/project — see
+    claude_client.domain_note_for_names), then the task's own instructions."""
+    parts = []
+    desc = (project_description or "").strip()
+    if desc:
+        parts.append(
+            "ОПИСАНИЕ ПРОЕКТА (написано менеджером проекта — учитывай тематику, аудиторию и требования при "
+            f"оценке каждой строки):\n{desc}"
+        )
+    note = domain_note_for_names(*names)
+    if note:
+        parts.append(note)
+    extra = (extra_instructions or "").strip()
+    if extra:
+        parts.append(extra)
+    return "\n\n".join(parts)
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -376,7 +400,33 @@ def create_project(payload: schemas.ProjectIn, db: Session = Depends(get_db)):
 
     if payload.copy_from_project_id is not None:
         _copy_project_documents(payload.copy_from_project_id, project.id, db)
+        src = db.get(models.Project, payload.copy_from_project_id)
+        if src is not None and src.description:
+            project.description = src.description
 
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+PROJECT_DESCRIPTION_MAX_CHARS = 4000
+
+
+@app.get("/projects/{project_id}", response_model=schemas.ProjectOut)
+def get_project(project_id: int, db: Session = Depends(get_db)):
+    return _get_project(project_id, db)
+
+
+@app.put("/projects/{project_id}/description", response_model=schemas.ProjectOut)
+def update_project_description(project_id: int, payload: schemas.ProjectDescriptionIn, db: Session = Depends(get_db)):
+    """Admin-only: the project's free-text description (subject area,
+    audience, special requirements), sent to the AI with every check here."""
+    _require_admin(payload.manager_id, db)
+    project = _get_project(project_id, db)
+    text_ = (payload.description or "").strip()
+    if len(text_) > PROJECT_DESCRIPTION_MAX_CHARS:
+        raise HTTPException(400, f"Описание слишком длинное — максимум {PROJECT_DESCRIPTION_MAX_CHARS} символов.")
+    project.description = text_
     db.commit()
     db.refresh(project)
     return project
@@ -631,8 +681,15 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     )
     for f in findings:
         f.setdefault("confidence", 100)  # algorithmic = certain, see excel_multi
+    manager_obj = db.get(models.Manager, payload.manager_id) if payload.manager_id else None
+    extra_for_ai = _with_domain_note(
+        payload.extra_instructions,
+        project.name if project is not None else None,
+        manager_obj.name if manager_obj is not None else None,
+        project_description=project.description if project is not None else None,
+    )
     ai_findings, cost_usd = await run_ai_checks(
-        payload.source, payload.translation, payload.checks, payload.extra_instructions,
+        payload.source, payload.translation, payload.checks, extra_for_ai,
         payload.target_lang, payload.source_lang,
     )
     findings += ai_findings
@@ -887,8 +944,11 @@ async def multi_check(
     # just for a batch one. See the duration_minutes plumbing below.
     started_at = datetime.datetime.now(datetime.timezone.utc)
 
-    _get_project(project_id, db)
-    _get_manager(manager_id, db)
+    project_obj = _get_project(project_id, db)
+    manager_obj = _get_manager(manager_id, db)
+    extra_instructions = _with_domain_note(
+        extra_instructions, project_obj.name, manager_obj.name, project_description=project_obj.description,
+    )
     file_bytes = await file.read()
 
     try:
