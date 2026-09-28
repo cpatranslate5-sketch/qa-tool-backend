@@ -47,19 +47,27 @@ _CSS = """
   .page { max-width: 880px; margin: 0 auto; }
   h1 { font-size: 1.35rem; margin: 0 0 4px; }
   .muted { color: #6b7280; font-size: 0.88rem; }
-  .label { font-weight: 600; }
+  .label, .num { font-weight: 700; color: #7a1f2b; }
   .general { background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 10px; padding: 10px 14px; margin: 14px 0; }
   .general .row { margin-top: 4px; white-space: pre-wrap; }
   .item { background: #fff; border: 1px solid #dde1e7; border-radius: 10px; padding: 12px 14px; margin-top: 12px;
           transition: background .15s, border-color .15s; }
+  .item.tone { background: #eef2ff; border-color: #c7d2fe; }
+  .item.question { background: #fff8db; border-color: #f0d98c; }
   .item.accepted { background: #eaf7ef; border-color: #9fd5b3; }
   .item.rejected { background: #fdeeee; border-color: #f0b4b4; }
-  .num { font-weight: 700; font-size: 0.95rem; margin-bottom: 6px; }
+  .num { font-size: 0.95rem; margin-bottom: 6px; }
+  .mgr-note-edit { display: block; width: 100%; min-height: 48px; margin-top: 4px; font: inherit; font-size: 0.88rem;
+                   padding: 6px 8px; border: 1px solid #e3c96a; border-radius: 6px; resize: vertical; background: #fff; }
+  .item .btn-keep, .item .btn-remove, .item.question .btn-accept, .item.question .btn-reject, .item.question .answer { display: none; }
+  .item.question .btn-keep, .item.question .btn-remove { display: inline-block; }
+  .btn-keep { color: #17703c; border-color: #17703c; }
+  .btn-remove { color: #b42318; border-color: #b42318; }
   .field { font-size: 0.9rem; margin-top: 4px; }
   .mgr-note { white-space: pre-wrap; }
   .links a { color: #4f46e5; word-break: break-all; display: block; }
   .comment { border-left: 3px solid #d98a1f; background: rgba(0,0,0,0.03); padding: 6px 10px; margin-top: 8px; font-size: 0.9rem; }
-  .tr-label { display: block; font-weight: 600; font-size: 0.85rem; margin-top: 10px; }
+  .tr-label { display: block; font-size: 0.85rem; margin-top: 10px; }
   .tr-comment { width: 100%; min-height: 54px; margin-top: 4px; font: inherit; font-size: 0.88rem; padding: 6px 8px;
                 border: 1px solid #dde1e7; border-radius: 6px; resize: vertical; background: #fff; }
   .actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 10px; }
@@ -111,12 +119,21 @@ def _is_reviewable(excel_row, f: dict) -> bool:
     return excel_row != 0 and f.get("type") not in ("register_summary", "system")
 
 
+def tone_key(lang: str) -> str:
+    return f"tone|{lang}"
+
+
 def numbered_findings(lang: str, results: dict):
     """Yields (number, key, row, finding) for every reviewable finding of this
-    language, numbered 1..N across sheets — the same order and numbers the
-    manager's report page uses (reportHtml.ts), so both sides can refer to
-    «замечание №5»."""
+    language — the same order and numbers the manager's report page uses
+    (reportHtml.ts), so both sides can refer to «замечание №5». The
+    «Тон обращения» summary, when the language has one, is always №1 (row is
+    None for it); the real findings follow, numbered across sheets."""
     n = 0
+    tone = _tone_finding(lang, results)
+    if tone is not None:
+        n = 1
+        yield 1, tone_key(lang), None, tone
     for sheet_idx, sheet in enumerate((results or {}).get("sheets", [])):
         if lang not in (sheet.get("languages_checked") or []):
             continue
@@ -128,58 +145,95 @@ def numbered_findings(lang: str, results: dict):
                 yield n, f"{sheet_idx}|{lang}|{row.get('excel_row')}|{fi}", row, f
 
 
-def accepted_keys(lang: str, results: dict, review: dict) -> set:
+def keys_with_decision(lang: str, results: dict, review: dict, decision: str) -> set:
     review = review or {}
     return {
         key for _, key, _, _ in numbered_findings(lang, results)
-        if (review.get(key) or {}).get("decision") == "accept"
+        if (review.get(key) or {}).get("decision") == decision
     }
 
 
-def _tone_message(lang: str, results: dict) -> str:
+def accepted_keys(lang: str, results: dict, review: dict) -> set:
+    return keys_with_decision(lang, results, review, "accept")
+
+
+def _tone_finding(lang: str, results: dict):
     for sheet in (results or {}).get("sheets", []):
+        if lang not in (sheet.get("languages_checked") or []):
+            continue
         for row in (sheet.get("languages") or {}).get(lang) or []:
             if row.get("excel_row") == 0:
                 for f in row.get("findings") or []:
                     if f.get("type") == "register_summary":
-                        return f.get("message", "")
-    return ""
+                        return f
+    return None
 
 
 _SCRIPT = """
 (function () {
-  var base = location.pathname.replace(/\\/+$/, "") + "/respond";
+  var base = location.pathname.replace(/\\/+$/, "");
   var timers = {};
-  function send(item) {
-    var st = item.querySelector(".status");
-    var decision = item.classList.contains("accepted") ? "accept" : item.classList.contains("rejected") ? "reject" : null;
+  function post(path, body, st, after) {
     st.textContent = "Сохраняю…";
-    fetch(base, {
+    return fetch(base + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key: item.getAttribute("data-key"), decision: decision, comment: item.querySelector(".tr-comment").value })
+      body: JSON.stringify(body)
     }).then(function (r) {
       if (!r.ok) throw new Error();
       st.textContent = "Сохранено";
       setTimeout(function () { if (st.textContent === "Сохранено") st.textContent = ""; }, 1500);
+      if (after) after();
     }).catch(function () { st.textContent = "⚠ Не сохранилось — проверьте интернет"; });
+  }
+  function sendAnswer(item) {
+    var decision = item.classList.contains("accepted") ? "accept" : item.classList.contains("rejected") ? "reject" : null;
+    post("/respond", { key: item.getAttribute("data-key"), decision: decision, comment: item.querySelector(".tr-comment").value },
+         item.querySelector(".status"));
+  }
+  function sendQuestion(item, action) {
+    var noteEl = item.querySelector(".mgr-note-edit");
+    return post("/question", { key: item.getAttribute("data-key"), action: action || null, note: noteEl ? noteEl.value : "" },
+         item.querySelector(".status"), function () {
+      if (action === "remove") { item.parentNode.removeChild(item); }
+      if (action === "keep") {
+        item.classList.remove("question");
+        var note = noteEl.value.trim();
+        var holder = item.querySelector(".mgr-note-field");
+        if (note) {
+          holder.innerHTML = '<span class="label">Примечание менеджера:</span> <span class="mgr-note"></span>';
+          holder.querySelector(".mgr-note").textContent = note;
+        } else {
+          holder.parentNode.removeChild(holder);
+        }
+      }
+    });
   }
   document.addEventListener("click", function (ev) {
     var b = ev.target.closest && ev.target.closest(".btn");
     if (!b) return;
     var item = b.closest(".item");
+    if (b.classList.contains("btn-keep")) { sendQuestion(item, "keep"); return; }
+    if (b.classList.contains("btn-remove")) { sendQuestion(item, "remove"); return; }
     var cls = b.classList.contains("btn-accept") ? "accepted" : "rejected";
     var on = !item.classList.contains(cls);
     item.classList.remove("accepted", "rejected");
     if (on) item.classList.add(cls);
-    send(item);
+    sendAnswer(item);
   });
   document.addEventListener("input", function (ev) {
-    if (!ev.target.classList || !ev.target.classList.contains("tr-comment")) return;
-    var item = ev.target.closest(".item");
+    var t = ev.target;
+    if (!t.classList) return;
+    var item = t.closest(".item");
+    if (!item) return;
     var k = item.getAttribute("data-key");
-    clearTimeout(timers[k]);
-    timers[k] = setTimeout(function () { send(item); }, 800);
+    if (t.classList.contains("tr-comment")) {
+      clearTimeout(timers[k]);
+      timers[k] = setTimeout(function () { sendAnswer(item); }, 800);
+    } else if (t.classList.contains("mgr-note-edit")) {
+      clearTimeout(timers[k]);
+      timers[k] = setTimeout(function () { sendQuestion(item, null); }, 800);
+    }
   });
 })();
 """
@@ -194,42 +248,67 @@ def render_shared_report(
     items_html = []
     for num, key, row, f in numbered_findings(lang, results):
         entry = review.get(key) or {}
-        if entry.get("decision") != "accept":
+        decision = entry.get("decision")
+        if decision not in ("accept", "question"):
             continue
+        is_question = decision == "question"
         tr = translator_review.get(key) or {}
-        state = {"accept": " accepted", "reject": " rejected"}.get(tr.get("decision"), "")
+        classes = ["item"]
+        if row is None:
+            classes.append("tone")
+        if is_question:
+            classes.append("question")
+        else:
+            classes.append({"accept": "accepted", "reject": "rejected"}.get(tr.get("decision"), ""))
         note = (entry.get("note") or "").strip()
-        note_html = (
-            '<div class="field"><span class="label">Примечание менеджера:</span> '
-            f'<span class="mgr-note">{_e(note)}</span></div>'
-        ) if note else ""
+        if is_question:
+            # Before «Оставить переводчику»/«Убрать» the manager's note can
+            # still be edited right here (whoever opens the link first).
+            note_html = (
+                '<div class="field mgr-note-field"><span class="label">Примечание менеджера:</span>'
+                f'<textarea class="mgr-note-edit" placeholder="Можно дописать перед решением">{_e(note)}</textarea></div>'
+            )
+        elif note:
+            note_html = (
+                '<div class="field mgr-note-field"><span class="label">Примечание менеджера:</span> '
+                f'<span class="mgr-note">{_e(note)}</span></div>'
+            )
+        else:
+            note_html = ""
+        if row is None:
+            body_html = f'<div class="field"><span class="label">Тон обращения:</span> {_e(f.get("message"))}</div>'
+            platform_html = ""
+        else:
+            body_html = (
+                f'<div class="field"><span class="label">Источник:</span> {_e(row.get("source"))}</div>'
+                f'<div class="field"><span class="label">Перевод:</span> {_e(row.get("translation"))}</div>'
+            )
+            platform_html = f'<div class="comment"><span class="label">Комментарий платформы:</span> {_e(f.get("message"))}</div>'
         items_html.append(
-            f'<div class="item{state}" data-key="{_e(key)}">'
+            f'<div class="{" ".join(c for c in classes if c)}" data-key="{_e(key)}">'
             f'<div class="num">№{num}</div>'
-            f'<div class="field"><span class="label">Источник:</span> {_e(row.get("source"))}</div>'
-            f'<div class="field"><span class="label">Перевод:</span> {_e(row.get("translation"))}</div>'
-            f"{note_html}"
-            f"{_links_html(entry.get('links', ''))}"
-            f'<div class="comment"><span class="label">Комментарий платформы:</span> {_e(f.get("message"))}</div>'
-            '<label class="tr-label">Примечание переводчика:</label>'
+            f"{body_html}{note_html}{_links_html(entry.get('links', ''))}{platform_html}"
+            '<div class="answer">'
+            '<label class="label tr-label">Примечание переводчика:</label>'
             f'<textarea class="tr-comment" placeholder="Ваш комментарий (необязательно)">{_e(tr.get("comment"))}</textarea>'
+            "</div>"
             '<div class="actions"><span class="status"></span>'
+            '<button type="button" class="btn btn-keep">Оставить переводчику</button>'
+            '<button type="button" class="btn btn-remove">Убрать</button>'
             '<button type="button" class="btn btn-accept">✓ Принять</button>'
             '<button type="button" class="btn btn-reject">✕ Отклонить</button></div>'
             "</div>"
         )
 
-    # Tone-of-address box: the check's tone summary plus the manager's
-    # general note and links for this language (review key "note|<lang>").
-    tone = _tone_message(lang, results)
+    # A language without a tone summary can still have a general note and
+    # links from the manager (review key "note|<lang>").
     general = review.get(f"note|{lang}") or {}
     g_note = (general.get("note") or "").strip()
     g_links = _links_html(general.get("links") or "")
     general_html = ""
-    if tone or g_note or g_links:
+    if g_note or g_links:
         general_html = (
             '<div class="general">'
-            + (f'<div><span class="label">Тон обращения:</span> {_e(tone)}</div>' if tone else "")
             + (f'<div class="row"><span class="label">Примечание менеджера:</span> {_e(g_note)}</div>' if g_note else "")
             + g_links
             + "</div>"

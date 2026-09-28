@@ -297,7 +297,7 @@ class MultiCheckReviewIn(BaseModel):
     models.MultiCheck.review). decision None clears it."""
     manager_id: int
     key: str
-    decision: str | None = None  # "accept" | "reject" | None
+    decision: str | None = None  # "accept" | "question" | "reject" | None
     links: str = ""
     note: str = ""
 
@@ -307,6 +307,13 @@ class TranslatorResponseIn(BaseModel):
     key: str
     decision: str | None = None  # "accept" | "reject" | None
     comment: str = ""
+
+
+class ShareQuestionIn(BaseModel):
+    """Resolving a «?» finding on the share-link page."""
+    key: str
+    action: str | None = None  # "keep" | "remove" | None (just save the note)
+    note: str = ""
 
 
 class ShareLinkIn(BaseModel):

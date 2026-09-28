@@ -215,9 +215,10 @@ class MultiCheck(Base):
     # similar size actually took — see app.main._estimate_batch_minutes.
     batch_volume_chars: Mapped[int] = mapped_column(Integer, default=0)
     # 2026-09-29 (Александр): the manager's review of this report before
-    # sending it to translators — {finding_key: {"decision": "accept"|"reject"
-    # |None, "links": "<Crowdin link(s)>", "note": "<manager's note>"}}, plus
-    # one "note|<lang>" entry per language for a general note. finding_key is
+    # sending it to translators — {finding_key: {"decision": "accept"|"question"
+    # |"reject"|None, "links": "<Crowdin link(s)>", "note": "<manager's note>"}}.
+    # "tone|<lang>" is the tone-of-address summary (always №1), "note|<lang>"
+    # a general note for a language without one. finding_key is
     # "<sheet index>|<lang>|<excel row>|<finding index in that row>" (see the
     # frontend's filteredReport.ts reviewKey). Old reports start empty.
     review: Mapped[dict] = mapped_column(JSON, default=dict)

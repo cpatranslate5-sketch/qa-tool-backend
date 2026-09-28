@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import domain_note_for_names, run_ai_checks
-from app.share_page import accepted_keys, render_not_found, render_shared_report, share_page_headers
+from app.share_page import accepted_keys, keys_with_decision, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
@@ -1208,7 +1208,7 @@ def update_multi_check_review(
     key = payload.key.strip()
     if not key or len(key) > 300:
         raise HTTPException(400, "Некорректный ключ замечания.")
-    if payload.decision not in (None, "accept", "reject"):
+    if payload.decision not in (None, "accept", "question", "reject"):
         raise HTTPException(400, "Некорректное решение.")
     links = (payload.links or "").strip()[:4000]
     note = (payload.note or "").strip()[:4000]
@@ -1280,16 +1280,48 @@ def shared_report_page(token: str, db: Session = Depends(get_db)):
     return HTMLResponse(page, headers=share_page_headers(nonce))
 
 
-@app.post("/share/{token}/respond", include_in_schema=False)
-def shared_report_respond(token: str, payload: schemas.TranslatorResponseIn, db: Session = Depends(get_db)):
-    """A translator's «Принять»/«Отклонить» and comment on one finding
-    (2026-09-30, Александр). Only findings the manager accepted for this
-    link's language can be answered."""
+def _active_share_link(token: str, db: Session) -> models.ShareLink:
     link = None
     if 10 <= len(token) <= 64:
         link = db.query(models.ShareLink).filter(models.ShareLink.token == token).first()
     if link is None or link.revoked or link.multi_check is None:
         raise HTTPException(404, "Ссылка недействительна.")
+    return link
+
+
+@app.post("/share/{token}/question", include_in_schema=False)
+def shared_report_question(token: str, payload: schemas.ShareQuestionIn, db: Session = Depends(get_db)):
+    """A finding the manager marked «?» (question, 2026-09-30, Александр):
+    whoever opens the link can edit the manager's note, then «Оставить
+    переводчику» (action "keep" → it becomes a normal accepted finding) or
+    «Убрать» (action "remove" → it's dropped from the translator's page).
+    action None only saves the note."""
+    link = _active_share_link(token, db)
+    mc = link.multi_check
+    key = payload.key.strip()
+    if key not in keys_with_decision(link.lang, mc.results or {}, mc.review or {}, "question"):
+        raise HTTPException(400, "Это замечание уже решено.")
+    if payload.action not in (None, "keep", "remove"):
+        raise HTTPException(400, "Некорректное действие.")
+    review = dict(mc.review or {})
+    entry = dict(review.get(key) or {})
+    entry["note"] = (payload.note or "").strip()[:4000]
+    if payload.action == "keep":
+        entry["decision"] = "accept"
+    elif payload.action == "remove":
+        entry["decision"] = "reject"
+    review[key] = entry
+    mc.review = review  # reassign so SQLAlchemy notices the JSON change
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/share/{token}/respond", include_in_schema=False)
+def shared_report_respond(token: str, payload: schemas.TranslatorResponseIn, db: Session = Depends(get_db)):
+    """A translator's «Принять»/«Отклонить» and comment on one finding
+    (2026-09-30, Александр). Only findings the manager accepted for this
+    link's language can be answered."""
+    link = _active_share_link(token, db)
     mc = link.multi_check
     if payload.decision not in (None, "accept", "reject"):
         raise HTTPException(400, "Некорректное решение.")
