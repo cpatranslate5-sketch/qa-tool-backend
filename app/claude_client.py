@@ -3,6 +3,7 @@ import json
 import re
 
 import httpx
+from typing import NamedTuple
 
 from app.config import settings
 from app.rule_checks import RULE_BASED_TYPES
@@ -31,10 +32,12 @@ CHECK_LABELS = {
     "typo": (
         "опечатки/ошибки — сюда входят ТРИ разные вещи: (1) обычные опечатки и орфографические ошибки в самом "
         "переводе — неправильно написанное слово, даже если смысл всё равно понятен из контекста (например "
-        "«resulits» вместо «results»); (2) ЛЮБАЯ объективная грамматическая ошибка целевого языка — неправильный "
-        "падеж, управление, согласование, число, род, форма слова, предлог/послелог, синтаксис и т.п. Для этого "
-        "пункта НЕ требуется, чтобы ошибка «ломала» понимание — если форма объективно неправильная по грамматике "
-        "целевого языка, это находка, даже когда смысл всё равно можно понять. Важное уточнение про синтаксис "
+        "«resulits» вместо «results»); (2) грамматическая ошибка целевого языка — неправильный падеж, управление, "
+        "согласование, число, род, форма слова, предлог/послелог, синтаксис и т.п. — ТАКАЯ, которую опытный "
+        "редактор-носитель исправил бы в тексте этого жанра. Смысл при этом может оставаться понятным — это "
+        "всё равно находка. Но НЕ находка — конструкция, которую носитель-копирайтер естественно написал бы в "
+        "тексте такого жанра, даже если она отличается от учебниковой, формальной или наиболее литературной "
+        "нормы (см. «Принцип редактора-носителя» в общих правилах). Важное уточнение про синтаксис "
         "(реальный случай, французский язык, 2026-09-26): если сегмент выглядит синтаксически незавершённым "
         "ТОЛЬКО из-за того, что начинается с союза/связки («и», «а», «но», «et», «mais», «and», «but» и т.п.) или "
         "представляет собой зависимую конструкцию/инфинитив без собственного подлежащего и сказуемого — это, как "
@@ -165,10 +168,33 @@ CHECK_LABELS = {
 # harder to satisfy by accident than the old one-line "tell them apart"
 # instruction was.
 CALIBRATION_STRICT_OPENING = (
-    "Общее правило: сообщай обо всех объективных находках по каждому выбранному критерию — не обязательно быть "
-    "стопроцентно уверенным(ой), чтобы сообщить о реальной проблеме. Не сообщай только о том, что является другим, "
-    "тоже полностью допустимым и корректным вариантом перевода — критерии ниже сами объясняют, когда именно "
-    "находка считается таким допустимым вариантом, а когда нет."
+    "Общее правило: сообщай о находках по каждому выбранному критерию и для каждой честно указывай свою "
+    "уверенность (поле confidence, см. ниже) — не обязательно быть стопроцентно уверенным(ой), чтобы сообщить "
+    "о реальной проблеме, но и завышать уверенность нельзя. Не сообщай о том, что является другим, тоже "
+    "полностью допустимым и корректным вариантом перевода. "
+    "ПРИНЦИП РЕДАКТОРА-НОСИТЕЛЯ: оценивай перевод так, как оценил бы опытный редактор — носитель целевого "
+    "языка, работающий с текстом именно такого жанра (жанр подсказывает «Контекст»: заголовок баннера, пуш, "
+    "пост, текст изображения, интерфейс, правила акции и т.п.). Не считай конструкцию ошибкой только потому, "
+    "что она отличается от учебниковой, формальной или наиболее литературной нормы. Учитывай рекламный язык, "
+    "UI-контекст, региональный узус и смешение языков (code-switching, например хинглиш). Если носитель-"
+    "копирайтер естественно написал бы так в письменном тексте этого жанра и смысл не страдает — это не "
+    "ошибка. Не путай «можно сказать лучше» с «сказано неправильно». Перед тем как сообщить о грамматической "
+    "ошибке, проверь: действительно ли конструкция невозможна или явно неправильна для носителя в письменном "
+    "тексте такого жанра? Если она допустима, но менее формальна или менее предпочтительна — не сообщай о ней "
+    "или ставь уверенность ниже 40. Мерило — письменный текст этого жанра, а не устная бытовая речь: то, что "
+    "люди иногда говорят вслух, не делает ошибку в письменном тексте нормой. "
+    "СТРОГОСТЬ ПО ЖАНРУ: в рекламных текстах (баннеры, пуши, посты, слоганы, тексты изображений) допустимы "
+    "разговорные конструкции, эллипсис, фразы без глагола, обрывы, английские слова и термины. В правилах и "
+    "условиях акции держи планку ближе к норме: там важна точность формулировок. "
+    "ВСЕГДА ОШИБКА, независимо от стиля и жанра: опечатки и орфографические ошибки; формы слов, которых нет в "
+    "языке или которые носитель не написал бы и в неформальном письменном тексте; сломанные плейсхолдеры и "
+    "теги; неверные числа, даты, валюта; потеря или искажение условий («от», «до», «не менее», «только» и "
+    "т.п.); символы чужого алфавита внутри слова. "
+    "ПРОВЕРЯЙ СВОИ ИСПРАВЛЕНИЯ: если предлагаешь вариант исправления, сначала прочитай его глазами читателя и "
+    "убедись, что он не меняет смысл и не создаёт новой двусмысленности; если хорошего исправления нет — "
+    "опиши проблему без готового варианта. Не переноси выводы по аналогии с другими языками: похожая по виду "
+    "конструкция в другом языке — не довод. Устойчивые клише и принятые в языке обороты (например "
+    "официальные сочетания вроде «государства-участники») — не ошибка, даже если выглядят нестандартно."
 )
 _CALIBRATION_SHARED_TAIL = (
     "Порядок символа валюты относительно числа, "
@@ -265,11 +291,54 @@ _CALIBRATION_WITHOUT_NUMBERS_CHECK = (
 )
 
 
+# 2026-09-29 redesign: the checking model rates its OWN confidence per
+# finding (no separate second-opinion model any more). Findings below
+# settings.CONFIDENCE_THRESHOLD never reach the report — see
+# _apply_confidence_threshold.
+_CONFIDENCE_INSTRUCTION = (
+    "У КАЖДОЙ находки укажи поле \"confidence\" — целое число 0-100: насколько ты уверен(а), что это "
+    "реальная проблема, которую редактор-носитель действительно исправил бы, а не допустимый вариант "
+    "перевода. Шкала: 90-100 — явная фактическая или техническая ошибка (цифра, валюта, дата, плейсхолдер, "
+    "опечатка, форма слова, которой нет в языке, искажённый смысл, потерянное условие «от/до/не менее»); "
+    "60-89 — ошибка вероятна, или термин без причины переведён в разных местах по-разному; 40-59 — "
+    "спорно, но редактор скорее поправил бы; 0-39 — допустимый вариант, вопрос стиля или вкуса, "
+    "разговорная, но естественная для носителя конструкция. Если конструкция допустима, но менее "
+    "формальна или менее предпочтительна, чем учебниковый вариант, ставь меньше 40. Находки ниже 40 "
+    "вообще не попадут в отчёт, так что оценивай честно, не завышай."
+)
+
+
+def _apply_confidence_threshold(raw: list) -> list:
+    """Keeps a finding only when the model rated it at or above
+    settings.CONFIDENCE_THRESHOLD. The percent is normalized to an int and
+    kept on the finding as "confidence" for the report. A finding with no
+    usable percent at all is KEPT (no safe basis to drop it). Register
+    value entries and anything that isn't a finding dict pass through."""
+    out = []
+    for f in raw:
+        if not isinstance(f, dict) or f.get("type") in (REGISTER_VALUE_TYPE, "system"):
+            out.append(f)
+            continue
+        conf = f.get("confidence")
+        if isinstance(conf, str):
+            m = re.search(r"\d+", conf)
+            conf = int(m.group()) if m else None
+        if isinstance(conf, (int, float)) and not isinstance(conf, bool):
+            conf = max(0, min(100, int(round(conf))))
+            if conf < settings.CONFIDENCE_THRESHOLD:
+                continue
+            f = {**f, "confidence": conf}
+        else:
+            f = {k: v for k, v in f.items() if k != "confidence"}
+        out.append(f)
+    return out
+
+
 def _calibration(checks: list[str]) -> str:
     tail = _CALIBRATION_WITH_NUMBERS_CHECK if "numbers" in checks else _CALIBRATION_WITHOUT_NUMBERS_CHECK
     return (
         f"{CALIBRATION_STRICT_OPENING} {_CALIBRATION_SHARED_TAIL} {tail} {_CONCISENESS_INSTRUCTION} "
-        f"{_RUSSIAN_COMMENT_INSTRUCTION}"
+        f"{_RUSSIAN_COMMENT_INSTRUCTION} {_CONFIDENCE_INSTRUCTION}"
     )
 
 
@@ -308,7 +377,7 @@ _SINGLE_PROMPT_SUFFIX = """Исходный текст:
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
 [
-  {{"type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
+  {{"type": "{type_enum}", "severity": "low|medium|high", "confidence": <0-100>, "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
 ]"""
 SINGLE_PROMPT = _SINGLE_PROMPT_PREFIX + _SINGLE_PROMPT_SUFFIX
 
@@ -392,8 +461,8 @@ _BATCH_PROMPT_SUFFIX = """{target_lang_line}
 Верни ТОЛЬКО валидный JSON-массив по всем парам без markdown и пояснений, строго в этой форме
 (пустой массив [], если нигде нет обычных находок; не включай пары без обычных находок{register_array_note}):
 [
-  {{"row": <номер пары из списка выше>, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с цитатой конкретного предложения/фрагмента, если в паре их несколько — без номеров пар/строк внутри самого текста message"}},
-  {{"rows": [<номера ВСЕХ пар, где повторяется одна и та же проблема>], "type": "{type_enum}", "severity": "low|medium|high", "message": "Повторяется по всему документу: ..."}}
+  {{"row": <номер пары из списка выше>, "type": "{type_enum}", "severity": "low|medium|high", "confidence": <0-100>, "message": "конкретное описание на русском, с цитатой конкретного предложения/фрагмента, если в паре их несколько — без номеров пар/строк внутри самого текста message"}},
+  {{"rows": [<номера ВСЕХ пар, где повторяется одна и та же проблема>], "type": "{type_enum}", "severity": "low|medium|high", "confidence": <0-100>, "message": "Повторяется по всему документу: ..."}}
 ]
 (используй "rows" вместо "row" ТОЛЬКО для настоящего повторения одной и той же проблемы в нескольких парах — см.
 выше; для обычной, отдельной находки в одной паре используй "row" как всегда)"""
@@ -478,7 +547,7 @@ _BATCH_PROMPT_SINGLE_ITEM_SUFFIX = """{target_lang_line}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
 [
-  {{"row": 1, "type": "{type_enum}", "severity": "low|medium|high", "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
+  {{"row": 1, "type": "{type_enum}", "severity": "low|medium|high", "confidence": <0-100>, "message": "конкретное описание на русском, с указанием места в тексте, если уместно"}}
 ]"""
 BATCH_PROMPT_SINGLE_ITEM = _BATCH_PROMPT_SINGLE_ITEM_PREFIX + _BATCH_PROMPT_SINGLE_ITEM_SUFFIX
 
@@ -648,6 +717,7 @@ def _parse_search_findings(text_block: str | None, checkable: list[tuple[int, di
 
 async def _search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
+    route: "ModelRoute | None" = None,
 ) -> tuple[dict[int, list[str]], float]:
     """Step 1 of the two-step pipeline — see FINDINGS_SEARCH_PROMPT's own
     comment above for the full rationale. Returns ({}, 0.0) with NO API
@@ -676,9 +746,12 @@ async def _search_findings(
         target_lang_line=_target_lang_line(target_lang),
         pairs_block=_pairs_block(checkable),
     )
-    model = model_override or _model_for_lang(target_lang)
-    text_block, usage, _stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
-    return _parse_search_findings(text_block, checkable), _usage_cost(model, usage)
+    if route is None:
+        route = route_for_model_id(model_override) if model_override else route_for_lang(target_lang)
+    text_block, cost, _stop_reason = await _call_route(
+        route, prompt, cache_prefix=cache_prefix, effort=settings.OPENAI_EFFORT_SEARCH,
+    )
+    return _parse_search_findings(text_block, checkable), cost
 
 
 async def _search_findings_openai(
@@ -804,35 +877,15 @@ async def _ensemble_search_findings(
     real check since 2026-09-27's volume-based model tiering, this branch
     was actually the one production traffic hits, not the two-branch
     ensemble below it — so it needed the exact same protection."""
-    if model_override is not None:
-        try:
-            findings, cost = await _search_findings(items, target_lang, source_lang, model_override=model_override)
-        except _BRANCH_FAILURE_EXCEPTIONS:
-            return {}, 0.0, [_model_branch_search_warning(model_override)]
-        return findings, cost, []
-
-    sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
-    gpt_expected = bool(settings.OPENAI_API_KEY)
-
-    ((sonnet_findings, sonnet_cost), sonnet_error), ((gpt_findings, gpt_cost), gpt_error) = await asyncio.gather(
-        _run_search_branch(_search_findings(items, target_lang, source_lang)),
-        _run_search_branch(_search_findings_openai(items, target_lang, source_lang)),
-    )
-
-    merged: dict[int, list[str]] = {idx: list(candidates) for idx, candidates in sonnet_findings.items()}
-    for idx, candidates in gpt_findings.items():
-        existing = merged.setdefault(idx, [])
-        for c in candidates:
-            if c not in existing:
-                existing.append(c)
-
-    warnings = []
-    if sonnet_expected and sonnet_error is not None:
-        warnings.append(_model_branch_search_warning("Sonnet"))
-    if gpt_expected and gpt_error is not None:
-        warnings.append(_model_branch_search_warning("GPT"))
-
-    return merged, sonnet_cost + gpt_cost, warnings
+    # 2026-09-29 redesign: no more Claude+GPT ensemble — Step 1 runs on the
+    # language's own fixed model only (see LANG_MODEL_TIER), same model as
+    # Step 2. A failure here degrades to a visible warning, never a crash.
+    route = route_for_model_id(model_override) if model_override else route_for_lang(target_lang)
+    try:
+        findings, cost = await _search_findings(items, target_lang, source_lang, route=route)
+    except _BRANCH_FAILURE_EXCEPTIONS:
+        return {}, 0.0, [_model_branch_search_warning(route.label)]
+    return findings, cost, []
 
 
 # Client-specific terminology equivalence, 2026-09-24 (Александр, reporting
@@ -1544,7 +1597,11 @@ def _model_for_lang(target_lang: str) -> str:
     HARD_LANGUAGE_BASES's own comment for the real chunk-size-comparison
     result that led here, after this briefly always returned CLAUDE_MODEL
     for every language between 2026-09-23 and today."""
-    return settings.CLAUDE_MODEL_HARD if _is_hard_language(target_lang) else settings.CLAUDE_MODEL
+    # 2026-09-29: now just the language's fixed route (see LANG_MODEL_TIER).
+    # Callers that can only talk to Anthropic (the legacy Message Batches
+    # path) get Sonnet for a GPT-routed language instead of a GPT id.
+    route = route_for_lang(target_lang)
+    return route.model if route.vendor == "anthropic" else settings.MODEL_CLAUDE_SONNET
 
 
 def _is_hard_language(target_lang: str) -> bool:
@@ -1554,6 +1611,73 @@ def _is_hard_language(target_lang: str) -> bool:
     Re-tied to model choice 2026-09-26 — see HARD_LANGUAGE_BASES's own
     comment."""
     return target_lang.strip().lower().split("-")[0] in HARD_LANGUAGE_BASES
+
+
+# ------------------------------------------------ per-language routing ---
+# 2026-09-29, Александр's redesign: every target language is checked end to
+# end by ONE fixed model — Step 1 search, Step 2 check (which now also rates
+# its own confidence per finding, see _CONFIDENCE_INSTRUCTION) and the
+# term-consistency pass. No cross-model second opinion, no GPT+Claude search
+# ensemble, no small-task Haiku tiering any more. The assignment below is
+# his own per-language list (his reasoning: Claude is stronger on Indian
+# languages, GPT on Turkic ones). Codes are matched on every letter-only
+# token of the code, first token first, so "kk-kz", "kz", "bn-bd", "bd",
+# "fil(tl)-ph", "hi-latn-in", "pt-br" and the agency's own short labels
+# (JP, CN, UA, KG, TJ …) all resolve. Anything not listed → Sonnet.
+LANG_MODEL_TIER = {
+    # Claude Opus 5.5
+    "bn": "opus", "bd": "opus", "hi": "opus", "hing": "opus", "mr": "opus",
+    "ko": "opus", "te": "opus", "ur": "opus",
+    # Claude Sonnet 5
+    "zh": "sonnet", "cn": "sonnet", "el": "sonnet", "fr": "sonnet", "ja": "sonnet",
+    "jp": "sonnet", "th": "sonnet", "vi": "sonnet", "sw": "sonnet", "en": "sonnet",
+    # GPT-5.6 Sol
+    "az": "sol", "ar": "sol", "ky": "sol", "kg": "sol", "kk": "sol", "kz": "sol",
+    "ms": "sol", "my": "sol", "tg": "sol", "tj": "sol", "tr": "sol", "uz": "sol",
+    "fil": "sol", "tl": "sol",
+    # GPT-5.6 Terra
+    "de": "terra", "es": "terra", "it": "terra", "id": "terra", "pl": "terra",
+    "pt": "terra", "uk": "terra", "ua": "terra", "ro": "terra",
+}
+DEFAULT_MODEL_TIER = "sonnet"
+
+_TIER_VENDOR = {"opus": "anthropic", "sonnet": "anthropic", "sol": "openai", "terra": "openai"}
+_TIER_LABEL = {"opus": "Claude Opus", "sonnet": "Claude Sonnet", "sol": "GPT Sol", "terra": "GPT Terra"}
+
+
+class ModelRoute(NamedTuple):
+    vendor: str   # "anthropic" | "openai"
+    model: str    # exact API model id
+    label: str    # human-readable, shown in reports/warnings
+
+
+def _tier_model_id(tier: str) -> str:
+    return {
+        "opus": settings.MODEL_CLAUDE_OPUS,
+        "sonnet": settings.MODEL_CLAUDE_SONNET,
+        "sol": settings.MODEL_GPT_SOL,
+        "terra": settings.MODEL_GPT_TERRA,
+    }[tier]
+
+
+def tier_for_lang(target_lang: str) -> str:
+    tokens = re.findall(r"[a-z]+", (target_lang or "").lower())
+    for tok in tokens:
+        if tok in LANG_MODEL_TIER:
+            return LANG_MODEL_TIER[tok]
+    return DEFAULT_MODEL_TIER
+
+
+def route_for_lang(target_lang: str) -> ModelRoute:
+    tier = tier_for_lang(target_lang)
+    return ModelRoute(_TIER_VENDOR[tier], _tier_model_id(tier), _TIER_LABEL[tier])
+
+
+def route_for_model_id(model_id: str) -> ModelRoute:
+    """For an explicit model id (diagnostics / overrides): vendor by id shape."""
+    mid = (model_id or "").strip()
+    vendor = "openai" if re.match(r"^(gpt|o\d|chatgpt)", mid.lower()) else "anthropic"
+    return ModelRoute(vendor, mid, mid)
 
 
 # 2026-09-27, volume-based model tiering — the third of three fixes from
@@ -1614,11 +1738,9 @@ def _model_for_task(target_lang: str, items: list[dict]) -> str:
     run_ai_checks_batch) receives the exact same resolved model via its own
     model_override passthrough — a small task is small for both steps of
     the pipeline, not just the structured check."""
-    if _is_hard_language(target_lang):
-        return _model_for_lang(target_lang)
-    if _is_small_task(items):
-        return settings.CLAUDE_MODEL_LIGHT
-    return _model_for_lang(target_lang)
+    # 2026-09-29: small-task tiering removed — a language always gets its
+    # own fixed model (Claude OR GPT id), see LANG_MODEL_TIER.
+    return route_for_lang(target_lang).model
 
 
 # USD per single token (not per million) — verified against
@@ -1645,6 +1767,8 @@ MODEL_PRICING_PER_TOKEN = {
     "claude-sonnet-4-5-20250929": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
     "claude-sonnet-5": {"input": 2.00 / 1_000_000, "output": 10.00 / 1_000_000},
     "claude-opus-5": {"input": 5.00 / 1_000_000, "output": 25.00 / 1_000_000},
+    # 2026-09-29, confirmed against Anthropic's current price list.
+    "claude-opus-5-5": {"input": 4.00 / 1_000_000, "output": 20.00 / 1_000_000},
 }
 # The Message Batches API (used for large multi-checks — see
 # excel_multi.BATCH_THRESHOLD_CHARS) is half price on both input and output.
@@ -1663,6 +1787,11 @@ OPENAI_MODEL_PRICING_PER_TOKEN = {
     "gpt-5-mini": {"input": 0.25 / 1_000_000, "output": 2.00 / 1_000_000},
     "gpt-5-nano": {"input": 0.05 / 1_000_000, "output": 0.40 / 1_000_000},
     "gpt-5": {"input": 1.25 / 1_000_000, "output": 10.00 / 1_000_000},
+    # GPT-5.6 family, confirmed 2026-09-29 against OpenAI's own GPT-5.6
+    # announcement (Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M tokens).
+    "gpt-5.6-sol": {"input": 5.00 / 1_000_000, "output": 30.00 / 1_000_000},
+    "gpt-5.6-terra": {"input": 2.50 / 1_000_000, "output": 15.00 / 1_000_000},
+    "gpt-5.6-luna": {"input": 1.00 / 1_000_000, "output": 6.00 / 1_000_000},
 }
 
 
@@ -1689,7 +1818,16 @@ def _openai_usage_cost(model: str, usage: dict | None) -> float:
     rates = OPENAI_MODEL_PRICING_PER_TOKEN.get(model)
     if not rates or not usage:
         return 0.0
-    cost = usage.get("prompt_tokens", 0) * rates["input"] + usage.get("completion_tokens", 0) * rates["output"]
+    # OpenAI reports automatically-cached prompt tokens inside prompt_tokens;
+    # those bill at 10% of the input rate.
+    prompt_tokens = usage.get("prompt_tokens", 0) or 0
+    cached = ((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    cached = min(cached, prompt_tokens)
+    cost = (
+        (prompt_tokens - cached) * rates["input"]
+        + cached * rates["input"] * 0.10
+        + (usage.get("completion_tokens", 0) or 0) * rates["output"]
+    )
     return cost * CONSOLE_TOPUP_TAX_MULTIPLIER
 
 
@@ -1743,6 +1881,32 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
 AI_MAX_TOKENS = 32000
 
 
+_RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
+_MAX_ATTEMPTS = 3
+_HTTP_TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=60.0)
+
+
+async def _post_json_with_retries(url: str, headers: dict, payload: dict) -> httpx.Response:
+    """POST with a long read timeout and up to two automatic retries on
+    transient failures (timeouts, dropped connections, 429 rate limits,
+    5xx/529 overloads). Non-transient errors (400/401/403…) are returned
+    unraised so the caller can inspect them (e.g. the reasoning_effort
+    fallback in _call_openai) before raise_for_status."""
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code not in _RETRYABLE_STATUS:
+                return resp
+            last_exc = httpx.HTTPStatusError(f"HTTP {resp.status_code}", request=resp.request, response=resp)
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+        if attempt < _MAX_ATTEMPTS - 1:
+            await asyncio.sleep(3 * (attempt + 1))
+    raise last_exc  # type: ignore[misc]
+
+
 async def _call_claude(
     prompt: str, model: str | None = None, cache_prefix: str | None = None,
 ) -> tuple[str | None, dict, str | None]:
@@ -1785,40 +1949,30 @@ async def _call_claude(
         ]
     else:
         content = prompt
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": settings.ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": resolved_model,
-                "max_tokens": AI_MAX_TOKENS,
-                # Deliberately NOT setting temperature. It was briefly set to
-                # 0 here (to make a fixed-criteria classification task give
-                # the same answer for the same input every time, instead of
-                # varying run to run) but Anthropic rejects it outright with
-                # a 400 ("temperature is deprecated for this model") on
-                # newer models — confirmed live against Sonnet, which broke
-                # every real-time check the moment Sonnet became the default
-                # model. Anthropic's own guidance for these newer models:
-                # "Remove them from requests, and use prompting to guide the
-                # model's behavior instead" — there's no replacement
-                # determinism knob, so consistency now has to come from
-                # clear prompt wording, not a request parameter.
-                "messages": [{"role": "user", "content": content}],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    # (No temperature: newer Anthropic models reject it — see git history.)
+    resp = await _post_json_with_retries(
+        "https://api.anthropic.com/v1/messages",
+        {
+            "x-api-key": settings.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        {
+            "model": resolved_model,
+            "max_tokens": AI_MAX_TOKENS,
+            "messages": [{"role": "user", "content": content}],
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
     text = next((b["text"] for b in data.get("content", []) if b.get("type") == "text"), None)
     return text, data.get("usage", {}), data.get("stop_reason")
 
 
-async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | None, dict, str | None]:
+async def _call_openai(
+    prompt: str, model: str | None = None, effort: str | None = None,
+) -> tuple[str | None, dict, str | None]:
     """OpenAI equivalent of _call_claude, called via plain REST (same style
     as the Anthropic calls in this file) rather than the openai SDK — no
     new dependency needed, and every other API call here already talks to
@@ -1833,27 +1987,46 @@ async def _call_openai(prompt: str, model: str | None = None) -> tuple[str | Non
     if not settings.OPENAI_API_KEY:
         return None, {}, None
     resolved_model = model or settings.OPENAI_MODEL
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-                "content-type": "application/json",
-            },
-            json={
-                "model": resolved_model,
-                "max_completion_tokens": AI_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": resolved_model,
+        "max_completion_tokens": AI_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if effort:
+        payload["reasoning_effort"] = effort
+    resp = await _post_json_with_retries(url, headers, payload)
+    # Some models reject reasoning_effort (or a given level of it) — rather
+    # than failing the whole check over it, retry once without it.
+    if resp.status_code == 400 and effort and "reasoning" in resp.text.lower():
+        payload.pop("reasoning_effort", None)
+        resp = await _post_json_with_retries(url, headers, payload)
+    resp.raise_for_status()
+    data = resp.json()
 
     choice = (data.get("choices") or [{}])[0]
     text = (choice.get("message") or {}).get("content")
     finish_reason = choice.get("finish_reason")
     stop_reason = "max_tokens" if finish_reason == "length" else finish_reason
     return text, data.get("usage", {}), stop_reason
+
+
+async def _call_route(
+    route: ModelRoute, prompt: str, cache_prefix: str | None = None, effort: str | None = None,
+) -> tuple[str | None, float, str | None]:
+    """One call to whichever vendor a language is routed to — returns
+    (response text, cost_usd, stop_reason). OpenAI caches long identical
+    prompt prefixes automatically, so cache_prefix only matters for
+    Anthropic; effort only matters for OpenAI."""
+    if route.vendor == "openai":
+        text, usage, stop = await _call_openai(prompt, model=route.model, effort=effort)
+        return text, _openai_usage_cost(route.model, usage), stop
+    text, usage, stop = await _call_claude(prompt, model=route.model, cache_prefix=cache_prefix)
+    return text, _usage_cost(route.model, usage), stop
 
 
 def _salvage_json_objects(text: str) -> list:
@@ -2012,9 +2185,11 @@ async def run_ai_checks(
     # (target_lang, checks), independent of this specific pair's text.
     cache_prefix = _SINGLE_PROMPT_PREFIX.format(**prompt_kwargs)
     prompt = cache_prefix + _SINGLE_PROMPT_SUFFIX.format(**prompt_kwargs)
-    model = _model_for_lang(target_lang)
-    text_block, usage, stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
-    findings = _filter_findings_by_checks(parse_json_array(text_block), checks)
+    route = route_for_lang(target_lang)
+    text_block, step2_cost, stop_reason = await _call_route(
+        route, prompt, cache_prefix=cache_prefix, effort=settings.OPENAI_EFFORT_CHECK,
+    )
+    findings = _filter_findings_by_checks(_apply_confidence_threshold(parse_json_array(text_block)), checks)
     if stop_reason == "max_tokens":
         findings = findings + [_truncation_warning()]
     findings = findings + search_warnings
@@ -2040,7 +2215,7 @@ async def run_ai_checks(
                     "register_majority": report["majority"],
                 })
 
-    return findings, search_cost + _usage_cost(model, usage)
+    return findings, search_cost + step2_cost
 
 
 def build_batch_prompt(
@@ -2237,24 +2412,19 @@ async def run_ai_checks_batch(
     )
     if prompt is None:
         return {}, search_cost, False, search_warnings
-    model = model_override or _model_for_lang(target_lang)
-    # Step 2, unlike Step 1's _ensemble_search_findings above, is a single
-    # REQUIRED call — there's no second branch to fall back on. Added
-    # 2026-09-28 (see _step2_call_failure_warning's own comment for the
-    # real incident that exposed this): a transient failure here used to
-    # propagate all the way up through app.excel_multi.run_multi_check's
-    # asyncio.gather and crash the ENTIRE multi-check, discarding every
-    # other language's already-successful results too. Now it degrades to
-    # "no AI findings for this one chunk" plus a visible warning, exactly
-    # like Step 1's own branches already do.
+    route = route_for_model_id(model_override) if model_override else route_for_lang(target_lang)
+    # Step 2 is a single REQUIRED call; a failure degrades to "no AI findings
+    # for this chunk" plus a visible warning instead of crashing the check.
     try:
-        text_block, usage, stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
+        text_block, step2_cost, stop_reason = await _call_route(
+            route, prompt, cache_prefix=cache_prefix, effort=settings.OPENAI_EFFORT_CHECK,
+        )
     except _BRANCH_FAILURE_EXCEPTIONS:
         return {}, search_cost, False, search_warnings + [_step2_call_failure_warning()]
-    raw = parse_json_array(text_block)
+    raw = _apply_confidence_threshold(parse_json_array(text_block))
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
-    return filtered, search_cost + _usage_cost(model, usage), stop_reason == "max_tokens", search_warnings
+    return filtered, search_cost + step2_cost, stop_reason == "max_tokens", search_warnings
 
 
 # ------------------------------------------------ automatic second opinion ---
@@ -2534,33 +2704,40 @@ MAX_ROWS_FOR_TERM_CONSISTENCY = 400
 # new response shape, so app.excel_multi's existing _resolve_repeated_
 # findings turns "rows" into a "(также в строках: ...)" tag with zero new
 # code on that end.
+# 2026-09-29 (Александр): softened — only flag DIFFERENT NOUNS used for the
+# same concept in the same kind of context (e.g. «фрибеты / бесплатные
+# ставки», «баллы / очки»). Grammatical forms, synonyms in clearly different
+# contexts, verbs/adjectives/phrasing variation are NOT findings. Runs on the
+# language's own fixed model (see LANG_MODEL_TIER), with its own confidence.
 _TERM_CONSISTENCY_INSTRUCTIONS = (
-    "Проверь консистентность перевода повторяющихся терминов и понятий внутри одного языка по всей "
-    "предоставленной пачке строк.\n"
-    "Если один и тот же термин исходника используется в одинаковом значении и контексте, его перевод должен "
-    "быть терминологически единообразным.\n"
-    "Например: «баллы» не должны без причины переводиться в разных строках разными терминами со значениями "
-    "«points», «scores», «credits» и т. п.\n"
-    "Не считать ошибкой:\n"
-    "- разные грамматические формы одного термина;\n"
-    "- склонение, число, род, падеж;\n"
-    "- артикли, предлоги и служебные элементы;\n"
-    "- естественные морфологические изменения;\n"
-    "- разные переводы, если значение исходного слова действительно различается по контексту.\n"
-    "Фиксируй ошибку только если разные варианты обозначают одно и то же понятие в сопоставимом контексте и "
-    "создают реальную терминологическую неконсистентность.\n"
-    "При обнаружении укажи обе (или все) строки и использованные варианты перевода.\n\n"
+    "Проверь единообразие ТЕРМИНОВ-СУЩЕСТВИТЕЛЬНЫХ в переводе на один язык по всей пачке строк ниже.\n"
+    "Ищи ТОЛЬКО одно: одно и то же понятие исходника (существительное или устойчивое терминологическое "
+    "сочетание — название бонуса, валюты акции, единицы начисления и т.п.) в сопоставимом контексте "
+    "переведено РАЗНЫМИ существительными. Примеры того, что нужно найти: в одних строках «фрибеты», в "
+    "других «бесплатные ставки» для одного и того же free bet; в одних «баллы», в других «очки» для одних и "
+    "тех же points.\n"
+    "НЕ считай находкой:\n"
+    "- разные грамматические формы одного и того же слова (число, падеж, род, склонение, артикли, "
+    "послелоги, притяжательные окончания);\n"
+    "- различия в глаголах, прилагательных, наречиях, порядке слов и формулировке фраз;\n"
+    "- разные слова, если в исходнике тоже разные слова или контекст явно другой;\n"
+    "- сокращение и полную форму одного термина, если это устоявшаяся практика (например «FS» и «фриспины»);\n"
+    "- названия игр, турниров, брендов;\n"
+    "- любые стилистические различия, если оба варианта — то же самое существительное.\n"
+    "Если сомневаешься — не сообщай.\n\n"
     "Строки пронумерованы ниже в формате «N. [контекст] Исходник: ... | Перевод: ...». Ответь СТРОГО "
     "JSON-массивом без каких-либо пояснений вокруг, каждый элемент вида {{\"rows\": [n1, n2, ...], "
-    "\"message\": \"...\"}}, где \"rows\" — номера ВСЕХ строк, задействованных в этой конкретной находке "
-    "(минимум два), а \"message\" — конкретное объяснение на русском языке: какой термин исходника и какими "
-    "разными вариантами перевода он передан в указанных строках. Если проблем не найдено, верни пустой "
-    "массив []. Не включай в ответ ничего, кроме самого JSON-массива.\n\n"
+    "\"confidence\": <0-100>, \"message\": \"...\"}}, где \"rows\" — номера ВСЕХ строк, задействованных в "
+    "этой находке (минимум два), \"confidence\" — насколько ты уверен(а), что это реальная "
+    "терминологическая непоследовательность, которую редактор исправил бы (ниже 40 — не попадёт в отчёт), а "
+    "\"message\" — коротко по-русски: какое понятие исходника и какими разными существительными оно передано "
+    "(с цитатами на целевом языке и переводом в скобках). Если проблем нет, верни пустой массив []. Не "
+    "включай в ответ ничего, кроме самого JSON-массива.\n\n"
     "Строки:\n{numbered_rows}"
 )
 
 
-def _term_consistency_failure_warning() -> dict:
+def _term_consistency_failure_warning(model_label: str = "GPT") -> dict:
     """Same synthetic "type": "system" finding pattern as
     _second_opinion_failure_warning/_model_branch_search_warning — shown
     only when GPT WAS configured (its API key is set) but this pass failed
@@ -2570,14 +2747,16 @@ def _term_consistency_failure_warning() -> dict:
         "type": "system",
         "severity": "medium",
         "message": (
-            "Проверка консистентности терминов (GPT) не выполнилась для этого языка — сбой на стороне "
+            f"Проверка консистентности терминов ({model_label}) не выполнилась для этого языка — сбой на стороне "
             "модели (например, закончились доступные средства на счёте, неверный/просроченный ключ API, "
             "или временная недоступность сервиса). Остальные критерии проверены как обычно."
         ),
     }
 
 
-async def run_term_consistency_check(items: list[dict]) -> tuple[dict[int, list[dict]], float, dict | None]:
+async def run_term_consistency_check(
+    items: list[dict], target_lang: str = "",
+) -> tuple[dict[int, list[dict]], float, dict | None]:
     """Whole-language, GPT-only pass — see TERM_CONSISTENCY_TYPE's own
     comment for why this can't reuse the normal per-chunk pipeline. Never
     calls Anthropic at all.
@@ -2619,21 +2798,21 @@ async def run_term_consistency_check(items: list[dict]) -> tuple[dict[int, list[
         for n, it in enumerate(capped, start=1)
     )
     prompt = _TERM_CONSISTENCY_INSTRUCTIONS.format(numbered_rows=numbered_rows)
-    gpt_expected = bool(settings.OPENAI_API_KEY)
+    route = route_for_lang(target_lang)
+    key_set = bool(settings.OPENAI_API_KEY) if route.vendor == "openai" else bool(settings.ANTHROPIC_API_KEY)
     try:
-        text_block, usage, _ = await _call_openai(prompt, model=settings.OPENAI_MODEL)
+        text_block, cost_usd, _ = await _call_route(route, prompt, effort=settings.OPENAI_EFFORT_CHECK)
     except _BRANCH_FAILURE_EXCEPTIONS:
-        return {}, 0.0, (_term_consistency_failure_warning() if gpt_expected else None)
+        return {}, 0.0, (_term_consistency_failure_warning(route.label) if key_set else None)
     if text_block is None:
         return {}, 0.0, None
-    raw = parse_json_array(text_block)
+    raw = _apply_confidence_threshold(parse_json_array(text_block))
     number_to_index = {n: n - 1 for n in range(1, len(capped) + 1)}
     grouped = group_batch_findings(raw, number_to_index)
     for findings in grouped.values():
         for f in findings:
             f["type"] = TERM_CONSISTENCY_TYPE
             f.setdefault("severity", "medium")
-    cost_usd = _openai_usage_cost(settings.OPENAI_MODEL, usage)
     return grouped, cost_usd, None
 
 

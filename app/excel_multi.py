@@ -35,6 +35,7 @@ from app.claude_client import (
     run_term_consistency_check,
 )
 from app.rule_checks import run_rule_checks
+from app.claude_client import route_for_lang
 
 logger = logging.getLogger(__name__)
 
@@ -1059,7 +1060,7 @@ async def _check_language_for_sheet(
     # sequentially after, since the two are otherwise independent.
     async def _term_consistency() -> tuple[dict[int, list[dict]], float, dict | None]:
         async with semaphore:
-            return await run_term_consistency_check(ai_items)
+            return await run_term_consistency_check(ai_items, target_lang=lang)
 
     if "term_consistency" in checks:
         (ai_findings_by_idx, cost_usd, truncated, search_warnings), (term_grouped, term_cost, term_warning) = (
@@ -1089,6 +1090,10 @@ async def _check_language_for_sheet(
         src = row["values"].get(source_lang, "")
         tgt = row["values"].get(lang, "")
         findings = run_rule_checks(src, tgt, checks, max_length=row["max_length"], lang_code=lang)
+        # Algorithmic checks are deterministic — shown as 100% confidence,
+        # next to the AI model's own percent on its findings.
+        for f in findings:
+            f.setdefault("confidence", 100)
         findings += ai_findings_by_idx.get(idx, [])
         if findings:
             out.append({
@@ -1235,6 +1240,10 @@ async def run_multi_check(
         "languages_checked": sorted({l for s in result_sheets for l in s["languages_checked"]}),
         "total_findings": total_findings,
         "cost_usd": total_cost_usd,
+        # Which model checked each language (2026-09-29 per-language routing).
+        "models_by_lang": {
+            l: route_for_lang(l).label for s_ in result_sheets for l in s_["languages_checked"]
+        },
     }
     return {"sheets": result_sheets, "summary": summary}
 
@@ -1829,14 +1838,14 @@ def build_report_workbook(
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=9)
         ws.cell(row=1, column=1).font = openpyxl.styles.Font(bold=True)
         ws.append([])  # spacer row before the header
-    ws.append(["Лист", "Строка в файле", "Контекст", "Язык", "Серьёзность", "Тип", "Проблема", "Источник", "Перевод"])
+    ws.append(["Лист", "Строка в файле", "Контекст", "Язык", "Серьёзность", "Тип", "Проблема", "Источник", "Перевод", "Уверенность, %", "Модель"])
     # Captured AFTER the append above (not computed from the pre-append
     # max_row) — an appended blank spacer row still advances openpyxl's
     # internal row cursor even though it holds no cells, so computing this
     # beforehand pointed one row too early and left the header itself out
     # of the filter/freeze range below.
     header_row = ws.max_row
-    for col_idx, width in enumerate([18, 14, 28, 8, 12, 14, 50, 40, 40], start=1):
+    for col_idx, width in enumerate([18, 14, 28, 8, 12, 14, 50, 40, 40, 14, 16], start=1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
     for sheet in results.get("sheets", []):
@@ -1853,6 +1862,9 @@ def build_report_workbook(
                         f.get("message", ""),
                         item["source"],
                         item["translation"],
+                        # model's own percent (2026-09-29); older reports: former second opinion
+                        f.get("confidence", f.get("sonnet_percent", "")),
+                        (results.get("summary") or {}).get("models_by_lang", {}).get(lang, ""),
                     ])
 
     # Turns on Excel's own column filter dropdowns on the header row — lets
@@ -1861,7 +1873,7 @@ def build_report_workbook(
     # everything exactly as it does today. Only makes sense once there's at
     # least one data row below the header.
     if ws.max_row > header_row:
-        ws.auto_filter.ref = f"A{header_row}:I{ws.max_row}"
+        ws.auto_filter.ref = f"A{header_row}:K{ws.max_row}"
         ws.freeze_panes = f"A{header_row + 1}"
 
     buf = io.BytesIO()

@@ -212,7 +212,10 @@ async def _run_live_check_background(
                 db.commit()
             return
 
-        results["second_opinion_pending"] = True
+        # 2026-09-29 redesign: no separate second-opinion pass any more — the
+        # checking model already rated (and the backend already filtered)
+        # its own findings, so the check is final the moment it's saved.
+        results["second_opinion_pending"] = False
         record = db.get(models.MultiCheck, multi_check_id)
         if record is None:
             # Manager deleted/cancelled it while this was still running (see
@@ -226,8 +229,6 @@ async def _run_live_check_background(
         db.commit()
     finally:
         db.close()
-
-    await _run_second_opinion_background(multi_check_id, results)
 
 
 @app.get("/health")
@@ -628,6 +629,8 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         payload.source, payload.translation, payload.checks,
         lang_code=payload.target_lang,
     )
+    for f in findings:
+        f.setdefault("confidence", 100)  # algorithmic = certain, see excel_multi
     ai_findings, cost_usd = await run_ai_checks(
         payload.source, payload.translation, payload.checks, payload.extra_instructions,
         payload.target_lang, payload.source_lang,
@@ -901,14 +904,14 @@ async def multi_check(
     target_filter = {c.strip().lower() for c in target_langs.split(",") if c.strip()} or None
     resolved_source = pick_source_lang(sheets, source_lang.strip().lower() or None)
 
-    # Small/medium jobs run live, as before. Large ones go through
-    # Anthropic's Message Batches API instead — cheaper per token, but the
-    # AI findings aren't ready immediately (see BATCH_THRESHOLD_CHARS) —
-    # unless the manager ticked "Срочно", which forces the live path (and
-    # its full, non-discounted price) regardless of size.
-    volume = estimate_check_volume(sheets, resolved_source, target_filter)
-
-    if urgent or volume <= BATCH_THRESHOLD_CHARS:
+    # 2026-09-29 redesign: every upload runs through the live background path.
+    # Languages are now routed to different vendors (Claude or GPT, see
+    # claude_client.LANG_MODEL_TIER), and Anthropic's Message Batches queue
+    # can't run GPT-routed languages — so the old "large non-urgent upload →
+    # Anthropic batch" branch is retired for NEW checks ("Срочно" no longer
+    # changes anything). Batch jobs already in flight still finish through
+    # multi_check_detail as before.
+    if True:
         # The actual AI check now runs in the background too, instead of
         # being awaited right here — added 2026-09-26, after Александр
         # reported that "Failed to fetch" kept happening even after the
@@ -960,97 +963,6 @@ async def multi_check(
             "estimated_minutes": None,
             "checks_run": record.checks_run,
         }
-
-    requests, skeleton = build_batch_plan(
-        sheets, resolved_source, selected_checks, extra_instructions,
-        target_filter,
-    )
-    # Anthropic (or the network to it) failing here — a transient outage, a
-    # rate limit, a malformed request we didn't anticipate — is handled by
-    # the app-wide httpx.HTTPError handler below (see its comment for why
-    # this can't just be a local try/except): it turns into a clean,
-    # readable error instead of a raw crash that strips CORS headers.
-    batch_id = await submit_multi_check_batch(requests) if requests else None
-
-    if batch_id is None:
-        # Nothing to submit (no AI check types selected, or no API key
-        # configured) — the rule-based skeleton is already the final answer.
-        # In practice run_second_opinion returns instantly here (nothing but
-        # algorithmic findings to score — see its own docstring), but it's
-        # still deferred to the background for the same reason as the live
-        # path above: no request should ever have to wait on it.
-        results = await finalize_batch_results(skeleton, {})
-        results["second_opinion_pending"] = True
-        finished_at = datetime.datetime.now(datetime.timezone.utc)
-        record = models.MultiCheck(
-            project_id=project_id,
-            filename=file.filename or "upload.xlsx",
-            source_lang=resolved_source,
-            checks_run=selected_checks,
-            summary=results["summary"],
-            results=results,
-            status="completed",
-            performed_by_name=manager_name.strip(),
-            manager_id=manager_id,
-            cost_usd=results["summary"].get("cost_usd", 0.0),
-            created_at=started_at,
-            completed_at=finished_at,
-        )
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-        background_tasks.add_task(_run_second_opinion_background, record.id, results)
-        return {
-            "multi_check_id": record.id,
-            "status": "completed",
-            "source_lang": resolved_source,
-            "summary": results["summary"],
-            "sheets": results["sheets"],
-            "cost_usd": record.cost_usd,
-            "created_at": record.created_at.isoformat(),
-            "completed_at": record.completed_at.isoformat(),
-            "checks_run": record.checks_run,
-            "second_opinion_pending": True,
-        }
-
-    record = models.MultiCheck(
-        project_id=project_id,
-        filename=file.filename or "upload.xlsx",
-        source_lang=resolved_source,
-        checks_run=selected_checks,
-        summary={},
-        results={"skeleton": skeleton},
-        status="processing",
-        batch_id=batch_id,
-        performed_by_name=manager_name.strip(),
-        manager_id=manager_id,
-        # Real cost isn't known until the Anthropic batch ends — see
-        # multi_check_detail, which fills this in once it finalizes.
-        cost_usd=0.0,
-        batch_volume_chars=volume,
-        created_at=started_at,
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return {
-        "multi_check_id": record.id,
-        "status": "processing",
-        "source_lang": resolved_source,
-        # None of the batch's requests have run yet — this is just handed
-        # straight to Anthropic, so we already know the total (no API call
-        # needed to say "0 of N so far").
-        "progress": {"done": 0, "total": len(requests)},
-        # When the request counts stay flat for a while (Anthropic doesn't
-        # always update them until well into the batch), the UI falls back
-        # to showing how long the job has actually been waiting — a real,
-        # measured number, not a guessed ETA.
-        "created_at": record.created_at.isoformat(),
-        # A rough, non-binding ETA based on how long similarly-sized past
-        # batch jobs actually took — None until there's history to learn
-        # from. See _estimate_batch_minutes.
-        "estimated_minutes": _estimate_batch_minutes(db, volume),
-    }
 
 
 @app.get(

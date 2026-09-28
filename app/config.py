@@ -70,6 +70,23 @@ class Settings:
     # Override via the OPENAI_MODEL env var on Railway if OpenAI's
     # naming/pricing moves on.
     OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+    # --- Per-language model routing (2026-09-29, Александр's redesign) ---
+    # Every target language is checked end-to-end by ONE fixed model (see
+    # claude_client.LANG_MODEL_TIER): the same model does Step 1 search,
+    # Step 2 check with its own confidence percent, and the term-consistency
+    # pass. New setting names on purpose, so stale CLAUDE_MODEL/_HARD values
+    # already set on Railway can't silently override the new routing.
+    # Override any of these on Railway → Variables if a vendor renames a model.
+    MODEL_CLAUDE_OPUS: str = os.environ.get("MODEL_CLAUDE_OPUS", "claude-opus-5-5")
+    MODEL_CLAUDE_SONNET: str = os.environ.get("MODEL_CLAUDE_SONNET", "claude-sonnet-5")
+    MODEL_GPT_SOL: str = os.environ.get("MODEL_GPT_SOL", "gpt-5.6-sol")
+    MODEL_GPT_TERRA: str = os.environ.get("MODEL_GPT_TERRA", "gpt-5.6-terra")
+    # Findings the model itself rates below this (0-100) never reach the report.
+    CONFIDENCE_THRESHOLD: int = int(os.environ.get("CONFIDENCE_THRESHOLD", "40"))
+    # GPT reasoning effort: lighter for the Step 1 search pass, fuller for the
+    # Step 2 check that actually decides what goes into the report.
+    OPENAI_EFFORT_SEARCH: str = os.environ.get("OPENAI_EFFORT_SEARCH", "low").strip()
+    OPENAI_EFFORT_CHECK: str = os.environ.get("OPENAI_EFFORT_CHECK", "medium").strip()
     ALLOWED_ORIGINS: list[str] = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 
 
