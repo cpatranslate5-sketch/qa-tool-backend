@@ -15,7 +15,7 @@ from app.claude_client import (
     REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
-    _model_for_lang,
+    _model_for_task,
     _register_mixed_finding,
     _second_opinion_unexpected_error_warning,
     _truncation_warning,
@@ -921,12 +921,23 @@ async def _run_ai_chunks(
     lang: str,
     source_lang: str,
     semaphore: asyncio.Semaphore,
+    model_override: str | None = None,
 ) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
     """Runs every chunk of one language's items through the AI (bounded by
     the shared semaphore) and merges the per-chunk results back into a
     single {item index: findings} dict, with "_also_idx" indices shifted to
     match. Factored out of _check_language_for_sheet purely to share this
     chunking/merging logic between the live and batch code paths.
+
+    model_override: passed straight through to every chunk's own
+    run_ai_checks_batch call — see _check_language_for_sheet, which resolves
+    this ONCE per language (via claude_client._model_for_task, over the
+    language's full item list before chunking) rather than letting each
+    chunk pick its own model independently. A small task (see
+    _model_for_task) always fits in a single chunk anyway (SMALL_TASK_MAX_
+    ROWS is well under MAX_ROWS_PER_AI_CALL), so this is only ever a
+    single-chunk concern in practice, but resolving it once here keeps that
+    an implementation detail rather than something every caller has to know.
 
     The 4th return value, search_warnings, is Step 1's own ensemble
     warnings (see claude_client._ensemble_search_findings) — a language
@@ -938,7 +949,7 @@ async def _run_ai_chunks(
     async def _run_chunk(chunk_items: list[dict]) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
         async with semaphore:
             return await run_ai_checks_batch(
-                chunk_items, checks, extra_instructions, lang, source_lang,
+                chunk_items, checks, extra_instructions, lang, source_lang, model_override=model_override,
             )
 
     chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
@@ -1009,6 +1020,16 @@ async def _check_language_for_sheet(
     # check didn't.
     item_chunks = _chunk_list(ai_items, _chunk_size_for_lang(lang))
 
+    # Volume-based model tiering (2026-09-27, Александр's ask, the third of
+    # three cost fixes) — resolved ONCE per language, over the full item
+    # list (before chunking), and handed to every chunk via model_override
+    # below rather than letting _model_for_lang run again per chunk. See
+    # claude_client._model_for_task's own comment for the exact rule: a
+    # hard language is never affected by this regardless of size; a
+    # non-hard language tiers down to CLAUDE_MODEL_LIGHT/Haiku when this
+    # language's task is small (SMALL_TASK_MAX_ROWS/SMALL_TASK_MAX_WORDS).
+    model_for_lang = _model_for_task(lang, ai_items)
+
     # Terminology consistency (see claude_client.run_term_consistency_check's
     # own comment) is a separate, GPT-only, WHOLE-language pass — it needs to
     # see every row together, not one chunk at a time, so it can't be folded
@@ -1022,13 +1043,17 @@ async def _check_language_for_sheet(
     if "term_consistency" in checks:
         (ai_findings_by_idx, cost_usd, truncated, search_warnings), (term_grouped, term_cost, term_warning) = (
             await asyncio.gather(
-                _run_ai_chunks(item_chunks, checks, extra_instructions, lang, source_lang, semaphore),
+                _run_ai_chunks(
+                    item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
+                    model_override=model_for_lang,
+                ),
                 _term_consistency(),
             )
         )
     else:
         ai_findings_by_idx, cost_usd, truncated, search_warnings = await _run_ai_chunks(
             item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
+            model_override=model_for_lang,
         )
         term_grouped, term_cost, term_warning = {}, 0.0, None
     cost_usd += term_cost
@@ -1282,7 +1307,13 @@ def build_batch_plan(
             # reject the WHOLE batch — every language in it, not just the
             # bad one — with a 400). Rebuilt this way, custom_id is always
             # safe regardless of what's in the file.
-            model = _model_for_lang(lang)
+            # See claude_client._model_for_task's own comment — same
+            # volume-based tiering as the live path (_check_language_for_
+            # sheet), resolved the same way (over this language's full
+            # ai_items list before chunking): a hard language is unaffected
+            # regardless of size, a non-hard language tiers down to
+            # CLAUDE_MODEL_LIGHT/Haiku when this language's task is small.
+            model = _model_for_task(lang, ai_items)
             # See MAX_ROWS_PER_AI_CALL — one Message Batch REQUEST per
             # chunk of this language's rows, not one for the whole
             # language, for the same per-row-attention reason as the live

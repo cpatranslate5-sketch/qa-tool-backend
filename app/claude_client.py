@@ -85,11 +85,19 @@ CHECK_LABELS = {
         "документе: имя турнира/бренда должно оставаться в исходном написании без исключений. Единственное "
         "исключение — падежное/грамматическое окончание, добавленное К ТЕРМИНУ, ОСТАВЛЕННОМУ В СВОЁМ ИСХОДНОМ "
         "НАПИСАНИИ (например «Grand Prix'а», «iPhone'ов» — сам термин не тронут и не переписан другим алфавитом, "
-        "просто добавлено окончание по грамматике целевого языка): это НЕ ошибка. Если термин в переводе остался "
-        "ровно как в исходнике, в своём исходном написании (тем же алфавитом, что и в оригинале, при необходимости — "
-        "с окончанием по грамматике целевого языка) — это ПРАВИЛЬНО, находки быть не должно, даже если может "
-        "показаться, что его \"следовало\" перевести — не сообщай о том, что и так сделано верно. При конфликте с "
-        "«Особыми указаниями» ниже — следуй им"
+        "просто добавлено окончание по грамматике целевого языка): это НЕ ошибка — НО только при выполнении ОБОИХ "
+        "условий: (а) окончание присоединено через апостроф, а не через дефис и не слитно без разделителя, и (б) "
+        "само окончание — реально верная грамматическая форма для целевого языка (правильный падеж, а если в "
+        "целевом языке действует сингармонизм гласных — ещё и правильный по сингармонизму вариант окончания). Если "
+        "хотя бы одно из двух не выполнено — это уже не исключение, а настоящая находка по критерию «опечатки/ "
+        "ошибки» (неверная грамматическая форма/оформление), просто у неё в качестве якоря выступает термин, "
+        "оставленный в исходном написании. Реальный пример (казахский, 2026-09-27): «Onlyplay-ден» — дефис вместо "
+        "апострофа И неверный по сингармонизму вариант окончания («-ден» вместо «-нен» после «Onlyplay»); "
+        "правильный вариант — «Onlyplay'нен». Если термин в переводе остался ровно как в исходнике, в своём "
+        "исходном написании (тем же алфавитом, что и в оригинале, при необходимости — с окончанием по грамматике "
+        "целевого языка, присоединённым через апостроф и в верной форме) — это ПРАВИЛЬНО, находки быть не должно, "
+        "даже если может показаться, что его \"следовало\" перевести — не сообщай о том, что и так сделано верно. "
+        "При конфликте с «Особыми указаниями» ниже — следуй им"
     ),
     "completeness": (
         "неполнота перевода — ЛЮБОЙ случай, когда содержательный кусок исходного текста не дошёл до перевода: (1) "
@@ -306,25 +314,39 @@ SINGLE_PROMPT = _SINGLE_PROMPT_PREFIX + _SINGLE_PROMPT_SUFFIX
 
 # Split into PREFIX/SUFFIX — same reasoning as FINDINGS_SEARCH_PROMPT's own
 # split above, but the biggest win of the five: everything in PREFIX below
-# (target_lang_line, calibration, source_lang_note, extra_instructions,
-# checks_description, other_type_instruction, AND the two long static
-# paragraphs about cross-row duplicate reporting and never citing pair
-# numbers) is fixed for the WHOLE document/run, not just one language —
-# build_batch_prompt already computes every one of these before it even
-# knows which rows are in THIS particular chunk. Only {pairs_block} (the
-# actual rows) and {register_instructions} are truly per-chunk. That means
-# this prefix repeats byte-for-byte across every chunk of every language in
-# one multi-check — including, especially, the hard-language path
+# (calibration, source_lang_note, extra_instructions, checks_description,
+# other_type_instruction, AND the two long static paragraphs about
+# cross-row duplicate reporting and never citing pair numbers) is fixed for
+# the WHOLE document/run, not just one language — build_batch_prompt already
+# computes every one of these before it even knows which rows are in THIS
+# particular chunk OR which target language this particular call is for.
+# Only {target_lang_line}, {pairs_block} (the actual rows), and
+# {register_instructions} are truly per-call. That means this prefix
+# repeats byte-for-byte across EVERY chunk of EVERY language in one
+# multi-check — including, especially, the hard-language path
 # (MAX_ROWS_PER_AI_CALL_HARD = 1 row/call), where it would otherwise never
 # get to amortize across 15 rows the way a normal language's batches do.
-# BATCH_PROMPT itself is still the exact same text as before — no wording
-# or order changed, see _call_claude's own cache_prefix comment for why
-# that's what makes this safe to ship without a side-by-side accuracy test.
+#
+# {target_lang_line} moved out of this prefix and into the SUFFIX
+# (2026-09-27, Александр's cost-cutting ask, following up on the earlier
+# 2026-09-25 caching work): it used to sit right here, near the top — which
+# meant this whole several-thousand-token prefix differed, byte for byte,
+# for every single target language, since the language name is baked into
+# it from the very first paragraph on. That's fine for a single big
+# document in ONE language (this prefix still repeats across that
+# language's own chunks), but it defeated caching entirely for exactly
+# Александр's other very common case — a SMALL file checked across 20-30+
+# languages at once — where every language's call was really a full-price
+# "first" call, never a cached "repeat" one, because no two languages ever
+# shared an identical prefix. Moving the one truly per-language line to the
+# very end (right before the content it actually describes) lets this
+# entire block be issued ONCE per run and read back at ~10% price for every
+# other language, while nothing about WHAT gets checked or how strictly
+# changes — same instructions, same wording, just reordered so the
+# language-specific line no longer breaks the shared block.
 _BATCH_PROMPT_PREFIX = """Ты — модуль контроля качества перевода для бюро переводов. Даны пары (контекст, исходный текст, перевод) на один целевой язык.
 Проверяй только критерии из "Что проверять" ниже. По умолчанию оценивай каждую пару отдельно от остальных — но если
 описание конкретного критерия ниже прямо просит сравнить пары между собой, следуй этому описанию для этого критерия.
-
-{target_lang_line}
 
 {calibration}
 
@@ -362,7 +384,9 @@ _BATCH_PROMPT_PREFIX = """Ты — модуль контроля качеств�
 фразу или предложение из перевода), а не номера пар.
 
 """
-_BATCH_PROMPT_SUFFIX = """Пары для проверки:
+_BATCH_PROMPT_SUFFIX = """{target_lang_line}
+
+Пары для проверки:
 {pairs_block}
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив по всем парам без markdown и пояснений, строго в этой форме
@@ -398,18 +422,33 @@ BATCH_PROMPT = _BATCH_PROMPT_PREFIX + _BATCH_PROMPT_SUFFIX
 # at a time (see this constant's own comment above), so caching its prefix
 # matters most here: without it, this exact block of instructions would be
 # billed at full price on EVERY single row for hi/hing/mr/te/etc., with no
-# 15-row batch to spread it across the way normal languages get. Unlike
-# BATCH_PROMPT, checks_description/other_type_instruction sit AFTER the
-# per-row context/source/translation in this template's own field order —
-# so, same rule as SINGLE_PROMPT's own split, they stay out of the
-# cacheable prefix rather than reordering existing wording. extra_instructions
-# CAN join the prefix here, unlike in SINGLE_PROMPT, because this template
-# already places it before the row content. BATCH_PROMPT_SINGLE_ITEM itself
-# is still the exact same text as before.
+# 15-row batch to spread it across the way normal languages get.
+#
+# Restructured 2026-09-27 (Александр's cost-cutting ask, same investigation
+# as BATCH_PROMPT's own reordering above) — this used to be the WORST
+# offender of the three prompts for exactly his "many languages, tiny file"
+# case, for two separate reasons at once: (1) {target_lang_line} sat right
+# here near the top, same problem BATCH_PROMPT had, and (2)
+# checks_description/other_type_instruction (a multi-thousand-token block —
+# by far the largest single piece of any of these prompts) sat AFTER the
+# per-row context/source/translation, in the SUFFIX, not cached at ALL —
+# not even across that SAME language's own repeat chunks, since this
+# template is used precisely when there's only ONE row per call in the
+# first place. That combination meant a single-row, single-language check
+# — the hard-language path's normal case, and ANY language's case for a
+# genuinely tiny file — paid full price for the single biggest block of
+# text in the whole request, every single time, with no cache ever
+# helping. Both are fixed the same way BATCH_PROMPT's was: the one
+# genuinely per-language line (target_lang_line) moves to the very end of
+# the SUFFIX, and everything else that's actually fixed for the whole
+# run — including checks_description/other_type_instruction and the
+# "never cite pair numbers" paragraph, previously stranded in the suffix
+# for no reason other than historical wording order — moves into the
+# PREFIX, where BATCH_PROMPT already keeps it. No instruction's wording
+# changed, only where it sits; extra_instructions already lived in this
+# prefix before today's change.
 _BATCH_PROMPT_SINGLE_ITEM_PREFIX = """Ты — модуль контроля качества перевода для бюро переводов. Дана одна пара (контекст, исходный текст, перевод).
 Проверяй только критерии из "Что проверять" ниже.
-
-{target_lang_line}
 
 {calibration}
 
@@ -418,20 +457,23 @@ _BATCH_PROMPT_SINGLE_ITEM_PREFIX = """Ты — модуль контроля к�
 Особые указания к задаче (важнее общих правил, если есть):
 {extra_instructions}
 
-"""
-_BATCH_PROMPT_SINGLE_ITEM_SUFFIX = """Контекст: {context}
-Исходный текст:
-\"\"\"{source}\"\"\"
-
-Перевод:
-\"\"\"{translation}\"\"\"
-{prior_findings}
 Что проверять: {checks_description}
 {other_type_instruction}
 
 Важно про сам текст "message": НИКОГДА не упоминай в нём номер пары/строки — ни словом ("пара 1", "строка 1"), ни
 просто числом в скобках. Если нужно различить конкретные места (например, при нескольких предложениях в одном
 тексте) — используй ТОЛЬКО цитаты самого текста (конкретную фразу или предложение), а не номер.
+
+"""
+_BATCH_PROMPT_SINGLE_ITEM_SUFFIX = """{target_lang_line}
+
+Контекст: {context}
+Исходный текст:
+\"\"\"{source}\"\"\"
+
+Перевод:
+\"\"\"{translation}\"\"\"
+{prior_findings}
 {register_instructions}
 Верни ТОЛЬКО валидный JSON-массив без markdown и пояснений, строго в этой форме
 (пустой массив [], если проблем нет{register_array_note}):
@@ -478,16 +520,24 @@ BATCH_PROMPT_SINGLE_ITEM = _BATCH_PROMPT_SINGLE_ITEM_PREFIX + _BATCH_PROMPT_SING
 # in the first place.
 # Split into PREFIX/SUFFIX (2026-09-25, Александр's cost-cutting ask) so
 # _search_findings/_search_findings_openai can hand _call_claude the exact
-# leading substring that's byte-identical across every chunk of the SAME
-# language (target_lang_line and source_lang_note are both fixed for a
-# whole run) — Anthropic's prompt caching then bills that repeated prefix
-# at ~10% of its normal price on every call after the first, instead of
-# full price every time. FINDINGS_SEARCH_PROMPT itself (below) is still
-# the exact same byte-for-byte text as before — just prefix+suffix glued
-# back together — so every existing caller/test that reads
-# FINDINGS_SEARCH_PROMPT directly (model_comparison.py, smoketest.py) is
-# unaffected. No wording or ordering changed — see _call_claude's own
-# cache_prefix comment for why this is safe.
+# leading substring that's byte-identical across every call — Anthropic's
+# prompt caching then bills that repeated prefix at ~10% of its normal
+# price on every call after the first, instead of full price every time.
+#
+# {target_lang_line} moved from this prefix into the SUFFIX 2026-09-27
+# (Александр's cost-cutting ask) — see _BATCH_PROMPT_PREFIX's own comment
+# for the full rationale (same fix, same reason): keeping it here meant
+# this prefix was byte-identical only across chunks of the SAME language,
+# never across the many DIFFERENT languages one multi-check actually
+# checks, which is exactly the case that costs the most relative to how
+# little text is involved. source_lang_note stays here — it depends only
+# on the source language and the selected checks, both fixed for the whole
+# run regardless of which target language a given call is for.
+# FINDINGS_SEARCH_PROMPT itself (below) is still the exact same wording as
+# before — just reassembled in a different prefix/suffix split — so every
+# existing caller/test that reads FINDINGS_SEARCH_PROMPT directly
+# (model_comparison.py, smoketest.py) still sees identical instructions,
+# just with the target-language line later in the text than before.
 _FINDINGS_SEARCH_PROMPT_PREFIX = """Ты — опытный редактор переводов. Даны пары (контекст, исходный текст, перевод).
 Прочитай их совершенно свободно, БЕЗ заранее заданного списка типов ошибок и БЕЗ формальной шкалы уверенности —
 просто внимательно сверь каждую пару и отметь всё, что кажется тебе неправильным, сомнительным, нелогичным или
@@ -495,12 +545,12 @@ _FINDINGS_SEARCH_PROMPT_PREFIX = """Ты — опытный редактор п�
 что угодно, вплоть до мелочей. Отметить лишнее не страшно (это перепроверят и при необходимости отсеют на
 следующем шаге) — а вот промолчать о том, что реально не так, нежелательно.
 
-{target_lang_line}
-
 {source_lang_note}
 
 """
-_FINDINGS_SEARCH_PROMPT_SUFFIX = """Пары для проверки:
+_FINDINGS_SEARCH_PROMPT_SUFFIX = """{target_lang_line}
+
+Пары для проверки:
 {pairs_block}
 
 Для каждой пары, где ты что-то заметил, напиши отдельную строку в формате:
@@ -615,13 +665,17 @@ async def _search_findings(
     if not checkable:
         return {}, 0.0
     # cache_prefix: see _FINDINGS_SEARCH_PROMPT_PREFIX's own comment — fixed
-    # per (target_lang, source_lang), so it repeats across every chunk of
-    # the same language's Step 1 calls within one run.
+    # per (source_lang, checks), so it repeats not just across every chunk
+    # of one language's Step 1 calls, but across every DIFFERENT target
+    # language in the same run too (target_lang_line lives in the suffix
+    # now, precisely so it no longer breaks that sharing).
     cache_prefix = _FINDINGS_SEARCH_PROMPT_PREFIX.format(
-        target_lang_line=_target_lang_line(target_lang),
         source_lang_note=_source_lang_note(source_lang),
     )
-    prompt = cache_prefix + _FINDINGS_SEARCH_PROMPT_SUFFIX.format(pairs_block=_pairs_block(checkable))
+    prompt = cache_prefix + _FINDINGS_SEARCH_PROMPT_SUFFIX.format(
+        target_lang_line=_target_lang_line(target_lang),
+        pairs_block=_pairs_block(checkable),
+    )
     model = model_override or _model_for_lang(target_lang)
     text_block, usage, _stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
     return _parse_search_findings(text_block, checkable), _usage_cost(model, usage)
@@ -1464,6 +1518,71 @@ def _is_hard_language(target_lang: str) -> bool:
     return target_lang.strip().lower().split("-")[0] in HARD_LANGUAGE_BASES
 
 
+# 2026-09-27, volume-based model tiering — the third of three fixes from
+# Александр's real cost complaint (~$2 for a 7-word source checked against
+# ~30 languages, only 7 findings total). His own framing, from the start of
+# that conversation, was "задачи до 50 слов в одном языке" (tasks under 50
+# words in one language) — reused directly here rather than picking a
+# fresh number. A LANGUAGE (not the whole upload) counts as a small task
+# when it has few enough checkable rows AND few enough source words that a
+# lighter model is worth trying — see _is_small_task below for the exact
+# rule and _model_for_task for how it's actually applied.
+#
+# Deliberately excludes hard languages (HARD_LANGUAGE_BASES) no matter how
+# small the task — Александр's explicit call, given the real, documented
+# Marathi "отыгрыш" case (HARD_LANGUAGE_BASES's own comment): Opus caught
+# it 2/3 of the time on a SINGLE isolated row while Sonnet missed it 0/3 —
+# i.e. Opus's advantage over a weaker model held even in the smallest
+# possible task. Downgrading further for a hard language on top of that
+# would risk repeating exactly the mistake that comment already documents,
+# with no fresh evidence it's safe. So hard languages stay on
+# CLAUDE_MODEL_HARD (Opus) unconditionally, small task or not; only
+# non-hard languages (where no such documented risk exists) get tiered
+# down to CLAUDE_MODEL_LIGHT (Haiku) when the task is small.
+SMALL_TASK_MAX_ROWS = 3
+SMALL_TASK_MAX_WORDS = 50
+
+
+def _is_small_task(items: list[dict]) -> bool:
+    """True when a language's checkable (translated) rows are few enough,
+    and short enough in total SOURCE word count, that a lighter model is
+    worth trying instead of CLAUDE_MODEL/Sonnet — see this module's own
+    comment above SMALL_TASK_MAX_ROWS for the exact numbers and their
+    origin. Word count is a simple whitespace split on the source text
+    only (not the translation) — matches how Александр himself described
+    the trigger case ("7 слов в исходнике"). An empty language (nothing
+    checkable at all) is never "small" in this sense — there's no AI call
+    to tier in the first place, build_batch_prompt/run_ai_checks_batch
+    already return early for it regardless of model choice."""
+    checkable = _checkable_items(items)
+    if not checkable or len(checkable) > SMALL_TASK_MAX_ROWS:
+        return False
+    total_words = sum(len(it["source"].split()) for _, it in checkable)
+    return total_words <= SMALL_TASK_MAX_WORDS
+
+
+def _model_for_task(target_lang: str, items: list[dict]) -> str:
+    """The real per-call model choice for the multi-check pipeline (both
+    the live path — app.excel_multi._check_language_for_sheet, threaded
+    through as run_ai_checks_batch's model_override — and the Message
+    Batches path — app.excel_multi.build_batch_plan) — supersedes calling
+    _model_for_lang directly so BOTH levers (hard-language routing AND
+    task-size tiering) are decided in exactly one place. A hard language
+    always gets _model_for_lang's own answer (CLAUDE_MODEL_HARD/Opus),
+    completely unaffected by `items` — see _is_small_task's own comment for
+    why. A non-hard language gets CLAUDE_MODEL_LIGHT/Haiku when `items`
+    qualifies as a small task, otherwise the normal CLAUDE_MODEL/Sonnet via
+    _model_for_lang. Step 1 (_ensemble_search_findings, inside
+    run_ai_checks_batch) receives the exact same resolved model via its own
+    model_override passthrough — a small task is small for both steps of
+    the pipeline, not just the structured check."""
+    if _is_hard_language(target_lang):
+        return _model_for_lang(target_lang)
+    if _is_small_task(items):
+        return settings.CLAUDE_MODEL_LIGHT
+    return _model_for_lang(target_lang)
+
+
 # USD per single token (not per million) — verified against
 # platform.claude.com/docs/en/about-claude/pricing. Keyed by the exact
 # model id, since that's what actually gets billed; if CLAUDE_MODEL or
@@ -2033,10 +2152,14 @@ async def run_ai_checks_batch(
     complete one.
 
     model_override: bypass the normal _model_for_lang(target_lang)
-    selection and force a specific model id instead. Added 2026-09-22
-    for app.model_comparison's diagnostic tool only (see its own
-    comment) — every real production caller leaves this None and gets
-    the normal per-language model choice, unaffected.
+    selection and force a specific model id instead. Added 2026-09-22 for
+    app.model_comparison's diagnostic tool only — every real production
+    caller left this None back then. Since 2026-09-27, app.excel_multi's
+    live path (_check_language_for_sheet) ALSO passes this — resolved once
+    per language via _model_for_task (hard-language routing AND small-task
+    tiering combined), rather than always None — so a production caller
+    genuinely forcing a model through here is now expected, not just a
+    diagnostic-only affordance.
 
     Findings keyed by index here still include any REGISTER_VALUE_TYPE
     entries mixed in with real findings — app.excel_multi extracts and
@@ -2366,10 +2489,25 @@ async def run_term_consistency_check(items: list[dict]) -> tuple[dict[int, list[
     real Excel row numbers with no new merging code; extra cost_usd this
     added; a warning finding — see _term_consistency_failure_warning —
     only when GPT was configured but this call failed). Returns
-    ({}, 0.0, None) immediately for an empty language, or when
-    OPENAI_API_KEY isn't configured at all (silent non-contribution, same
-    as every other GPT-only branch in this file)."""
+    ({}, 0.0, None) immediately for an empty language, for a language with
+    fewer than 2 rows that actually have a translation to compare (see
+    below), or when OPENAI_API_KEY isn't configured at all (silent non-
+    contribution, same as every other GPT-only branch in this file)."""
     if not items:
+        return {}, 0.0, None
+    # 2026-09-27, Александр's cost investigation (~$2 for a 7-word/30-
+    # language check): this pass structurally CANNOT find anything with
+    # fewer than two comparable rows — it looks for the same source term
+    # translated two different ways, and its own prompt above tells the
+    # model exactly that ("rows" — минимум два). A single-row-per-language
+    # multi-check (the common "small task" case — most of Александр's real
+    # uploads check many languages against a short file) was still paying
+    # for a whole extra GPT call per language here that could never
+    # possibly return a finding. Rows with no translation at all can't be
+    # compared either, so the count that matters is checkable rows
+    # (non-empty translation — same definition _checkable_items uses for
+    # the Anthropic pipeline), not raw row count.
+    if len(_checkable_items(items)) < 2:
         return {}, 0.0, None
     capped = items[:MAX_ROWS_FOR_TERM_CONSISTENCY]
     numbered_rows = "\n".join(

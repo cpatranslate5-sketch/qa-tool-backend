@@ -34,6 +34,21 @@ class Settings:
     # has this env var set from an earlier trial (e.g. to a Sonnet id),
     # that value wins over this default and must be updated there too.
     CLAUDE_MODEL_HARD: str = os.environ.get("CLAUDE_MODEL_HARD", "claude-opus-5")
+    # 2026-09-27 (Александр's ask): a lighter/cheaper model for the OPPOSITE
+    # case from CLAUDE_MODEL_HARD above — a small task (see
+    # app.claude_client.SMALL_TASK_MAX_ROWS/_is_small_task) in a language
+    # that ISN'T on HARD_LANGUAGE_BASES gets tiered DOWN to this model
+    # instead of CLAUDE_MODEL/Sonnet. Defaults to the same Haiku id
+    # CLAUDE_MODEL itself used before 2026-09-16 (see that setting's own
+    # comment) — a known-good, already-priced model id (see
+    # claude_client.MODEL_PRICING_PER_TOKEN), not a guess. If Alexander
+    # later wants the newer "-5"-generation Haiku to match CLAUDE_MODEL/
+    # CLAUDE_MODEL_HARD's own naming (once Anthropic's real id for it is
+    # confirmed), set CLAUDE_MODEL_LIGHT on Railway to that id AND add its
+    # price to MODEL_PRICING_PER_TOKEN at the same time — exactly the two
+    # steps CLAUDE_MODEL_HARD's own bug comment above describes skipping
+    # once already, which silently showed $0 for a real, non-zero bill.
+    CLAUDE_MODEL_LIGHT: str = os.environ.get("CLAUDE_MODEL_LIGHT", "claude-haiku-4-5-20251001")
     # Added 2026-09-23 (Александр's ask): a GPT model joins Sonnet on Step 1
     # of the search (see claude_client._ensemble_search_findings) for model-
     # family diversity — Kyrgyz detection kept feeling inconsistent even on

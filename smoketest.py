@@ -1590,6 +1590,145 @@ print("[OK] _model_for_lang: confirmed the 15-language hard list (ar/bn/el/hi/hi
       "CLAUDE_MODEL (Sonnet), and that _is_hard_language recognizes the exact same list for the separate "
       "chunk-size decision")
 
+# --- Volume-based model tiering (2026-09-27, the third of three fixes from
+# Александр's real cost complaint): a non-hard language whose task is small
+# (few checkable rows, short in total source words) tiers down to
+# CLAUDE_MODEL_LIGHT/Haiku; a hard language is NEVER tiered down regardless
+# of size, given the documented real Marathi risk (HARD_LANGUAGE_BASES's
+# own comment). ---
+from app.claude_client import _is_small_task, _model_for_task, SMALL_TASK_MAX_ROWS, SMALL_TASK_MAX_WORDS
+
+_st_one_short = [{"context": "a", "source": "Фрибет без отыгрыша", "translation": "पैज न लावता फ्री बेट"}]
+assert _is_small_task(_st_one_short), _st_one_short
+assert SMALL_TASK_MAX_ROWS >= 1 and SMALL_TASK_MAX_WORDS >= 3
+
+_st_empty: list[dict] = []
+assert not _is_small_task(_st_empty), "an empty language has no AI call to tier at all, never counts as 'small'"
+
+_st_untranslated_only = [{"context": "a", "source": "hi", "translation": ""}]
+assert not _is_small_task(_st_untranslated_only), (
+    "a language with rows but nothing actually checkable is not a 'small task' either — there's no AI call for "
+    "it, same reasoning as the empty case"
+)
+
+_st_too_many_rows = [
+    {"context": str(i), "source": "hi", "translation": "привет"} for i in range(SMALL_TASK_MAX_ROWS + 1)
+]
+assert not _is_small_task(_st_too_many_rows), (
+    f"one more checkable row than SMALL_TASK_MAX_ROWS ({SMALL_TASK_MAX_ROWS}) must no longer count as small"
+)
+
+_st_too_many_words = [
+    {"context": "a", "source": " ".join(["слово"] * (SMALL_TASK_MAX_WORDS + 1)), "translation": "word word"},
+]
+assert not _is_small_task(_st_too_many_words), (
+    f"one source word over SMALL_TASK_MAX_WORDS ({SMALL_TASK_MAX_WORDS}) must no longer count as small, even "
+    f"with just a single row"
+)
+
+_st_untranslated_rows_dont_count_toward_word_total = [
+    {"context": "a", "source": "Фрибет без отыгрыша", "translation": "पैज न लावता फ्री बेट"},
+    {"context": "b", "source": " ".join(["слово"] * (SMALL_TASK_MAX_WORDS + 20)), "translation": ""},
+]
+assert _is_small_task(_st_untranslated_rows_dont_count_toward_word_total), (
+    "an untranslated row's source text must not count toward the word total either — it's not checkable, so "
+    "there's no AI call spent on it regardless of how long its source text is"
+)
+print(f"[OK] _is_small_task: a language counts as a small task with at most {SMALL_TASK_MAX_ROWS} checkable "
+      f"(translated) rows totalling at most {SMALL_TASK_MAX_WORDS} source words — an empty or entirely-"
+      f"untranslated language is never 'small' (no AI call to tier), and an untranslated row's source text "
+      f"doesn't count toward the word total")
+
+for hard_lang in ["mr", "hi-IN", "th"]:
+    assert _model_for_task(hard_lang, _st_one_short) == settings.CLAUDE_MODEL_HARD, (
+        f"a hard language must stay on CLAUDE_MODEL_HARD/Opus even for a tiny 1-row task — this is exactly the "
+        f"real documented Marathi case (HARD_LANGUAGE_BASES's own comment): Opus's advantage held even on a "
+        f"single isolated row, so task size must never downgrade a hard language, got {hard_lang}"
+    )
+    assert _model_for_task(hard_lang, _st_too_many_rows) == settings.CLAUDE_MODEL_HARD, hard_lang
+
+for normal_lang in ["ru", "en", "es-mx", "fr"]:
+    assert _model_for_task(normal_lang, _st_one_short) == settings.CLAUDE_MODEL_LIGHT, (
+        f"a non-hard language with a small task must tier down to CLAUDE_MODEL_LIGHT/Haiku, got {normal_lang}"
+    )
+    assert _model_for_task(normal_lang, _st_too_many_rows) == settings.CLAUDE_MODEL, (
+        f"a non-hard language whose task ISN'T small must still get the normal CLAUDE_MODEL/Sonnet, unaffected "
+        f"by this new tiering, got {normal_lang}"
+    )
+print("[OK] _model_for_task: a hard language (HARD_LANGUAGE_BASES) always gets CLAUDE_MODEL_HARD/Opus regardless "
+      "of task size — never tiered down, per Александр's explicit call given the documented Marathi risk — while "
+      "a non-hard language tiers down to CLAUDE_MODEL_LIGHT/Haiku only when _is_small_task says so, and keeps "
+      "the normal CLAUDE_MODEL/Sonnet otherwise")
+
+# Integration: the live path (_check_language_for_sheet) must actually pass
+# the resolved model through to the real API call, for both a small non-
+# hard language (tiered to Haiku) and a small HARD language (still Opus,
+# never tiered) — captured via a fake _call_claude, not just unit-tested
+# in isolation above.
+from app.excel_multi import _check_language_for_sheet, build_batch_plan
+
+_st_seen_models: list[str] = []
+
+
+async def _fake_call_claude_capture_model(prompt, model=None, cache_prefix=None):
+    _st_seen_models.append(model)
+    return '[{"row": 1, "type": "typo", "severity": "low", "message": "тест"}]', {
+        "input_tokens": 20, "output_tokens": 10,
+    }, "end_turn"
+
+
+_st_sheet_small_normal = {
+    "sheet_name": "Sheet1", "languages": ["ru", "fr"],
+    "rows": [{"excel_row": 2, "context": "a", "max_length": None, "values": {"ru": "Привет", "fr": "Salut"}}],
+}
+claude_client_mod._call_claude = _fake_call_claude_capture_model
+asyncio.run(_check_language_for_sheet(_st_sheet_small_normal, "fr", "ru", ["typo"], "", asyncio.Semaphore(5)))
+claude_client_mod._call_claude = _previous_call_claude
+assert settings.CLAUDE_MODEL_LIGHT in _st_seen_models and settings.CLAUDE_MODEL not in _st_seen_models, (
+    f"a small task in a non-hard language must reach the real API call under CLAUDE_MODEL_LIGHT/Haiku, not "
+    f"Sonnet — got models {_st_seen_models}"
+)
+
+_st_seen_models.clear()
+_st_sheet_small_hard = {
+    "sheet_name": "Sheet1", "languages": ["ru", "mr"],
+    "rows": [{"excel_row": 2, "context": "a", "max_length": None, "values": {"ru": "Привет", "mr": "नमस्कार"}}],
+}
+claude_client_mod._call_claude = _fake_call_claude_capture_model
+asyncio.run(_check_language_for_sheet(_st_sheet_small_hard, "mr", "ru", ["typo"], "", asyncio.Semaphore(5)))
+claude_client_mod._call_claude = _previous_call_claude
+assert _st_seen_models and all(m == settings.CLAUDE_MODEL_HARD for m in _st_seen_models), (
+    f"a small task in a HARD language must still reach the real API call under CLAUDE_MODEL_HARD/Opus, never "
+    f"downgraded just because the task happens to be tiny — got models {_st_seen_models}"
+)
+print("[OK] _check_language_for_sheet (live path): a small task really does reach the real API call under "
+      "CLAUDE_MODEL_LIGHT/Haiku for a non-hard language, and stays on CLAUDE_MODEL_HARD/Opus for a hard "
+      "language even when that language's own task is just as small — proven end-to-end, not just at the "
+      "_model_for_task unit level")
+
+# Same proof for the OTHER path — build_batch_plan (Message Batches, large
+# uploads) — which resolves its own model independently (it doesn't go
+# through _check_language_for_sheet at all).
+_st_batch_sheet = {
+    "sheet_name": "Sheet1", "languages": ["ru", "fr", "mr"],
+    "rows": [{"excel_row": 2, "context": "a", "max_length": None, "values": {
+        "ru": "Привет", "fr": "Salut", "mr": "नमस्कार",
+    }}],
+}
+_st_batch_requests, _ = build_batch_plan([_st_batch_sheet], "ru", ["typo"], "", None)
+_st_batch_models_by_lang = {r["custom_id"].split("-")[1]: r["model"] for r in _st_batch_requests}
+assert _st_batch_models_by_lang["t0"] == settings.CLAUDE_MODEL_LIGHT, (
+    f"build_batch_plan must tier a small non-hard-language task to CLAUDE_MODEL_LIGHT/Haiku too, got "
+    f"{_st_batch_models_by_lang}"
+)
+assert _st_batch_models_by_lang["t1"] == settings.CLAUDE_MODEL_HARD, (
+    f"build_batch_plan must keep a hard language on CLAUDE_MODEL_HARD/Opus even for a tiny task, got "
+    f"{_st_batch_models_by_lang}"
+)
+print("[OK] build_batch_plan (Message Batches path): resolves the exact same volume-based tiering independently "
+      "of _check_language_for_sheet — a small non-hard-language task gets CLAUDE_MODEL_LIGHT/Haiku, a hard "
+      "language stays on CLAUDE_MODEL_HARD/Opus regardless of task size")
+
 # --- MODEL_PRICING_PER_TOKEN / _usage_cost: Александр's real bug
 # (2026-09-17) — CLAUDE_MODEL on Railway had already moved on to
 # "claude-sonnet-5", but this table only listed the two older model ids,
@@ -2204,6 +2343,29 @@ print("[OK] «непереводимые термины» now also explicitly co
       "an incomplete translation on one row while identical untranslated 'FS' went unflagged on two other "
       "rows of the same document — routes to the 'always correct, never a finding' untranslatable-term rule "
       "instead of «неполнота перевода», which now explicitly excludes it too")
+
+# --- untranslatable, take four: Александр's real feedback (2026-09-27,
+# Kazakh) — a translator wrote «Onlyplay-ден» for a Latin-script brand name
+# with a Kazakh case ending attached: a HYPHEN instead of an apostrophe, AND
+# the wrong vowel-harmony variant of the ending («-ден» instead of «-нен»
+# after «Onlyplay» — correct would be «Onlyplay'нен»). The old exception
+# wording only said "a grammatical ending added to an untouched term is not
+# an error", with no requirement on HOW it's attached or whether the ending
+# itself is actually correct — a model could read that as blanket cover for
+# ANY ending in ANY shape, hyphen included, as long as the base term itself
+# was left alone. Tightened to two explicit conditions (apostrophe, not a
+# hyphen or no separator at all; AND the ending itself is a genuinely
+# correct grammatical form, including the right vowel-harmony variant where
+# the target language has vowel harmony) — failing either one is now a real
+# «опечатки/ошибки» finding, not covered by this exception at all. ---
+assert "апостроф, а не через дефис" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "сингармонизм" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+assert "Onlyplay'нен" in CHECK_LABELS["untranslatable"], CHECK_LABELS["untranslatable"]
+print("[OK] «непереводимые термины»: the grammatical-ending exception now explicitly requires an apostrophe "
+      "(never a hyphen or no separator) AND a genuinely correct ending (right case, right vowel-harmony "
+      "variant where the target language has one) — a real Kazakh miss («Onlyplay-ден» instead of "
+      "«Onlyplay'нен») is now a real finding under «опечатки/ошибки» instead of silently exempted just "
+      "because the brand name itself was left untouched")
 
 # --- completeness: Александр's real feedback (2026-09-17) — the check was
 # missing cases where a whole sentence/chunk of the source was dropped
@@ -5883,6 +6045,52 @@ assert _tc_empty_grouped == {} and _tc_empty_cost == 0.0 and _tc_empty_warn is N
 )
 print("[OK] run_term_consistency_check: an empty item list returns ({}, 0.0, None) immediately, no GPT call")
 
+# 2026-09-27, Александр's cost investigation: a language with 0 or 1
+# CHECKABLE (translated) rows can never structurally produce a cross-row
+# finding — this check's own prompt requires "минимум два" — so it must
+# skip the GPT call entirely rather than spending one to learn nothing.
+# A fake OPENAI_API_KEY is configured and _call_openai is replaced with one
+# that RAISES if actually invoked, so this proves the early-return itself
+# skips the call — not merely that an unconfigured key would have anyway.
+async def _fake_call_openai_tc_should_not_run(prompt, model=None):
+    raise AssertionError("must not call GPT when there are fewer than 2 checkable rows to compare")
+
+
+_tc_single_row = [
+    {"context": "score1", "source": "Ваши баллы: 10", "translation": "Your points: 10"},
+]
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_openai = _fake_call_openai_tc_should_not_run
+_tc_single_grouped, _tc_single_cost, _tc_single_warn = asyncio.run(run_term_consistency_check(_tc_single_row))
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _tc_single_grouped == {} and _tc_single_cost == 0.0 and _tc_single_warn is None, (
+    _tc_single_grouped, _tc_single_cost, _tc_single_warn
+)
+print("[OK] run_term_consistency_check: a language with exactly ONE checkable (translated) row skips the GPT "
+      "call entirely (the fake would raise if called) and returns ({}, 0.0, None) — a single-row-per-language "
+      "multi-check (the common small-task case) no longer pays for a check that could never find anything")
+
+# Same skip must apply when there are several ROWS but fewer than two of
+# them actually have a translation — an untranslated row can't be compared
+# either, so raw row count isn't what matters, checkable row count is.
+_tc_mostly_empty = [
+    {"context": "score1", "source": "Ваши баллы: 10", "translation": "Your points: 10"},
+    {"context": "greeting", "source": "Добро пожаловать!", "translation": ""},
+    {"context": "score2", "source": "Начислено баллов: 5", "translation": "   "},
+]
+settings.OPENAI_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_openai = _fake_call_openai_tc_should_not_run
+_tc_me_grouped, _tc_me_cost, _tc_me_warn = asyncio.run(run_term_consistency_check(_tc_mostly_empty))
+claude_client_mod._call_openai = _previous_call_openai
+settings.OPENAI_API_KEY = ""
+assert _tc_me_grouped == {} and _tc_me_cost == 0.0 and _tc_me_warn is None, (
+    _tc_me_grouped, _tc_me_cost, _tc_me_warn
+)
+print("[OK] run_term_consistency_check: the <2 skip counts CHECKABLE (non-empty-translation) rows, not raw row "
+      "count — two untranslated rows alongside one real translation still skip the GPT call (the fake would "
+      "raise if called)")
+
 _tc_items = [
     {"context": "score1", "source": "Ваши баллы: 10", "translation": "Your points: 10"},
     {"context": "greeting", "source": "Добро пожаловать!", "translation": "Welcome!"},
@@ -6100,6 +6308,75 @@ for _prefix, _suffix, _full, _name in [
 print("[OK] every prompt-caching PREFIX/SUFFIX split (FINDINGS_SEARCH_PROMPT, SINGLE_PROMPT, BATCH_PROMPT, "
       "BATCH_PROMPT_SINGLE_ITEM, SECOND_OPINION_PROMPT) still reconstructs byte-for-byte the exact same full "
       "prompt text as before caching existed — the model reads identical text either way, only billing changes")
+
+# 2026-09-27, Александр's real complaint (~$2 for a 7-word/30-language
+# check): {target_lang_line} used to sit INSIDE every one of these three
+# cache_prefix templates, so the "cached" prefix was never actually
+# byte-identical across two DIFFERENT target languages in the same
+# multi-check run — only across repeated chunks of the SAME language. Since
+# Александр's dominant real usage is "one small file, many languages", not
+# "one language, many chunks", this meant caching barely ever paid off for
+# the actual dominant cost driver. target_lang_line now lives in each
+# template's SUFFIX instead (see _BATCH_PROMPT_SUFFIX/_BATCH_PROMPT_SINGLE_
+# ITEM_SUFFIX/_FINDINGS_SEARCH_PROMPT_SUFFIX's own comments) specifically so
+# the prefix — calibration, checks_description, the whole large fixed
+# instruction block — can now be written ONCE by Anthropic's cache and read
+# cheaply for every subsequent language, not just every subsequent chunk.
+# Prove that directly: build the SAME items/checks/source_lang through two
+# DIFFERENT target languages and require an identical cache_prefix back.
+_cache_share_one_item = [{"context": "freebet", "source": "Фрибет без отыгрыша", "translation": "पैज न लावता फ्री बेट"}]
+_cache_share_two_items = [
+    {"context": "a", "source": "Hello", "translation": "Привет"},
+    {"context": "b", "source": "World", "translation": "Мир"},
+]
+
+_cs_one_hi_prompt, _cs_one_hi_cache, _ = _build_batch_prompt_direct(_cache_share_one_item, ["typo"], "", "hi", "ru")
+_cs_one_fr_prompt, _cs_one_fr_cache, _ = _build_batch_prompt_direct(_cache_share_one_item, ["typo"], "", "fr", "ru")
+assert _cs_one_hi_cache == _cs_one_fr_cache, (
+    "BATCH_PROMPT_SINGLE_ITEM's cache_prefix must be identical across different target languages (same items/"
+    "checks/source_lang) — this single-row path is THE common case for a small task, and used to be the worst "
+    "offender: it embedded target_lang_line early AND never cached checks_description at all"
+)
+assert _cs_one_hi_prompt.startswith(_cs_one_hi_cache) and _cs_one_fr_prompt.startswith(_cs_one_fr_cache)
+assert "Что проверять" in _cs_one_hi_cache, (
+    "checks_description must now actually live in the single-item cache_prefix, not just the identical-across-"
+    "languages suffix — otherwise the biggest cost block in this template still wouldn't benefit from caching"
+)
+
+_cs_two_hi_prompt, _cs_two_hi_cache, _ = _build_batch_prompt_direct(_cache_share_two_items, ["typo"], "", "hi", "ru")
+_cs_two_fr_prompt, _cs_two_fr_cache, _ = _build_batch_prompt_direct(_cache_share_two_items, ["typo"], "", "fr", "ru")
+assert _cs_two_hi_cache == _cs_two_fr_cache, (
+    "BATCH_PROMPT's cache_prefix must likewise be identical across different target languages (same items/"
+    "checks/source_lang) — target_lang_line must no longer sit inside it"
+)
+assert _cs_two_hi_prompt.startswith(_cs_two_hi_cache) and _cs_two_fr_prompt.startswith(_cs_two_fr_cache)
+
+# Step 1 (FINDINGS_SEARCH_PROMPT/_search_findings) needs the same proof —
+# capture the cache_prefix it actually hands _call_claude for two different
+# target languages and require them identical, with zero real API calls.
+from app.claude_client import _search_findings
+
+_cs_step1_seen_prefixes: list[str] = []
+
+
+async def _fake_call_claude_capture_cache_prefix(prompt, model=None, cache_prefix=None):
+    _cs_step1_seen_prefixes.append(cache_prefix)
+    return "1: тест", {"input_tokens": 5, "output_tokens": 5}, "end_turn"
+
+
+claude_client_mod._call_claude = _fake_call_claude_capture_cache_prefix
+asyncio.run(_search_findings(_cache_share_one_item, target_lang="hi", source_lang="ru"))
+asyncio.run(_search_findings(_cache_share_one_item, target_lang="fr", source_lang="ru"))
+claude_client_mod._call_claude = _previous_call_claude
+assert len(_cs_step1_seen_prefixes) == 2 and _cs_step1_seen_prefixes[0] == _cs_step1_seen_prefixes[1], (
+    f"_search_findings' cache_prefix (Step 1) must be identical across different target languages — got "
+    f"{_cs_step1_seen_prefixes}"
+)
+print("[OK] cache_prefix (FINDINGS_SEARCH_PROMPT, BATCH_PROMPT, BATCH_PROMPT_SINGLE_ITEM) is now byte-identical "
+      "across DIFFERENT target languages for the same items/checks/source_lang — target_lang_line moved out of "
+      "every prefix into its suffix, and BATCH_PROMPT_SINGLE_ITEM's checks_description moved INTO its prefix, so "
+      "Anthropic's prompt cache is finally shared across Александр's dominant real usage pattern (one small "
+      "file, many languages), not just across chunks of a single language")
 
 
 class _RecordedCacheRequest:
