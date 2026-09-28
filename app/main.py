@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import domain_note_for_names, run_ai_checks
-from app.share_page import SHARE_PAGE_HEADERS, render_not_found, render_shared_report
+from app.share_page import accepted_keys, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
@@ -1188,6 +1188,8 @@ async def multi_check_detail(
         "review": record.review or {},
         # Active translator links, {lang: token} (see models.ShareLink).
         "shares": {sl.lang: sl.token for sl in record.share_links if not sl.revoked},
+        # Translators' answers from their share-link pages (2026-09-30).
+        "translator_review": record.translator_review or {},
     }
 
 
@@ -1269,10 +1271,40 @@ def shared_report_page(token: str, db: Session = Depends(get_db)):
     if 10 <= len(token) <= 64:
         link = db.query(models.ShareLink).filter(models.ShareLink.token == token).first()
     if link is None or link.revoked or link.multi_check is None or link.multi_check.status != "completed":
-        return HTMLResponse(render_not_found(), status_code=404, headers=SHARE_PAGE_HEADERS)
+        return HTMLResponse(render_not_found(), status_code=404, headers=share_page_headers(""))
     mc = link.multi_check
-    page = render_shared_report(mc.filename, link.lang, mc.results or {}, mc.review or {})
-    return HTMLResponse(page, headers=SHARE_PAGE_HEADERS)
+    nonce = secrets.token_urlsafe(16)
+    page = render_shared_report(
+        mc.filename, link.lang, mc.results or {}, mc.review or {}, mc.translator_review or {}, nonce,
+    )
+    return HTMLResponse(page, headers=share_page_headers(nonce))
+
+
+@app.post("/share/{token}/respond", include_in_schema=False)
+def shared_report_respond(token: str, payload: schemas.TranslatorResponseIn, db: Session = Depends(get_db)):
+    """A translator's «Принять»/«Отклонить» and comment on one finding
+    (2026-09-30, Александр). Only findings the manager accepted for this
+    link's language can be answered."""
+    link = None
+    if 10 <= len(token) <= 64:
+        link = db.query(models.ShareLink).filter(models.ShareLink.token == token).first()
+    if link is None or link.revoked or link.multi_check is None:
+        raise HTTPException(404, "Ссылка недействительна.")
+    mc = link.multi_check
+    if payload.decision not in (None, "accept", "reject"):
+        raise HTTPException(400, "Некорректное решение.")
+    key = payload.key.strip()
+    if key not in accepted_keys(link.lang, mc.results or {}, mc.review or {}):
+        raise HTTPException(400, "Такого замечания нет.")
+    comment = (payload.comment or "").strip()[:4000]
+    tr = dict(mc.translator_review or {})
+    if payload.decision is None and not comment:
+        tr.pop(key, None)
+    else:
+        tr[key] = {"decision": payload.decision, "comment": comment}
+    mc.translator_review = tr  # reassign so SQLAlchemy notices the JSON change
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/projects/{project_id}/multi-check/{multi_check_id}/report.xlsx")

@@ -221,6 +221,10 @@ class MultiCheck(Base):
     # "<sheet index>|<lang>|<excel row>|<finding index in that row>" (see the
     # frontend's filteredReport.ts reviewKey). Old reports start empty.
     review: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 2026-09-30 (Александр): translators' answers from their share-link page
+    # — {finding_key: {"decision": "accept"|"reject"|None, "comment": str}}.
+    # Kept apart from the manager's review so neither side overwrites the other.
+    translator_review: Mapped[dict] = mapped_column(JSON, default=dict)
     # When this record's batch actually finished (flipped to "completed") —
     # together with created_at and batch_volume_chars, this is the
     # historical data _estimate_batch_minutes learns from. NULL for a

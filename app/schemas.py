@@ -302,6 +302,13 @@ class MultiCheckReviewIn(BaseModel):
     note: str = ""
 
 
+class TranslatorResponseIn(BaseModel):
+    """A translator's answer to one finding on the share-link page."""
+    key: str
+    decision: str | None = None  # "accept" | "reject" | None
+    comment: str = ""
+
+
 class ShareLinkIn(BaseModel):
     manager_id: int
     lang: str

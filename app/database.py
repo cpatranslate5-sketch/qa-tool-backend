@@ -227,6 +227,9 @@ def _run_migrations():
             # 2026-09-29: manager's per-finding review (see models.MultiCheck.review).
             if "review" not in cols:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN review JSON"))
+            # 2026-09-30: translators' answers (see models.MultiCheck.translator_review).
+            if "translator_review" not in cols:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN translator_review JSON"))
 
     # The target-language checkbox catalog is now its own table, fully
     # decoupled from tone_rules — Александр asked for the checkbox list to
