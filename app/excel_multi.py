@@ -15,6 +15,8 @@ from app.claude_client import (
     REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
+    _is_hard_language,
+    _language_check_unexpected_error_warning,
     _model_for_task,
     _register_mixed_finding,
     _second_opinion_unexpected_error_warning,
@@ -96,29 +98,48 @@ MAX_ROWS_PER_AI_CALL = 15
 # see claude_client._is_hard_language), with the SAME prompt/instructions —
 # was MISSED when checked as part of a normal batch, but CAUGHT when checked
 # alone via the single-pair form. app.model_comparison.run_chunk_size_comparison
-# later reproduced this for real (2026-09-26, 5 runs each): Opus alone caught
+# later reproduced this for real (2026-09-26, 3 runs each): Opus alone caught
 # it 67% of the time, Opus batched 0% — confirming the mechanism is real,
 # for this specific kind of subtle terminological/semantic nuance.
 #
-# RETIRED 2026-09-26 anyway (Александр's explicit call): the same diagnostic,
-# run a second time on 4 different deliberately-planted OBJECTIVE errors
-# (a dropped {{placeholder}}, a wrong number, a reversed negation, a real
-# case-ending grammar violation) showed BOTH Opus and Sonnet catching ALL
-# four 100% of the time, batched or not — only the rare subtle-nuance
-# category (like "отыгрыш") seems to actually need chunk=1, and Александр
-# decided that rare benefit isn't worth ~4x the cost on every hard-language
-# row. Hard languages still get the stronger model (CLAUDE_MODEL_HARD/Opus,
-# via claude_client._model_for_lang) — only the row-per-call count changed
-# here, not which model runs. Kept as a constant (rather than deleted
-# outright) in case this trade-off is ever revisited.
-MAX_ROWS_PER_AI_CALL_HARD = 1
+# RETIRED 2026-09-26 anyway (Александр's call at the time): the same
+# diagnostic, run a second time on 4 different deliberately-planted
+# OBJECTIVE errors (a dropped {{placeholder}}, a wrong number, a reversed
+# negation, a real case-ending grammar violation) showed BOTH Opus and
+# Sonnet catching ALL four 100% of the time, batched or not — only the
+# rare subtle-nuance category (like "отыгрыш") seems to actually need
+# chunk=1, and the ~4x cost of chunk=1 on every hard-language row felt not
+# worth it for that. This retirement quietly cancelled out the whole point
+# of HARD_LANGUAGE_BASES's own model choice, though: claude_client.py's own
+# comment on that list claims chunk=1 was "un-retired" alongside Opus on
+# 2026-09-26 — it wasn't, this constant stayed at MAX_ROWS_PER_AI_CALL (15)
+# the whole time, so hard languages were paying Opus's price with none of
+# the row-count protection the two were always supposed to come as a pair.
+# Caught 2026-09-28 auditing the tool for detection gaps, then verified
+# hands-on: re-ran the exact same diagnostic (5 runs each, for a steadier
+# read than the original 3) and additionally tried a THIRD option — chunks
+# of 5 — that didn't exist as a mode until this same day. Result: alone
+# 20% (1/5), chunks of 5 also 20% (1/5), full batch of 8 still 0% (0/5) —
+# noisier than the original 67%/0% (small-sample variance, expected with
+# only 5 runs), but the RELATIVE finding replicated cleanly across both
+# tests: alone and chunks-of-5 track each other, full batching loses it
+# every time. So chunks of 5 (RESTORED, not chunk=1) — real, replicated
+# evidence it keeps the same protection chunk=1 does, at roughly half
+# chunk=1's per-row cost and only modestly above full batching's. Still
+# just one real known example, tested twice — if Александр ever gets a
+# second distinct real hard-language miss to test with
+# /debug/chunk-size-comparison's grouped_chunk_size, that would firm this
+# up further, but there's no reason to wait on that to ship a real,
+# demonstrated improvement over today's unprotected chunk=15.
+MAX_ROWS_PER_AI_CALL_HARD = 5
 
 
 def _chunk_size_for_lang(target_lang: str) -> int:
-    """Same MAX_ROWS_PER_AI_CALL for every language now, hard or not — see
-    MAX_ROWS_PER_AI_CALL_HARD's own comment for why the old chunk=1 special
-    case for hard languages was retired 2026-09-26."""
-    return MAX_ROWS_PER_AI_CALL
+    """MAX_ROWS_PER_AI_CALL_HARD (chunks of 5) for a HARD_LANGUAGE_BASES
+    language, MAX_ROWS_PER_AI_CALL (15) for everyone else — see
+    MAX_ROWS_PER_AI_CALL_HARD's own comment for the 2026-09-28 restore and
+    the real evidence behind picking 5 specifically, not 1 or 15."""
+    return MAX_ROWS_PER_AI_CALL_HARD if _is_hard_language(target_lang) else MAX_ROWS_PER_AI_CALL
 
 
 def _chunk_list(items: list, size: int) -> list[list]:
@@ -1143,21 +1164,50 @@ async def run_multi_check(
     target_langs_filter: when given, only these languages are checked even
     if the file has more columns — lets a manager check a subset of a
     large upload instead of every language every time.
-    """
+
+    A single language's task is never allowed to take the whole multi-check
+    down with it — added 2026-09-28, Александр's explicit ask, after
+    diagnosing a real production 502 that turned out to be unrelated (a
+    Swagger placeholder value), but exposed a real gap while investigating
+    it: this function's own asyncio.gather had no return_exceptions=True,
+    and run_ai_checks_batch's Step 2 call had no try/except at all (see
+    claude_client._step2_call_failure_warning's own comment) — so a
+    transient Anthropic hiccup on ANY ONE of e.g. 30 languages crashed the
+    entire multi-check, discarding every other language's already-finished
+    results too, and forcing a full re-run (re-paying for all 30 languages)
+    just because one had a bad moment. run_ai_checks_batch's own fix already
+    handles the common case (a plain AI-service failure) without raising at
+    all; _run_one below is the outer, catch-all safety net for anything
+    else unexpected (a genuine bug, a malformed row) that still reaches this
+    level — mirrors apply_second_opinion's own _run_one/_second_opinion_
+    unexpected_error_warning pattern for the exact same reason."""
     semaphore = asyncio.Semaphore(AI_CONCURRENCY)
     result_sheets = []
     total_findings = 0
     total_rows_checked = 0
     total_cost_usd = 0.0
 
+    async def _run_one(sheet: dict, lang: str) -> tuple[list[dict], float]:
+        try:
+            return await _check_language_for_sheet(sheet, lang, source_lang, checks, extra_instructions, semaphore)
+        except Exception:
+            logger.exception("check failed unexpectedly for language=%s", lang)
+            return (
+                [{
+                    "excel_row": 0,
+                    "context": "⚠ Системное предупреждение",
+                    "source": "",
+                    "translation": "",
+                    "findings": [_language_check_unexpected_error_warning()],
+                }],
+                0.0,
+            )
+
     for sheet in sheets:
         target_langs = [l for l in sheet["languages"] if l != source_lang]
         if target_langs_filter is not None:
             target_langs = [l for l in target_langs if _lang_selected(l, target_langs_filter)]
-        tasks = [
-            _check_language_for_sheet(sheet, lang, source_lang, checks, extra_instructions, semaphore)
-            for lang in target_langs
-        ]
+        tasks = [_run_one(sheet, lang) for lang in target_langs]
         per_lang_results = await asyncio.gather(*tasks) if tasks else []
 
         dup_cols = sheet.get("duplicate_language_columns") or {}

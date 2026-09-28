@@ -793,9 +793,22 @@ async def _ensemble_search_findings(
     configured-but-broken branch (bad/expired key, no credit, an outage)
     produces a warning, so Александр can see directly in the report when
     a model he expects to be running actually isn't, rather than the
-    ensemble silently and permanently degrading with no visible trace."""
+    ensemble silently and permanently degrading with no visible trace.
+
+    The model_override branch used to have NO failure handling at all —
+    an unguarded _call_claude deep inside _search_findings — unlike the
+    two-branch ensemble below, which was already resilient per-branch via
+    _run_search_branch. Caught 2026-09-28 fixing the matching gap in Step 2
+    (see run_ai_checks_batch's own comment): since app.excel_multi's live
+    path (_check_language_for_sheet) has passed a model_override for EVERY
+    real check since 2026-09-27's volume-based model tiering, this branch
+    was actually the one production traffic hits, not the two-branch
+    ensemble below it — so it needed the exact same protection."""
     if model_override is not None:
-        findings, cost = await _search_findings(items, target_lang, source_lang, model_override=model_override)
+        try:
+            findings, cost = await _search_findings(items, target_lang, source_lang, model_override=model_override)
+        except _BRANCH_FAILURE_EXCEPTIONS:
+            return {}, 0.0, [_model_branch_search_warning(model_override)]
         return findings, cost, []
 
     sonnet_expected = bool(settings.ANTHROPIC_API_KEY)
@@ -1456,8 +1469,8 @@ def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[
 
 
 # Languages that get BOTH extra levers for quality: the smaller
-# MAX_ROWS_PER_AI_CALL_HARD chunk size (one row per AI call instead of
-# batching several together — see app.excel_multi._chunk_size_for_lang)
+# MAX_ROWS_PER_AI_CALL_HARD chunk size (small groups per AI call instead of
+# batching everyone together — see app.excel_multi._chunk_size_for_lang)
 # AND the stronger CLAUDE_MODEL_HARD (Opus) model instead of CLAUDE_MODEL
 # (see _model_for_lang below).
 #
@@ -1480,17 +1493,42 @@ def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[
 # now confirmed on more than a single run. Checking one row at a time
 # only pays for itself when the model actually has the knowledge to use
 # that extra attention on — Sonnet alone apparently doesn't, for at least
-# this kind of subtle terminological nuance. So hard languages once again
-# get both levers: Opus AND chunk=1 (chunk=1 itself was never retired —
-# only the model side was, and is now un-retired to match). Matched
-# against the BASE language subtag of whatever target_lang a check
-# actually runs with, so "ko-KR", "ko", or any other region variant of
-# Korean all get it alike. "hing" (Hinglish) isn't a real ISO code at
-# all — it's this platform's own code for Hindi-English code-mixed text
-# (see parse_workbook) — but the base-subtag match doesn't care, an exact
-# "hing" simply matches itself.
+# this kind of subtle terminological nuance. So the model side was
+# un-retired: hard languages went back to Opus on 2026-09-26.
+#
+# The chunk-size side, though, quietly did NOT come back with it: a bug in
+# app.excel_multi._chunk_size_for_lang (target_lang was accepted but never
+# actually used) meant every language, hard or not, kept getting batched in
+# groups of 15 the whole time — this comment's older text claimed chunk=1
+# was "never retired", which was wrong; the row-count protection had been
+# missing since 2026-09-23 and nobody noticed because nothing here checked
+# for it. Caught 2026-09-28 auditing the tool for detection gaps. Rather
+# than assume chunk=1 was still the right answer, re-ran the same real
+# Marathi diagnostic (5 runs per mode this time) and added a third option —
+# grouped chunks of 5 — that didn't exist before that day:
+# individual 20% (1/5), grouped-of-5 20% (1/5), full batch-of-8 0% (0/5).
+# Noisier than the original 3-run numbers (small-sample variance), but the
+# relative finding replicated cleanly: alone and chunks-of-5 track each
+# other, full batching loses it every time. Chunks of 5 keep the same
+# protection as chunk=1 at roughly half its per-row cost, so that's what
+# app.excel_multi.MAX_ROWS_PER_AI_CALL_HARD is now set to (see that
+# constant's own comment for the full numbers) — not chunk=1, and not the
+# unprotected chunk=15 this had silently regressed to. Matched against the
+# BASE language subtag of whatever target_lang a check actually runs with,
+# so "ko-KR", "ko", or any other region variant of Korean all get it alike.
+# "hing" (Hinglish) isn't a real ISO code at all — it's this platform's own
+# code for Hindi-English code-mixed text (see parse_workbook) — but the
+# base-subtag match doesn't care, an exact "hing" simply matches itself.
+#
+# Kazakh ("kk") added back 2026-09-28 (Александр's explicit ask, no new
+# diagnostic run for it specifically) — it was one of the four languages
+# (alongside uzbek/swahili/azerbaijani) dropped from the very first version
+# of this list on 2026-09-18 for being "good enough" on plain Sonnet;
+# Александр's own call this time to move it to Opus (and the smaller
+# MAX_ROWS_PER_AI_CALL_HARD chunk size that now genuinely comes with it —
+# see that constant's own comment) regardless.
 HARD_LANGUAGE_BASES = {
-    "ar", "bn", "el", "hi", "hing", "id", "ky", "ko", "mr", "ms", "ro", "te", "th", "tg", "ur",
+    "ar", "bn", "el", "hi", "hing", "id", "kk", "ky", "ko", "mr", "ms", "ro", "te", "th", "tg", "ur",
 }
 
 
@@ -2200,7 +2238,19 @@ async def run_ai_checks_batch(
     if prompt is None:
         return {}, search_cost, False, search_warnings
     model = model_override or _model_for_lang(target_lang)
-    text_block, usage, stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
+    # Step 2, unlike Step 1's _ensemble_search_findings above, is a single
+    # REQUIRED call — there's no second branch to fall back on. Added
+    # 2026-09-28 (see _step2_call_failure_warning's own comment for the
+    # real incident that exposed this): a transient failure here used to
+    # propagate all the way up through app.excel_multi.run_multi_check's
+    # asyncio.gather and crash the ENTIRE multi-check, discarding every
+    # other language's already-successful results too. Now it degrades to
+    # "no AI findings for this one chunk" plus a visible warning, exactly
+    # like Step 1's own branches already do.
+    try:
+        text_block, usage, stop_reason = await _call_claude(prompt, model=model, cache_prefix=cache_prefix)
+    except _BRANCH_FAILURE_EXCEPTIONS:
+        return {}, search_cost, False, search_warnings + [_step2_call_failure_warning()]
     raw = parse_json_array(text_block)
     grouped = group_batch_findings(raw, number_to_index)
     filtered = {idx: _filter_findings_by_checks(fs, checks) for idx, fs in grouped.items()}
@@ -2345,6 +2395,60 @@ def _second_opinion_unexpected_error_warning() -> dict:
             "ошибки. Остальная часть проверки отработала нормально — эта проблема касается только "
             "дополнительной оценки вероятности ошибки для второго мнения (Sonnet). Находки этого "
             "языка при нажатии «Отфильтровать отчёт» останутся в отчёте без изменений."
+        ),
+    }
+
+
+def _step2_call_failure_warning() -> dict:
+    """A synthetic finding for when run_ai_checks_batch's own Step 2 call
+    (the required, structured _call_claude call — as opposed to Step 1's
+    _ensemble_search_findings, which already degrades per-branch on its
+    own) fails outright for one CHUNK of one language's rows — a transient
+    Anthropic outage, a bad gateway from a proxy in between, or a genuinely
+    malformed request (e.g. an invalid model id). Added 2026-09-28,
+    Александр's explicit ask, after diagnosing a real production 502 that
+    turned out to be a Swagger placeholder value (not a code bug) but
+    exposed a real structural gap: nothing here caught this call failing at
+    all, so it propagated all the way up through app.excel_multi.
+    run_multi_check's asyncio.gather and took the ENTIRE multi-check down —
+    every other language's already-successful results too, not just this
+    one chunk's rows. Only the rows in the affected chunk are missing an AI
+    opinion here; free rule-based checks (numbers, placeholders,
+    punctuation, mixed script, etc. — see app.rule_checks) still ran on
+    them regardless, and every other chunk or language in the same upload
+    is completely unaffected — see run_multi_check's own comment for the
+    matching per-language catch-all this pairs with."""
+    return {
+        "type": "system",
+        "severity": "high",
+        "message": (
+            "Часть строк этого языка не удалось проверить нейросетью из-за временного сбоя ИИ-сервиса "
+            "(эта партия строк пропущена, остальные проверены нормально) — попробуйте перепроверить этот "
+            "язык ещё раз чуть позже. Бесплатные автоматические проверки (числа, теги, пунктуация и т.п.) "
+            "всё равно отработали по всем строкам."
+        ),
+    }
+
+
+def _language_check_unexpected_error_warning() -> dict:
+    """The matching catch-all for app.excel_multi.run_multi_check's own
+    per-language wrapper — same spirit as _second_opinion_unexpected_error_
+    warning/apply_second_opinion, but for the MAIN AI-check pass itself,
+    not the bonus second-opinion step. _step2_call_failure_warning above
+    already turns a plain AI-service failure into a per-chunk warning
+    without raising at all — this one is for anything else entirely (a
+    genuine bug, a malformed row, anything _BRANCH_FAILURE_EXCEPTIONS
+    doesn't already catch) that reaches run_multi_check's own per-language
+    task. Added 2026-09-28, Александр's explicit ask: one language's
+    failure — of ANY kind — must never discard every other language's
+    already-successful results in the same upload."""
+    return {
+        "type": "system",
+        "severity": "high",
+        "message": (
+            "Проверка этого языка не была выполнена из-за непредвиденной ошибки — попробуйте проверить "
+            "его ещё раз отдельно (например, повторно загрузив файл с фильтром только по этому языку). "
+            "Остальные языки этой проверки не пострадали."
         ),
     }
 

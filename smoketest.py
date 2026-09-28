@@ -1229,28 +1229,111 @@ small_buf.seek(0)
 # app.main._run_live_check_background, added 2026-09-26 — see the "Failed
 # to fetch" fix), so an Anthropic failure here can no longer surface as a
 # 502 on THIS request — the request already returned "processing" before
-# run_multi_check even started. Instead the record is expected to flip to
-# status "failed" with a short error message, once polled.
-r = check("an Anthropic failure on the LIVE multi-check path submits fine (fails in the background instead)", client.post(
-    f"/projects/{project_id}/multi-check",
-    files={"file": ("small.xlsx", small_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-    data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "typo"},
-))
+# run_multi_check even started.
+#
+# 2026-09-28 (Александр's explicit ask, after diagnosing an unrelated real
+# 502): a plain AI-service failure like this one no longer takes the WHOLE
+# multi-check down either. Both claude_client.run_ai_checks_batch's Step 2
+# call AND _ensemble_search_findings' model_override branch (Step 1 — see
+# that function's own comment for why THIS is the branch real production
+# traffic actually hits now, not the two-branch Sonnet+GPT ensemble) catch
+# a plain AI-service failure themselves and degrade to a visible system-
+# warning finding instead of raising — so this check is now expected to
+# finish "completed", with $0 cost and two system warnings (one per step)
+# explaining the AI side didn't run for this language, rather than flipping
+# the whole record to "failed" and discarding it.
+r = check(
+    "an Anthropic failure on the LIVE multi-check path submits fine (degrades to a warning, not a failure)",
+    client.post(
+        f"/projects/{project_id}/multi-check",
+        files={"file": ("small.xlsx", small_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        data={
+            "source_lang": "en", "manager_name": "Мария", "manager_id": regular_id,
+            "extra_instructions": "", "checks": "typo",
+        },
+    ),
+)
 live_fail_submit = r.json()
 assert live_fail_submit["status"] == "processing", live_fail_submit
-r = check("its detail then shows status=failed instead of hanging on processing forever", client.get(
+r = check(
+    "its detail then shows status=completed (not failed) once per-language/per-chunk resilience absorbs the outage",
+    client.get(f"/projects/{project_id}/multi-check/{live_fail_submit['multi_check_id']}", params={"manager_id": regular_id}),
+)
+live_fail_detail = r.json()
+assert live_fail_detail["status"] == "completed", live_fail_detail
+assert live_fail_detail["cost_usd"] == 0.0, live_fail_detail
+_ru_warning_messages = " | ".join(
+    f["message"]
+    for row in live_fail_detail["sheets"][0]["languages"]["ru"]
+    for f in row["findings"]
+    if f.get("type") == "system"
+)
+assert "Поиск ошибок на первом шаге не сработал" in _ru_warning_messages, _ru_warning_messages
+assert "не удалось проверить нейросетью" in _ru_warning_messages, _ru_warning_messages
+check("Мария can delete this multi-check", client.delete(
     f"/projects/{project_id}/multi-check/{live_fail_submit['multi_check_id']}", params={"manager_id": regular_id}
 ))
-live_fail_detail = r.json()
-assert live_fail_detail["status"] == "failed", live_fail_detail
-assert live_fail_detail["error"], live_fail_detail
+print(
+    "[OK] a plain AI-service failure on the live multi-check path (Step 1's model_override search branch, or "
+    "Step 2's own structured call) degrades to a visible system-warning finding for the affected language "
+    "instead of failing the whole multi-check — Александр's 2026-09-28 ask, closing the gap where one "
+    "language's transient hiccup used to discard every other language's already-successful results too"
+)
+
+# ...and a genuinely UNEXPECTED failure (something other than a plain AI-
+# service error caught inside claude_client.py — e.g. a real bug elsewhere
+# in run_multi_check) still hits app.main._run_live_check_background's own
+# outer safety net and marks the record "failed" with a readable message,
+# rather than leaving it stuck on "processing" forever, or (worse) a bug
+# taking down the FastAPI worker. This is the one layer still allowed to
+# fail the whole check — nothing language-specific is even known yet if
+# run_multi_check itself blows up before assembling any per-language result.
+import app.main as main_mod
+
+_previous_run_multi_check = main_mod.run_multi_check
+
+
+async def _fake_run_multi_check_crashing(*args, **kwargs):
+    raise RuntimeError("simulated totally unexpected bug, not a plain AI-service failure")
+
+
+main_mod.run_multi_check = _fake_run_multi_check_crashing
+# A small file, deliberately — must stay under BATCH_THRESHOLD_CHARS so this
+# actually exercises the LIVE path (_run_live_check_background calls
+# run_multi_check directly); the big sample file above goes through the
+# separate Message Batches path instead, which never calls run_multi_check
+# at all and so wouldn't touch this fake.
+crash_wb = openpyxl.Workbook()
+crash_ws = crash_wb.active
+crash_ws.append(["EN", "RU"])
+crash_ws.append(["Hello.", "Привет."])
+crash_buf = io.BytesIO()
+crash_wb.save(crash_buf)
+crash_buf.seek(0)
+r = check("a genuinely unexpected (non-AI-service) failure still submits fine", client.post(
+    f"/projects/{project_id}/multi-check",
+    files={"file": ("crash.xlsx", crash_buf, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    data={"source_lang": "en", "manager_name": "Мария", "manager_id": regular_id, "extra_instructions": "", "checks": "typo"},
+))
+crash_submit = r.json()
+r = check("...but its detail correctly still shows status=failed (the one remaining all-or-nothing safety net)", client.get(
+    f"/projects/{project_id}/multi-check/{crash_submit['multi_check_id']}", params={"manager_id": regular_id}
+))
+crash_detail = r.json()
+assert crash_detail["status"] == "failed", crash_detail
+assert crash_detail["error"], crash_detail
 r = check("a failed live check also shows up as failed in the history list, not a misleading '0 findings'", client.get(
     f"/projects/{project_id}/multi-check", params={"manager_id": regular_id}
 ))
-assert any(h["id"] == live_fail_submit["multi_check_id"] and h["status"] == "failed" for h in r.json()), r.json()
+assert any(h["id"] == crash_submit["multi_check_id"] and h["status"] == "failed" for h in r.json()), r.json()
 check("Мария can delete a failed multi-check", client.delete(
-    f"/projects/{project_id}/multi-check/{live_fail_submit['multi_check_id']}", params={"manager_id": regular_id}
+    f"/projects/{project_id}/multi-check/{crash_submit['multi_check_id']}", params={"manager_id": regular_id}
 ))
+main_mod.run_multi_check = _previous_run_multi_check
+print(
+    "[OK] app.main._run_live_check_background's own outer safety net still marks the record 'failed' for a "
+    "truly unexpected bug (not a plain AI-service failure, which now degrades per-language/per-chunk instead)"
+)
 
 # and on the standalone single-check endpoint
 r = check("an Anthropic failure on the standalone /check endpoint also surfaces cleanly", client.post(
@@ -1571,22 +1654,25 @@ print("[OK] pick_source_lang: resolves the manager's chosen source language agai
 # _is_hard_language (matched by base subtag, so any region variant
 # qualifies too) is shared by both this model choice AND the chunk-size
 # decision (MAX_ROWS_PER_AI_CALL_HARD) — confirmed below that it still
-# recognizes the same 15-language list either way. ---
+# recognizes the same hard list either way. Kazakh (kk) added back to the
+# hard list 2026-09-28 (Александр's explicit ask) — it had been dropped
+# 2026-09-18 (see HARD_LANGUAGE_BASES's own comment) for being "good enough"
+# on Sonnet; Александр's own call this time to move it back to Opus. ---
 from app.claude_client import _model_for_lang, _is_hard_language
 from app.config import settings
 
 for hard in [
     "ar", "ar-SA", "bn", "bn-BD", "el", "el-GR", "hi", "hi-IN", "hing", "id", "id-ID",
-    "ky-KG", "ko", "ko-KR", "mr-IN", "ms", "ms-MY", "ro", "ro-RO", "te-IN", "th", "th-TH",
+    "kk", "kk-KZ", "ky-KG", "ko", "ko-KR", "mr-IN", "ms", "ms-MY", "ro", "ro-RO", "te-IN", "th", "th-TH",
     "tg-TJ", "ur", "ur-PK",
 ]:
     assert _is_hard_language(hard), hard
     assert _model_for_lang(hard) == settings.CLAUDE_MODEL_HARD, hard
-for normal in ["ru", "es-mx", "en", "de-DE", "fr", "kk", "kk-KZ", "uz", "sw-KE", "az-AZ"]:
+for normal in ["ru", "es-mx", "en", "de-DE", "fr", "uz", "sw-KE", "az-AZ"]:
     assert not _is_hard_language(normal), normal
     assert _model_for_lang(normal) == settings.CLAUDE_MODEL, normal
-print("[OK] _model_for_lang: confirmed the 15-language hard list (ar/bn/el/hi/hing/id/ky/ko/mr/ms/ro/te/th/tg/ur) "
-      "once again routes to CLAUDE_MODEL_HARD (Opus, restored 2026-09-26) while every other language stays on "
+print("[OK] _model_for_lang: confirmed the 16-language hard list (ar/bn/el/hi/hing/id/kk/ky/ko/mr/ms/ro/te/th/tg/ur "
+      "— kk/Kazakh added back 2026-09-28) routes to CLAUDE_MODEL_HARD (Opus) while every other language stays on "
       "CLAUDE_MODEL (Sonnet), and that _is_hard_language recognizes the exact same list for the separate "
       "chunk-size decision")
 
@@ -2899,24 +2985,25 @@ print(f"[OK] live multi-check path: a language with more rows than MAX_ROWS_PER_
       f"DIFFERENT chunk is correctly left unmerged, since that chunk's AI call never saw the first chunk's "
       f"rows")
 
-# MAX_ROWS_PER_AI_CALL_HARD / _chunk_size_for_lang: RETIRED 2026-09-26
-# (Александр's explicit call) — a real Marathi miss (2026-09-22) originally
-# proved chunk=1 mattered for hard languages (the exact same pair, same
-# model, same prompt was caught alone but missed batched), but a broader
-# follow-up test (app.model_comparison.run_chunk_size_comparison,
-# 2026-09-26) on 4 different deliberately-planted OBJECTIVE errors showed
-# both Sonnet and Opus catching all four 100% of the time either way — only
-# the rare subtle-nuance category (like "отыгрыш") actually needed chunk=1,
-# and Александр decided that rare benefit isn't worth ~4x the cost on every
-# hard-language row. _chunk_size_for_lang now returns MAX_ROWS_PER_AI_CALL
-# for every language, hard or not — hard languages keep the stronger model
-# (see the _model_for_lang test above) but no longer get a smaller chunk.
+# MAX_ROWS_PER_AI_CALL_HARD / _chunk_size_for_lang: a 2026-09-28 fix, not a
+# behavior change from "before" — see claude_client.HARD_LANGUAGE_BASES's own
+# comment and excel_multi.MAX_ROWS_PER_AI_CALL_HARD's own comment for the
+# full story. Short version: _chunk_size_for_lang had a real bug (its
+# target_lang parameter was accepted but never used), so EVERY language, hard
+# or not, was silently getting chunk=15 the whole time the 2026-09-26 "RESTORED"
+# comment on HARD_LANGUAGE_BASES claimed chunk=1 was back — it never was.
+# Caught auditing the tool 2026-09-28. Rather than just restore chunk=1 (the
+# original 2026-09-22/26 evidence), a new grouped-chunk-size diagnostic mode
+# was used to test a middle ground first: chunks of 5 keep the exact same
+# detection rate as chunk=1 on the real Marathi "отыгрыш" case (individual
+# 20%/5 runs, grouped-of-5 20%/5 runs, full-batch 0%/5 runs) at roughly half
+# chunk=1's per-row cost. So MAX_ROWS_PER_AI_CALL_HARD is now 5, not 1 and not 15.
 from app.excel_multi import MAX_ROWS_PER_AI_CALL_HARD, _chunk_size_for_lang
 
-assert MAX_ROWS_PER_AI_CALL_HARD == 1, "kept as a constant in case this trade-off is ever revisited"
-assert _chunk_size_for_lang("mr") == MAX_ROWS_PER_AI_CALL, "mr (Marathi) is hard, but no longer gets a smaller chunk"
-assert _chunk_size_for_lang("mr-IN") == MAX_ROWS_PER_AI_CALL, "region variants of a hard base are unaffected too"
-assert _chunk_size_for_lang("ky") == MAX_ROWS_PER_AI_CALL, "ky (Kyrgyz) is hard, but no longer gets a smaller chunk"
+assert MAX_ROWS_PER_AI_CALL_HARD == 5, "2026-09-28: chunks of 5 for hard languages, not chunk=1 or the buggy chunk=15"
+assert _chunk_size_for_lang("mr") == MAX_ROWS_PER_AI_CALL_HARD, "mr (Marathi) is hard, gets the smaller chunk"
+assert _chunk_size_for_lang("mr-IN") == MAX_ROWS_PER_AI_CALL_HARD, "region variants of a hard base are affected too"
+assert _chunk_size_for_lang("ky") == MAX_ROWS_PER_AI_CALL_HARD, "ky (Kyrgyz) is hard, gets the smaller chunk"
 assert _chunk_size_for_lang("ru") == MAX_ROWS_PER_AI_CALL, "ru was never hard — same chunk size as always"
 assert _chunk_size_for_lang("es-mx") == MAX_ROWS_PER_AI_CALL, "an easy language's region variant is unaffected"
 
@@ -2942,14 +3029,38 @@ asyncio.run(
 claude_client_mod._call_claude = _previous_call_claude
 settings.ANTHROPIC_API_KEY = ""
 assert _hard_chunk_calls["n"] == 2, (
-    f"a hard language (mr) with 3 rows must now make ONE batched AI chunk (chunk=1 was retired 2026-09-26), "
-    f"and that one chunk makes 2 AI calls (the two-step pipeline's search step, then its structured step — "
-    f"see claude_client.FINDINGS_SEARCH_PROMPT's own comment) — got {_hard_chunk_calls['n']} calls"
+    f"a hard language (mr) with 3 rows fits inside ONE chunk of 5 (MAX_ROWS_PER_AI_CALL_HARD), so it should "
+    f"still make just ONE AI chunk, and that one chunk makes 2 AI calls (the two-step pipeline's search step, "
+    f"then its structured step — see claude_client.FINDINGS_SEARCH_PROMPT's own comment) — got "
+    f"{_hard_chunk_calls['n']} calls"
 )
-print("[OK] _chunk_size_for_lang: a hard-list language (mr, ky, ...) is now batched exactly like every other "
-      "language (chunk=1 retired 2026-09-26 after a broader test showed it only mattered for a rare subtle-"
-      "nuance error category, not worth its cost) — it still gets the stronger Opus model, just not a smaller "
-      "chunk any more")
+print("[OK] _chunk_size_for_lang: a hard-list language (mr, ky, ...) with 3 rows (<= chunk size 5) still makes "
+      "just one AI chunk")
+
+# A hard language with MORE than 5 rows must actually split into multiple
+# chunks now (this is the part the 2026-09-23..2026-09-28 bug silently broke
+# — it would have stayed as one chunk of 15 instead).
+_hard_chunk_rows_big = [
+    {"excel_row": 500 + i, "context": f"row {i}", "max_length": None,
+     "values": {"ru": "Фрибет без отыгрыша", "mr": f"पैज न लावता {i}"}}
+    for i in range(7)
+]
+_hard_chunk_sheet_big = {"sheet_name": "Sheet1", "languages": ["ru", "mr"], "rows": _hard_chunk_rows_big}
+_hard_chunk_calls["n"] = 0
+settings.ANTHROPIC_API_KEY = "fake-key-for-smoketest"
+claude_client_mod._call_claude = _fake_call_claude_count_calls
+asyncio.run(
+    _check_language_for_sheet(_hard_chunk_sheet_big, "mr", "ru", ["typo"], "", asyncio.Semaphore(5))
+)
+claude_client_mod._call_claude = _previous_call_claude
+settings.ANTHROPIC_API_KEY = ""
+assert _hard_chunk_calls["n"] == 4, (
+    f"a hard language with 7 rows must split into 2 chunks of at most 5 rows each (5 + 2), and each chunk makes "
+    f"2 AI calls (search + structured) for 4 calls total — got {_hard_chunk_calls['n']} calls"
+)
+print("[OK] _chunk_size_for_lang: a hard-list language with more than 5 rows (7) really does split into multiple "
+      "smaller AI chunks (2 chunks of at most 5) instead of silently going out as one big batch — this is the "
+      "exact protection the 2026-09-23..2026-09-28 _chunk_size_for_lang bug had quietly disabled")
 
 # BATCH_PROMPT_SINGLE_ITEM: Александр's SHARPER follow-up test, 2026-09-22 —
 # even a 1-ROW document upload (so MAX_ROWS_PER_AI_CALL_HARD's chunking
