@@ -68,6 +68,7 @@ _CSS = """
   .block-label { display: block; font-size: 0.85rem; margin-top: 10px; }
   textarea { width: 100%; min-height: 54px; margin-top: 4px; font: inherit; font-size: 0.88rem; padding: 6px 8px;
              border: 1px solid #dde1e7; border-radius: 6px; resize: vertical; background: #fff; color: #dc2626; }
+  textarea.okk-links { color: #4f46e5; min-height: 40px; }
   .actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 10px; }
   .status { font-size: 0.8rem; color: #6b7280; margin-right: auto; }
   .btn { border: 1px solid; border-radius: 8px; padding: 6px 16px; font: inherit; font-size: 0.88rem; cursor: pointer; background: #fff; }
@@ -222,7 +223,8 @@ _SCRIPT = """
   function key(item) { return item.getAttribute("data-key"); }
   function sendOkk(item, action) {
     var c = item.querySelector(".okk-comment");
-    post("/okk", { key: key(item), action: action || null, comment: c ? c.value : "" }, item, function () {
+    var l = item.querySelector(".okk-links");
+    post("/okk", { key: key(item), action: action || null, comment: c ? c.value : "", links: l ? l.value : null }, item, function () {
       if (action === "remove") item.parentNode.removeChild(item);
       if (action === "keep") location.reload();
     });
@@ -258,7 +260,7 @@ _SCRIPT = """
     if (t.classList.contains("tr-comment")) {
       clearTimeout(timers[k]);
       timers[k] = setTimeout(function () { sendAnswer(item); }, 800);
-    } else if (t.classList.contains("okk-comment")) {
+    } else if (t.classList.contains("okk-comment") || t.classList.contains("okk-links")) {
       clearTimeout(timers[k]);
       timers[k] = setTimeout(function () { sendOkk(item, null); }, 800);
     }
@@ -302,6 +304,13 @@ def render_shared_report(
             )
             platform_html = f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(f.get("message"))}</div>'
         links_html = _links_html(entry.get("links", ""))
+        if pending:
+            # The QA head can add or fix the Crowdin link(s) at this stage.
+            raw_links = "\n".join(p for p in re.split(r"\s+", entry.get("links") or "") if p)
+            links_html = (
+                '<label class="label block-label">Ссылки на Crowdin:</label>'
+                f'<textarea class="okk-links" placeholder="https://crowdin.com/… — каждая ссылка с новой строки">{_e(raw_links)}</textarea>'
+            )
         okk_comment = (entry.get("okk_comment") or "").strip()
 
         if pending:

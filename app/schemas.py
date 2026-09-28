@@ -314,6 +314,7 @@ class ShareOkkIn(BaseModel):
     key: str
     action: str | None = None  # "keep" | "remove" | None (just save the comment)
     comment: str = ""  # «Комментарий для переводчика»
+    links: str | None = None  # Crowdin link(s), editable by the QA head; None = keep as is
 
 
 class ShareCheckedIn(BaseModel):

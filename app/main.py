@@ -1319,6 +1319,8 @@ def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Dep
     review = dict(mc.review or {})
     entry = dict(review.get(key) or {})
     entry["okk_comment"] = (payload.comment or "").strip()[:4000]
+    if payload.links is not None:
+        entry["links"] = payload.links.strip()[:4000]
     if payload.action == "keep":
         entry["decision"] = "accept"
         entry["sent"] = True
