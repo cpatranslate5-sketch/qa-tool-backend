@@ -318,6 +318,15 @@ INDEPENDENT_LANGUAGE_CODES = {
 }
 
 
+def _country_region(code: str) -> str:
+    """The 2-letter country part of a code ("mx" in "es-mx"), or "" when
+    there is none (bare code, script like "hans", numeric area like "419")."""
+    for part in code.split("-")[1:]:
+        if len(part) == 2 and part.isalpha():
+            return part
+    return ""
+
+
 def _language_subtags_compatible(a: str, b: str) -> bool:
     """True when two language codes plausibly name the same language once
     bridged across granularity — the shared logic behind both
@@ -341,6 +350,14 @@ def _language_subtags_compatible(a: str, b: str) -> bool:
     never by coincidentally matching someone else's region."""
     a, b = a.strip().lower(), b.strip().lower()
     if _base_lang(a) == _base_lang(b):
+        # Same language but two DIFFERENT explicit countries ("es-mx" vs
+        # "es-ar", "pt-br" vs "pt-pt") are different variants — never the
+        # same column (Александр, 2026-10-01: MX was "found" in a file that
+        # only had es-AR). A bare "es", or a generic numeric region like
+        # "419"/"001", still bridges as before.
+        ra, rb = _country_region(a), _country_region(b)
+        if ra and rb and ra != rb:
+            return False
         return True
     a_is_shorthand = "-" not in a and a not in INDEPENDENT_LANGUAGE_CODES
     b_is_shorthand = "-" not in b and b not in INDEPENDENT_LANGUAGE_CODES
