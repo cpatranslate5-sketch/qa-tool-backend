@@ -624,7 +624,7 @@ _FINDINGS_SEARCH_PROMPT_PREFIX = """Ты — опытный редактор п�
 следующем шаге) — а вот промолчать о том, что реально не так, нежелательно.
 
 {source_lang_note}
-
+{task_context}
 """
 _FINDINGS_SEARCH_PROMPT_SUFFIX = """{target_lang_line}
 
@@ -724,9 +724,23 @@ def _parse_search_findings(text_block: str | None, checkable: list[tuple[int, di
     return found
 
 
+def _search_task_context(extra_instructions: str) -> str:
+    """Project description, subject-domain note and the manager's own
+    instructions for Step 1 too (2026-10-01, Александр: the free search
+    flagged things the project description explicitly allows, and Step 2
+    then anchored on those leads)."""
+    extra = (extra_instructions or "").strip()
+    if not extra:
+        return ""
+    return (
+        "Контекст задачи и указания (учитывай их уже при поиске — не отмечай то, что они прямо допускают):\n"
+        + extra + "\n"
+    )
+
+
 async def _search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
-    route: "ModelRoute | None" = None,
+    route: "ModelRoute | None" = None, extra_instructions: str = "",
 ) -> tuple[dict[int, list[str]], float]:
     """Step 1 of the two-step pipeline — see FINDINGS_SEARCH_PROMPT's own
     comment above for the full rationale. Returns ({}, 0.0) with NO API
@@ -750,6 +764,7 @@ async def _search_findings(
     # now, precisely so it no longer breaks that sharing).
     cache_prefix = _FINDINGS_SEARCH_PROMPT_PREFIX.format(
         source_lang_note=_source_lang_note(source_lang),
+        task_context=_search_task_context(extra_instructions),
     )
     prompt = cache_prefix + _FINDINGS_SEARCH_PROMPT_SUFFIX.format(
         target_lang_line=_target_lang_line(target_lang),
@@ -780,6 +795,7 @@ async def _search_findings_openai(
     prompt = FINDINGS_SEARCH_PROMPT.format(
         target_lang_line=_target_lang_line(target_lang),
         source_lang_note=_source_lang_note(source_lang),
+        task_context="",
         pairs_block=_pairs_block(checkable),
     )
     text_block, usage, _stop_reason = await _call_openai(prompt)
@@ -837,6 +853,7 @@ def _model_branch_search_warning(model_label: str) -> dict:
 
 async def _ensemble_search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
+    extra_instructions: str = "",
 ) -> tuple[dict[int, list[str]], float, list[dict]]:
     """Step 1 of the two-step pipeline, Александр's ask (2026-09-23): run
     it under Sonnet (Anthropic) and GPT (OpenAI) concurrently and merge
@@ -891,7 +908,9 @@ async def _ensemble_search_findings(
     # Step 2. A failure here degrades to a visible warning, never a crash.
     route = route_for_model_id(model_override) if model_override else route_for_lang(target_lang)
     try:
-        findings, cost = await _search_findings(items, target_lang, source_lang, route=route)
+        findings, cost = await _search_findings(
+            items, target_lang, source_lang, route=route, extra_instructions=extra_instructions,
+        )
     except _BRANCH_FAILURE_EXCEPTIONS:
         return {}, 0.0, [_model_branch_search_warning(route.label)]
     return findings, cost, []
@@ -2211,7 +2230,7 @@ async def run_ai_checks(
     if checks_description:
         prior_findings, search_cost, search_warnings = await _ensemble_search_findings(
             [{"context": "", "source": source, "translation": translation}],
-            target_lang=target_lang, source_lang=source_lang,
+            target_lang=target_lang, source_lang=source_lang, extra_instructions=extra_instructions,
         )
 
     prompt_kwargs = dict(
@@ -2452,6 +2471,7 @@ async def run_ai_checks_batch(
     if checks_description:
         prior_findings, search_cost, search_warnings = await _ensemble_search_findings(
             items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
+            extra_instructions=extra_instructions,
         )
 
     prompt, cache_prefix, number_to_index = build_batch_prompt(

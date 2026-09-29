@@ -108,6 +108,7 @@ async def _run_search_step(
     prompt = _claude_client.FINDINGS_SEARCH_PROMPT.format(
         target_lang_line=_claude_client._target_lang_line(target_lang),
         source_lang_note=_claude_client._source_lang_note(source_lang),
+        task_context="",
         pairs_block=_claude_client._pairs_block(checkable),
     )
     async with semaphore:
