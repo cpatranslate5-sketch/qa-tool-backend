@@ -76,6 +76,12 @@ _CSS = """
   .item.done .btn-done { background: #17703c; color: #fff; }
   .item.na .btn-na { background: #b42318; color: #fff; }
   [hidden] { display: none !important; }
+  .lang-bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0 4px; position: sticky; top: 0; background: #f5f6f8; padding: 8px 0; z-index: 5; }
+  .lang-btn { background: #fff; border: 1px solid #dde1e7; border-radius: 999px; font: inherit; font-size: 0.85rem; padding: 5px 12px; cursor: pointer; }
+  .lang-btn.active { background: #3949ab; border-color: #3949ab; color: #fff; font-weight: 600; }
+  .copy-link { margin-left: auto; background: #fff; border: 1px solid #c7d2fe; color: #3949ab; border-radius: 8px; font: inherit; font-size: 0.82rem; padding: 5px 10px; cursor: pointer; }
+  .lang-section { margin-top: 22px; }
+  .lang-title { font-size: 1.15rem; margin: 0 0 4px; padding-bottom: 6px; border-bottom: 2px solid #c7d2fe; }
   .corner { position: absolute; top: 10px; right: 12px; display: flex; align-items: center; gap: 6px; }
   .num { padding-right: 150px; }
   .save-btn { background: #fff; border: 1px solid #dde1e7; border-radius: 6px; width: 30px; height: 26px; cursor: pointer;
@@ -361,12 +367,46 @@ _SCRIPT = """
 """
 
 
-def render_shared_report(
-    filename: str, lang: str, results: dict, review: dict,
-    translator_review: dict | None = None, nonce: str = "",
-) -> str:
-    review = review or {}
-    translator_review = translator_review or {}
+ALL_LANGS = "*"  # a share link for every language of the report (2026-10-01)
+
+_FLAG_FALLBACK = {
+    "en": "🇬🇧", "ru": "🇷🇺", "es": "🇪🇸", "fr": "🇫🇷", "de": "🇩🇪", "it": "🇮🇹", "ar": "🇸🇦", "zh": "🇨🇳",
+    "ja": "🇯🇵", "ko": "🇰🇷", "vi": "🇻🇳", "th": "🇹🇭", "pl": "🇵🇱", "tr": "🇹🇷", "uk": "🇺🇦", "id": "🇮🇩",
+    "ms": "🇲🇾", "hi": "🇮🇳", "hing": "🇮🇳", "kk": "🇰🇿", "el": "🇬🇷", "sw": "🇹🇿", "te": "🇮🇳", "ur": "🇵🇰",
+    "bn": "🇧🇩", "ky": "🇰🇬", "mr": "🇮🇳", "tg": "🇹🇯", "tl": "🇵🇭", "fil": "🇵🇭", "pt": "🇧🇷", "az": "🇦🇿",
+    "uz": "🇺🇿", "ro": "🇷🇴",
+}
+
+
+def _region_flag(cc: str) -> str:
+    return "".join(chr(0x1F1E6 + ord(c) - ord("a")) for c in cc.lower())
+
+
+def flag_for_lang(code: str) -> str:
+    """Same idea as the frontend's flagForLang (lang.ts)."""
+    parts = (code or "").lower().split("-")
+    for part in reversed(parts[1:]):
+        if len(part) == 2 and part.isalpha():
+            return _region_flag(part)
+    if parts[0] in _FLAG_FALLBACK:
+        return _FLAG_FALLBACK[parts[0]]
+    if len(parts) == 1 and len(parts[0]) == 2 and parts[0].isalpha():
+        return _region_flag(parts[0])
+    return "🌐"
+
+
+def report_langs(results: dict) -> list[str]:
+    """Every checked language of the report, alphabetically."""
+    langs = []
+    for sheet in (results or {}).get("sheets", []):
+        for l in sheet.get("languages_checked") or []:
+            if l not in langs:
+                langs.append(l)
+    return sorted(langs, key=lambda x: x.lower())
+
+
+def _lang_items(lang: str, results: dict, review: dict, translator_review: dict) -> tuple[list[str], int]:
+    """The HTML blocks of one language (and how many wait for the QA head)."""
     items_html = []
     pending_count = 0
     for num, key, row, f in numbered_findings(lang, results):
@@ -449,30 +489,114 @@ def render_shared_report(
             "</div>"
         )
 
+    return items_html, pending_count
+
+
+_SAVE_LOGIN_HTML = (
+    '<div id="save-login" class="save-login" hidden>'
+    "<span>Сохранить в свою папку:</span>"
+    '<input id="save-folder" placeholder="Название папки" autocomplete="username" />'
+    '<input id="save-code" type="password" placeholder="Пароль папки" autocomplete="current-password" />'
+    '<button type="button" id="save-go" class="btn btn-done">Сохранить</button>'
+    '<button type="button" id="save-cancel" class="btn">Отмена</button>'
+    '<span class="msg" id="save-msg"></span></div>'
+    '<div id="save-who" class="save-who" hidden></div>'
+)
+
+
+def _intro(total: int, pending: int) -> str:
+    intro = f"Замечаний: {total}."
+    if pending:
+        intro += f" Ожидают проверки руководителя ОКК: {pending}."
+    return intro + " Всё сохраняется автоматически."
+
+
+def render_shared_report(
+    filename: str, lang: str, results: dict, review: dict,
+    translator_review: dict | None = None, nonce: str = "",
+) -> str:
+    review = review or {}
+    translator_review = translator_review or {}
+    if lang == ALL_LANGS:
+        return _render_all_langs(filename, results, review, translator_review, nonce)
+    items_html, pending_count = _lang_items(lang, results, review, translator_review)
     body = (
         f"<h1>Замечания по переводу — {_e(lang.upper())}</h1>"
         f'<div class="muted">{_e(filename)}</div>'
     )
     if items_html:
-        intro = f"Замечаний: {len(items_html)}."
-        if pending_count:
-            intro += f" Ожидают проверки руководителя ОКК: {pending_count}."
-        intro += " Всё сохраняется автоматически."
-        body += f'<p class="muted">{intro}</p>'
+        body += f'<p class="muted">{_intro(len(items_html), pending_count)}</p>'
         # 💾 on a block saves it into «Сохранённое» of the folder whose name
         # and password are entered here (asked once, remembered on this
         # device) — the page itself has no login, it's opened by a link.
-        body += (
-            '<div id="save-login" class="save-login" hidden>'
-            "<span>Сохранить в свою папку:</span>"
-            '<input id="save-folder" placeholder="Название папки" autocomplete="username" />'
-            '<input id="save-code" type="password" placeholder="Пароль папки" autocomplete="current-password" />'
-            '<button type="button" id="save-go" class="btn btn-done">Сохранить</button>'
-            '<button type="button" id="save-cancel" class="btn">Отмена</button>'
-            '<span class="msg" id="save-msg"></span></div>'
-            '<div id="save-who" class="save-who" hidden></div>'
-        )
-        body += "".join(items_html)
+        body += _SAVE_LOGIN_HTML + "".join(items_html)
         return _page(f"Замечания — {lang.upper()}", body, _SCRIPT, nonce)
     body += '<div class="empty">Замечаний к исправлению нет.</div>'
     return _page(f"Замечания — {lang.upper()}", body)
+
+
+def _render_all_langs(filename: str, results: dict, review: dict, translator_review: dict, nonce: str) -> str:
+    """Every language on one page (2026-10-01, Александр): a language switcher
+    on top; «Все» shows each language under its own flag header in
+    alphabetical order. The chosen language goes into the address (#az-az),
+    so a copied link opens straight on that language."""
+    sections, buttons = [], []
+    total = pending_total = 0
+    for l in report_langs(results):
+        items, pending = _lang_items(l, results, review, translator_review)
+        total += len(items)
+        pending_total += pending
+        label = f"{flag_for_lang(l)} {_e(l.upper())}"
+        buttons.append(
+            f'<button type="button" class="lang-btn" data-lang="{_e(l)}">{label} ({len(items)})</button>'
+        )
+        sections.append(
+            f'<section class="lang-section" data-lang="{_e(l)}">'
+            f'<h2 class="lang-title">{label}</h2>'
+            + ("".join(items) if items else '<div class="empty">Замечаний к исправлению нет.</div>')
+            + "</section>"
+        )
+    body = (
+        "<h1>Замечания по переводу — все языки</h1>"
+        f'<div class="muted">{_e(filename)}</div>'
+        '<div class="lang-bar"><button type="button" class="lang-btn active" data-lang="all">Все</button>'
+        + "".join(buttons)
+        + '<button type="button" id="copy-lang-link" class="copy-link">🔗 Скопировать ссылку на этот язык</button></div>'
+        f'<p class="muted">{_intro(total, pending_total)}</p>'
+        + _SAVE_LOGIN_HTML
+        + "".join(sections)
+    )
+    return _page("Замечания — все языки", body, _SCRIPT + _LANG_SWITCH_SCRIPT, nonce)
+
+
+_LANG_SWITCH_SCRIPT = """
+(function () {
+  var btns = document.querySelectorAll(".lang-btn");
+  if (!btns.length) return;
+  function show(lang, push) {
+    var known = false;
+    btns.forEach(function (b) { if (b.getAttribute("data-lang") === lang) known = true; });
+    if (!known) lang = "all";
+    btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-lang") === lang); });
+    document.querySelectorAll(".lang-section").forEach(function (s) {
+      s.hidden = lang !== "all" && s.getAttribute("data-lang") !== lang;
+    });
+    var copy = document.getElementById("copy-lang-link");
+    if (copy) copy.textContent = lang === "all" ? "🔗 Скопировать ссылку на все языки" : "🔗 Скопировать ссылку на этот язык";
+    if (push) {
+      var url = location.pathname + location.search + (lang === "all" ? "" : "#" + encodeURIComponent(lang));
+      history.replaceState(null, "", url);
+    }
+  }
+  btns.forEach(function (b) {
+    b.addEventListener("click", function () { show(b.getAttribute("data-lang"), true); window.scrollTo(0, 0); });
+  });
+  var copy = document.getElementById("copy-lang-link");
+  if (copy) copy.addEventListener("click", function () {
+    var done = function () { var t = copy.textContent; copy.textContent = "✓ Ссылка скопирована"; setTimeout(function () { copy.textContent = t; }, 1500); };
+    try { navigator.clipboard.writeText(location.href).then(done, done); } catch (e) { done(); }
+  });
+  window.addEventListener("hashchange", function () { show(decodeURIComponent(location.hash.slice(1)) || "all", false); });
+  show(decodeURIComponent(location.hash.slice(1)) || "all", false);
+})();
+"""

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import domain_note_for_names, run_ai_checks
-from app.share_page import numbered_findings, pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
+from app.share_page import ALL_LANGS, numbered_findings, report_langs, pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
@@ -1254,7 +1254,7 @@ def create_share_link(project_id: int, multi_check_id: int, payload: schemas.Sha
     if not lang or len(lang) > 40:
         raise HTTPException(400, "Не указан язык.")
     langs = {l for sh in (record.results or {}).get("sheets", []) for l in sh.get("languages_checked", [])}
-    if lang not in langs:
+    if lang != ALL_LANGS and lang not in langs:
         raise HTTPException(400, "Такого языка нет в этом отчёте.")
     existing = next((sl for sl in record.share_links if sl.lang == lang and not sl.revoked), None)
     if existing is None:
@@ -1278,7 +1278,8 @@ def revoke_share_link(project_id: int, multi_check_id: int, payload: schemas.Sha
     # head's «Оставить переводчику»/«Убрать», so a new link starts the QA-head
     # stage over (Александр, 2026-10-01). The manager's ✓/?/✕, links, notes
     # and the QA head's comments stay (they're prefilled next time).
-    of_lang = lambda k: (k.split("|") + ["", ""])[1] == lang
+    # The all-languages link ("*") resets every language.
+    of_lang = lambda k: lang == ALL_LANGS or (k.split("|") + ["", ""])[1] == lang
     record.translator_review = {k: v for k, v in (record.translator_review or {}).items() if not of_lang(k)}
     review = {}
     for k, v in (record.review or {}).items():
@@ -1317,6 +1318,18 @@ def _active_share_link(token: str, db: Session) -> models.ShareLink:
     return link
 
 
+def _key_lang(link: models.ShareLink, key: str) -> str:
+    """Which language a finding key on a share page belongs to — the link's
+    own language, or, for an all-languages link, the one inside the key
+    ("<sheet>|<lang>|<row>|<n>" / "tone|<lang>")."""
+    if link.lang != ALL_LANGS:
+        return link.lang
+    lang = (key.split("|") + ["", ""])[1]
+    if lang not in report_langs(link.multi_check.results or {}):
+        raise HTTPException(400, "Такого замечания нет.")
+    return lang
+
+
 @app.post("/share/{token}/okk", include_in_schema=False)
 def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Depends(get_db)):
     """The head of QA's step on the share page (2026-10-01, Александр): every
@@ -1327,7 +1340,8 @@ def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Dep
     link = _active_share_link(token, db)
     mc = link.multi_check
     key = payload.key.strip()
-    if key not in pending_keys(link.lang, mc.results or {}, mc.review or {}):
+    klang = _key_lang(link, key)
+    if key not in pending_keys(klang, mc.results or {}, mc.review or {}):
         raise HTTPException(400, "Это замечание уже решено.")
     if payload.action not in (None, "keep", "remove"):
         raise HTTPException(400, "Некорректное действие.")
@@ -1360,16 +1374,17 @@ def shared_report_save_case(token: str, payload: schemas.ShareSaveIn, db: Sessio
     if manager is None or not verify_code(payload.code.strip(), manager.code_hash):
         raise HTTPException(401, "Неверная папка или пароль.")
     key = payload.key.strip()
-    visible = pending_keys(link.lang, mc.results or {}, mc.review or {}) | sent_keys(link.lang, mc.results or {}, mc.review or {})
+    klang = _key_lang(link, key)
+    visible = pending_keys(klang, mc.results or {}, mc.review or {}) | sent_keys(klang, mc.results or {}, mc.review or {})
     found = next(
-        ((row, f) for _, k, row, f in numbered_findings(link.lang, mc.results or {}) if k == key and row is not None),
+        ((row, f) for _, k, row, f in numbered_findings(klang, mc.results or {}) if k == key and row is not None),
         None,
     )
     if key not in visible or found is None:
         raise HTTPException(400, "Такого замечания нет.")
     row, f = found
     sheet_idx = key.split("|")[0]
-    source_key = f"{mc.id}|{sheet_idx}|{link.lang}|{row.get('excel_row')}|{key.split('|')[-1]}|m{manager.id}"
+    source_key = f"{mc.id}|{sheet_idx}|{klang}|{row.get('excel_row')}|{key.split('|')[-1]}|m{manager.id}"
     existing = db.query(models.SavedCase).filter(models.SavedCase.source_key == source_key).first()
     if existing is None:
         project = db.get(models.Project, mc.project_id)
@@ -1379,7 +1394,7 @@ def shared_report_save_case(token: str, payload: schemas.ShareSaveIn, db: Sessio
             manager_id=manager.id,
             project_name=project.name if project else "",
             filename=mc.filename or "",
-            lang=link.lang,
+            lang=klang,
             excel_row=row.get("excel_row") or 0,
             context=row.get("context") or "",
             source=row.get("source") or "",
@@ -1397,8 +1412,9 @@ def shared_report_checked(token: str, payload: schemas.ShareCheckedIn, db: Sessi
     link = _active_share_link(token, db)
     mc = link.multi_check
     key = payload.key.strip()
+    klang = _key_lang(link, key)
     tr = dict(mc.translator_review or {})
-    if key not in sent_keys(link.lang, mc.results or {}, mc.review or {}) or not (tr.get(key) or {}).get("decision"):
+    if key not in sent_keys(klang, mc.results or {}, mc.review or {}) or not (tr.get(key) or {}).get("decision"):
         raise HTTPException(400, "Сначала нужен ответ переводчика.")
     entry = dict(tr[key])
     entry["checked"] = bool(payload.checked)
@@ -1418,7 +1434,8 @@ def shared_report_respond(token: str, payload: schemas.TranslatorResponseIn, db:
     if payload.decision not in (None, "done", "na"):
         raise HTTPException(400, "Некорректное решение.")
     key = payload.key.strip()
-    if key not in sent_keys(link.lang, mc.results or {}, mc.review or {}):
+    klang = _key_lang(link, key)
+    if key not in sent_keys(klang, mc.results or {}, mc.review or {}):
         raise HTTPException(400, "Такого замечания нет.")
     comment = (payload.comment or "").strip()[:4000]
     tr = dict(mc.translator_review or {})
