@@ -172,7 +172,7 @@ def pending_keys(lang: str, results: dict, review: dict) -> set:
     out = set()
     for _, key, _, _ in numbered_findings(lang, results):
         e = review.get(key) or {}
-        if e.get("decision") in ("accept", "question") and not e.get("sent"):
+        if e.get("decision") in ("accept", "question") and not e.get("sent") and not e.get("okk_removed"):
             out.add(key)
     return out
 
@@ -183,7 +183,7 @@ def sent_keys(lang: str, results: dict, review: dict) -> set:
     out = set()
     for _, key, _, _ in numbered_findings(lang, results):
         e = review.get(key) or {}
-        if e.get("decision") == "accept" and e.get("sent"):
+        if e.get("decision") in ("accept", "question") and e.get("sent") and not e.get("okk_removed"):
             out.add(key)
     return out
 
@@ -282,7 +282,9 @@ def render_shared_report(
         decision = entry.get("decision")
         if decision not in ("accept", "question"):
             continue
-        pending = not (decision == "accept" and entry.get("sent"))
+        if entry.get("okk_removed"):
+            continue
+        pending = not entry.get("sent")
         tr = translator_review.get(key) or {}
         tr_decision = {"accept": "done", "reject": "na"}.get(tr.get("decision"), tr.get("decision"))
         classes = ["item"]

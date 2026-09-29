@@ -1267,10 +1267,18 @@ def revoke_share_link(project_id: int, multi_check_id: int, payload: schemas.Sha
     for sl in record.share_links:
         if sl.lang == lang and not sl.revoked:
             sl.revoked = True
-    # Deleting the link resets the translator's reactions for this language
-    # (Александр, 2026-10-01); the manager's and QA head's decisions stay.
-    tr = {k: v for k, v in (record.translator_review or {}).items() if (k.split("|") + ["", ""])[1] != lang}
-    record.translator_review = tr
+    # Deleting the link resets this language's translator reactions and the QA
+    # head's «Оставить переводчику»/«Убрать», so a new link starts the QA-head
+    # stage over (Александр, 2026-10-01). The manager's ✓/?/✕, links, notes
+    # and the QA head's comments stay (they're prefilled next time).
+    of_lang = lambda k: (k.split("|") + ["", ""])[1] == lang
+    record.translator_review = {k: v for k, v in (record.translator_review or {}).items() if not of_lang(k)}
+    review = {}
+    for k, v in (record.review or {}).items():
+        if of_lang(k) and isinstance(v, dict):
+            v = {kk: vv for kk, vv in v.items() if kk not in ("sent", "okk_removed")}
+        review[k] = v
+    record.review = review
     db.commit()
     return {"ok": True}
 
@@ -1321,11 +1329,12 @@ def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Dep
     entry["okk_comment"] = (payload.comment or "").strip()[:4000]
     if payload.links is not None:
         entry["links"] = payload.links.strip()[:4000]
+    # The QA head's choice is stored apart from the manager's ✓/?/✕, so a new
+    # link can start the QA-head stage over from the manager's marks.
     if payload.action == "keep":
-        entry["decision"] = "accept"
         entry["sent"] = True
     elif payload.action == "remove":
-        entry["decision"] = "reject"
+        entry["okk_removed"] = True
     review[key] = entry
     mc.review = review  # reassign so SQLAlchemy notices the JSON change
     db.commit()
