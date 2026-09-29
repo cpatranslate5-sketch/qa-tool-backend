@@ -432,6 +432,14 @@ def resolve_lang_code(requested: str, available, values: dict | None = None):
     return None
 
 
+def lang_matches_exactly(code: str, available) -> bool:
+    """The strict rule for matching a catalog language against a file's
+    column codes (both already passed through the dictionary + spelling
+    normalization): identical, case-insensitively — nothing else."""
+    c = (code or "").strip().lower()
+    return bool(c) and c in {(a or "").strip().lower() for a in available}
+
+
 def _lang_selected(lang: str, target_langs_filter: set[str]) -> bool:
     """Whether `lang` — a code straight from a FILE's own header, already
     normalized by _normalize_lang_label — should count as "selected" by a
@@ -474,16 +482,12 @@ def _lang_selected(lang: str, target_langs_filter: set[str]) -> bool:
     manager arguably meant to cover is a far smaller problem than the bug
     this function exists to fix (a language silently never checked at
     all), so this asymmetry is intentional, not a gap to close."""
-    lang_low = lang.strip().lower()
-    filt = {f.strip().lower() for f in target_langs_filter if f and f.strip()}
-    if lang_low in filt:
-        return True
-    lang_is_bare = "-" not in lang_low
-    matches = [
-        f for f in filt
-        if (("-" not in f) != lang_is_bare) and _language_subtags_compatible(lang_low, f)
-    ]
-    return len(matches) == 1
+    # 2026-10-01 (Александр): strict, no guessing. A column is checked only
+    # when its header — after the language dictionary («Словарь языков») and
+    # the plain spelling normalization ("ES (AR)"/"ES AR" → "es-ar") — is
+    # EXACTLY the ticked code. Spellings a file uses for a language are
+    # taught in the dictionary, not inferred from similar-looking codes.
+    return lang_matches_exactly(lang, target_langs_filter)
 
 
 def merge_lang_codes(codes) -> list[str]:

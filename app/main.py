@@ -23,6 +23,7 @@ from app.excel_multi import (
     build_report_workbook,
     cancel_multi_check_batch,
     estimate_check_volume,
+    lang_matches_exactly,
     finalize_batch_results,
     merge_lang_codes,
     parse_workbook,
@@ -827,7 +828,7 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     known: set[str] = set()
     unknown: set[str] = set()
     for code in langs:
-        target = known if (catalog and resolve_lang_code(code, catalog)) else unknown
+        target = known if lang_matches_exactly(code, catalog) else unknown
         target.add(code)
 
     return {
@@ -886,12 +887,15 @@ async def verify_file_languages(
     confirmation keeps reading only `found` and ignoring this field, so
     its own, deliberately looser behavior is completely unchanged."""
     _get_project(project_id, db)
+    alias_map = _load_alias_map(db)
+    # Same dictionary + spelling normalization as the file's own headers,
+    # then a strict exact match (2026-10-01, Александр — no guessing).
     requested = [c.strip() for c in codes.split(",") if c.strip()]
     if not requested:
         raise HTTPException(400, "Не выбрано ни одного языка для подтверждения.")
     file_bytes = await file.read()
     try:
-        sheets = parse_workbook(file_bytes, _load_alias_map(db))
+        sheets = parse_workbook(file_bytes, alias_map)
     except Exception:
         raise HTTPException(400, "Не удалось прочитать файл — убедитесь, что это .xlsx с языковыми колонками.")
     file_langs: set[str] = set()
@@ -902,9 +906,10 @@ async def verify_file_languages(
     results = [
         {
             "code": code,
-            "found": resolve_lang_code(code, file_langs) is not None,
+            "found": lang_matches_exactly(_label_to_code(code, alias_map), file_langs),
             "missing_from_sheets": [
-                name for name, langs in per_sheet_langs if resolve_lang_code(code, langs) is None
+                name for name, langs in per_sheet_langs
+                if not lang_matches_exactly(_label_to_code(code, alias_map), langs)
             ],
         }
         for code in requested
