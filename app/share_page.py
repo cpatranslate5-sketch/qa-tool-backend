@@ -75,7 +75,20 @@ _CSS = """
   .btn-remove, .btn-na { color: #b42318; border-color: #b42318; }
   .item.done .btn-done { background: #17703c; color: #fff; }
   .item.na .btn-na { background: #b42318; color: #fff; }
-  .check { position: absolute; top: 10px; right: 12px; display: none; align-items: center; gap: 6px;
+  [hidden] { display: none !important; }
+  .corner { position: absolute; top: 10px; right: 12px; display: flex; align-items: center; gap: 6px; }
+  .num { padding-right: 150px; }
+  .save-btn { background: #fff; border: 1px solid #dde1e7; border-radius: 6px; width: 30px; height: 26px; cursor: pointer;
+              font-size: 0.9rem; line-height: 1; padding: 0; }
+  .save-btn:hover { border-color: #6366f1; }
+  .save-btn.saved { cursor: default; }
+  .save-login { background: #fff; border: 1px solid #c7d2fe; border-radius: 10px; padding: 10px 14px; margin: 12px 0;
+                display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.88rem; }
+  .save-login input { font: inherit; font-size: 0.88rem; padding: 5px 8px; border: 1px solid #dde1e7; border-radius: 6px; }
+  .save-login .msg { color: #dc2626; }
+  .save-who { font-size: 0.8rem; color: #6b7280; margin-top: 4px; }
+  .save-who a { color: #4f46e5; cursor: pointer; }
+  .check { display: none; align-items: center; gap: 6px;
            font-size: 0.8rem; color: #374151; background: #fff; border: 1px solid #dde1e7; border-radius: 6px; padding: 3px 8px; cursor: pointer; }
   .item.done .check, .item.na .check { display: flex; }
   .check input { width: 16px; height: 16px; margin: 0; cursor: pointer; }
@@ -261,6 +274,7 @@ _SCRIPT = """
     var b = ev.target.closest && ev.target.closest(".btn");
     if (!b) return;
     var item = b.closest(".item");
+    if (!item) return;
     if (b.classList.contains("btn-keep")) { sendOkk(item, "keep"); return; }
     if (b.classList.contains("btn-remove")) { sendOkk(item, "remove"); return; }
     var cls = b.classList.contains("btn-done") ? "done" : "na";
@@ -269,6 +283,60 @@ _SCRIPT = """
     if (on) item.classList.add(cls);
     sendAnswer(item);
   });
+  // 💾 → «Сохранённое» of the viewer's own folder.
+  var LS = "qa-share-save-folder";
+  var pendingSave = null;
+  function creds() { try { return JSON.parse(localStorage.getItem(LS) || "null"); } catch (e) { return null; } }
+  function setCreds(c) { try { if (c) localStorage.setItem(LS, JSON.stringify(c)); else localStorage.removeItem(LS); } catch (e) {} }
+  function showWho() {
+    var w = document.getElementById("save-who"); if (!w) return;
+    var c = creds();
+    if (!c) { w.hidden = true; return; }
+    w.hidden = false;
+    w.textContent = "Сохранение в папку «" + c.folder + "». ";
+    var a = document.createElement("a"); a.textContent = "Сменить папку";
+    a.addEventListener("click", function () { setCreds(null); showWho(); });
+    w.appendChild(a);
+  }
+  function doSave(item, c, onFail) {
+    var b = item.querySelector(".save-btn");
+    b.disabled = true;
+    fetch(base + "/save-case", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: key(item), folder: c.folder, code: c.code })
+    }).then(function (r) {
+      if (r.status === 401 || r.status === 404) { b.disabled = false; setCreds(null); showWho(); if (onFail) onFail("Неверная папка или пароль."); return; }
+      if (!r.ok) throw new Error();
+      setCreds(c); showWho();
+      document.getElementById("save-login").hidden = true;
+      b.classList.add("saved"); b.textContent = "✅"; b.title = "Сохранено в папку «" + c.folder + "»";
+    }).catch(function () { b.disabled = false; if (onFail) onFail("Не удалось сохранить — проверьте интернет."); });
+  }
+  document.addEventListener("click", function (ev) {
+    var b = ev.target.closest && ev.target.closest(".save-btn");
+    if (!b || b.classList.contains("saved") || b.disabled) return;
+    var item = b.closest(".item");
+    var c = creds();
+    if (c) { doSave(item, c, function (m) { pendingSave = item; var p = document.getElementById("save-login"); p.hidden = false; document.getElementById("save-msg").textContent = m; }); return; }
+    pendingSave = item;
+    var p = document.getElementById("save-login");
+    p.hidden = false; document.getElementById("save-msg").textContent = "";
+    p.scrollIntoView({ block: "center" });
+    document.getElementById("save-folder").focus();
+  });
+  var go = document.getElementById("save-go");
+  if (go) {
+    go.addEventListener("click", function () {
+      var c = { folder: document.getElementById("save-folder").value.trim(), code: document.getElementById("save-code").value };
+      if (!c.folder || !c.code || !pendingSave) return;
+      doSave(pendingSave, c, function (m) { document.getElementById("save-msg").textContent = m; });
+    });
+    document.getElementById("save-cancel").addEventListener("click", function () {
+      document.getElementById("save-login").hidden = true; pendingSave = null;
+    });
+    showWho();
+  }
   document.addEventListener("change", function (ev) {
     var t = ev.target;
     if (!t.classList || !t.classList.contains("checked-box")) return;
@@ -373,7 +441,9 @@ def render_shared_report(
             )
         items_html.append(
             f'<div class="{" ".join(classes)}" data-key="{_e(key)}">'
-            f"{check_html}"
+            '<div class="corner">'
+            + ('<button type="button" class="save-btn" title="Сохранить в свою папку («Сохранённое»)">💾</button>' if row is not None else "")
+            + f"{check_html}</div>"
             f'<div class="num">№{num}</div>'
             f"{body_html}{note_html}{links_html}{platform_html}{tail}"
             "</div>"
@@ -388,7 +458,21 @@ def render_shared_report(
         if pending_count:
             intro += f" Ожидают проверки руководителя ОКК: {pending_count}."
         intro += " Всё сохраняется автоматически."
-        body += f'<p class="muted">{intro}</p>' + "".join(items_html)
+        body += f'<p class="muted">{intro}</p>'
+        # 💾 on a block saves it into «Сохранённое» of the folder whose name
+        # and password are entered here (asked once, remembered on this
+        # device) — the page itself has no login, it's opened by a link.
+        body += (
+            '<div id="save-login" class="save-login" hidden>'
+            "<span>Сохранить в свою папку:</span>"
+            '<input id="save-folder" placeholder="Название папки" autocomplete="username" />'
+            '<input id="save-code" type="password" placeholder="Пароль папки" autocomplete="current-password" />'
+            '<button type="button" id="save-go" class="btn btn-done">Сохранить</button>'
+            '<button type="button" id="save-cancel" class="btn">Отмена</button>'
+            '<span class="msg" id="save-msg"></span></div>'
+            '<div id="save-who" class="save-who" hidden></div>'
+        )
+        body += "".join(items_html)
         return _page(f"Замечания — {lang.upper()}", body, _SCRIPT, nonce)
     body += '<div class="empty">Замечаний к исправлению нет.</div>'
     return _page(f"Замечания — {lang.upper()}", body)

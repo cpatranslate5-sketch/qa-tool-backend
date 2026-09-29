@@ -317,6 +317,13 @@ class ShareOkkIn(BaseModel):
     links: str | None = None  # Crowdin link(s), editable by the QA head; None = keep as is
 
 
+class ShareSaveIn(BaseModel):
+    """💾 on the share page: save one block into a folder's «Сохранённое»."""
+    key: str
+    folder: str
+    code: str
+
+
 class ShareCheckedIn(BaseModel):
     key: str
     checked: bool = False

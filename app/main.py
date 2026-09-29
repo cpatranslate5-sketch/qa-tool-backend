@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app import models, schemas
 from app.auth import hash_code, verify_code
 from app.claude_client import domain_note_for_names, run_ai_checks
-from app.share_page import pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
+from app.share_page import numbered_findings, pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
@@ -1346,6 +1346,49 @@ def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Dep
     mc.review = review  # reassign so SQLAlchemy notices the JSON change
     db.commit()
     return {"ok": True}
+
+
+@app.post("/share/{token}/save-case", include_in_schema=False)
+def shared_report_save_case(token: str, payload: schemas.ShareSaveIn, db: Session = Depends(get_db)):
+    """💾 on the share page (2026-10-01, Александр): saves one finding with
+    its source and translation into «Сохранённое» of the folder named here.
+    The page has no login of its own, so the folder's password is required."""
+    link = _active_share_link(token, db)
+    mc = link.multi_check
+    wanted = payload.folder.strip().lower()
+    manager = next((m for m in db.query(models.Manager).all() if m.name.strip().lower() == wanted), None)
+    if manager is None or not verify_code(payload.code.strip(), manager.code_hash):
+        raise HTTPException(401, "Неверная папка или пароль.")
+    key = payload.key.strip()
+    visible = pending_keys(link.lang, mc.results or {}, mc.review or {}) | sent_keys(link.lang, mc.results or {}, mc.review or {})
+    found = next(
+        ((row, f) for _, k, row, f in numbered_findings(link.lang, mc.results or {}) if k == key and row is not None),
+        None,
+    )
+    if key not in visible or found is None:
+        raise HTTPException(400, "Такого замечания нет.")
+    row, f = found
+    sheet_idx = key.split("|")[0]
+    source_key = f"{mc.id}|{sheet_idx}|{link.lang}|{row.get('excel_row')}|{key.split('|')[-1]}|m{manager.id}"
+    existing = db.query(models.SavedCase).filter(models.SavedCase.source_key == source_key).first()
+    if existing is None:
+        project = db.get(models.Project, mc.project_id)
+        db.add(models.SavedCase(
+            source_key=source_key,
+            multi_check_id=mc.id,
+            manager_id=manager.id,
+            project_name=project.name if project else "",
+            filename=mc.filename or "",
+            lang=link.lang,
+            excel_row=row.get("excel_row") or 0,
+            context=row.get("context") or "",
+            source=row.get("source") or "",
+            translation=row.get("translation") or "",
+            findings=[{"type": f.get("type"), "severity": f.get("severity"), "message": f.get("message")}],
+            saved_by_name=manager.name,
+        ))
+        db.commit()
+    return {"ok": True, "folder": manager.name}
 
 
 @app.post("/share/{token}/checked", include_in_schema=False)
