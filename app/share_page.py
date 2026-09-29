@@ -57,7 +57,6 @@ _CSS = """
   .tag { color: #c026d3; font-weight: 600; }
   .item { position: relative; background: #fff; border: 1px solid #dde1e7; border-radius: 10px; padding: 12px 14px; margin-top: 12px;
           transition: background .15s, border-color .15s; }
-  .item.tone { background: #eef2ff; border-color: #c7d2fe; }
   .item.pending.p-accept { background: #eaf7ef; border-color: #9fd5b3; }
   .item.pending.p-question { background: #fff8db; border-color: #f0d98c; }
   .item.done { background: #eaf7ef; border-color: #9fd5b3; }
