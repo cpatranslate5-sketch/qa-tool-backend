@@ -1834,7 +1834,8 @@ MODEL_PRICING_PER_TOKEN = {
     "claude-sonnet-5": {"input": 2.00 / 1_000_000, "output": 10.00 / 1_000_000},
     "claude-opus-5": {"input": 5.00 / 1_000_000, "output": 25.00 / 1_000_000},
     # 2026-09-29, confirmed against Anthropic's current price list.
-    "claude-opus-5-5": {"input": 4.00 / 1_000_000, "output": 20.00 / 1_000_000},
+    # Cache reads on Opus 5.5 are $0.20 per 1M (5% of input), not the flat 10%.
+    "claude-opus-5-5": {"input": 4.00 / 1_000_000, "output": 20.00 / 1_000_000, "cache_read": 0.20 / 1_000_000},
 }
 # The Message Batches API (used for large multi-checks — see
 # excel_multi.BATCH_THRESHOLD_CHARS) is half price on both input and output.
@@ -1853,11 +1854,13 @@ OPENAI_MODEL_PRICING_PER_TOKEN = {
     "gpt-5-mini": {"input": 0.25 / 1_000_000, "output": 2.00 / 1_000_000},
     "gpt-5-nano": {"input": 0.05 / 1_000_000, "output": 0.40 / 1_000_000},
     "gpt-5": {"input": 1.25 / 1_000_000, "output": 10.00 / 1_000_000},
-    # GPT-5.6 family, confirmed 2026-09-29 against OpenAI's own GPT-5.6
-    # announcement (Sol $5/$30, Terra $2.50/$15, Luna $1/$6 per 1M tokens).
-    "gpt-5.6-sol": {"input": 5.00 / 1_000_000, "output": 30.00 / 1_000_000},
-    "gpt-5.6-terra": {"input": 2.50 / 1_000_000, "output": 15.00 / 1_000_000},
-    "gpt-5.6-luna": {"input": 1.00 / 1_000_000, "output": 6.00 / 1_000_000},
+    # GPT-5.6 family, re-checked 2026-10-01 after OpenAI's price cut: Sol
+    # $4/$20 (OpenAI's own model page for gpt-5.6-sol, cached input $0.40),
+    # Terra $2/$12, Luna $0.20/$1.20 per 1M tokens. The earlier $5/$30 and
+    # $2.50/$15 overstated every GPT check's shown cost.
+    "gpt-5.6-sol": {"input": 4.00 / 1_000_000, "output": 20.00 / 1_000_000},
+    "gpt-5.6-terra": {"input": 2.00 / 1_000_000, "output": 12.00 / 1_000_000},
+    "gpt-5.6-luna": {"input": 0.20 / 1_000_000, "output": 1.20 / 1_000_000},
 }
 
 
@@ -1931,7 +1934,7 @@ def _usage_cost(model: str, usage: dict | None, batch: bool = False) -> float:
         return 0.0
     cost = usage.get("input_tokens", 0) * rates["input"] + usage.get("output_tokens", 0) * rates["output"]
     cost += usage.get("cache_creation_input_tokens", 0) * rates["input"] * CACHE_WRITE_PRICE_MULTIPLIER
-    cost += usage.get("cache_read_input_tokens", 0) * rates["input"] * CACHE_READ_PRICE_MULTIPLIER
+    cost += usage.get("cache_read_input_tokens", 0) * rates.get("cache_read", rates["input"] * CACHE_READ_PRICE_MULTIPLIER)
     cost = cost * BATCH_PRICE_DISCOUNT if batch else cost
     return cost * CONSOLE_TOPUP_TAX_MULTIPLIER
 
@@ -2081,6 +2084,25 @@ async def _call_openai(
     return text, data.get("usage", {}), stop_reason
 
 
+class MissingApiKeyError(httpx.HTTPError):
+    """A language is routed to a vendor whose API key isn't set on the
+    server (2026-10-01): used to return an empty answer silently — the
+    language then looked «проверено, ошибок нет» while nothing was checked."""
+
+
+def _missing_key_warning(route: "ModelRoute") -> dict:
+    env = "OPENAI_API_KEY" if route.vendor == "openai" else "ANTHROPIC_API_KEY"
+    return {
+        "type": "system",
+        "severity": "high",
+        "message": (
+            f"Этот язык НЕ проверен нейросетью: он закреплён за моделью {route.label}, но на сервере не задан "
+            f"ключ {env} (переменная в настройках Railway). Бесплатные автоматические проверки (числа, теги, "
+            "пунктуация и т.п.) отработали. Добавьте ключ и перепроверьте язык."
+        ),
+    }
+
+
 async def _call_route(
     route: ModelRoute, prompt: str, cache_prefix: str | None = None, effort: str | None = None,
 ) -> tuple[str | None, float, str | None]:
@@ -2088,6 +2110,10 @@ async def _call_route(
     (response text, cost_usd, stop_reason). OpenAI caches long identical
     prompt prefixes automatically, so cache_prefix only matters for
     Anthropic; effort only matters for OpenAI."""
+    if route.vendor == "openai" and not settings.OPENAI_API_KEY:
+        raise MissingApiKeyError("OPENAI_API_KEY is not set")
+    if route.vendor != "openai" and not settings.ANTHROPIC_API_KEY:
+        raise MissingApiKeyError("ANTHROPIC_API_KEY is not set")
     if route.vendor == "openai":
         text, usage, stop = await _call_openai(prompt, model=route.model, effort=effort)
         return text, _openai_usage_cost(route.model, usage), stop
@@ -2252,9 +2278,12 @@ async def run_ai_checks(
     cache_prefix = _SINGLE_PROMPT_PREFIX.format(**prompt_kwargs)
     prompt = cache_prefix + _SINGLE_PROMPT_SUFFIX.format(**prompt_kwargs)
     route = route_for_lang(target_lang)
-    text_block, step2_cost, stop_reason = await _call_route(
-        route, prompt, cache_prefix=cache_prefix, effort=settings.OPENAI_EFFORT_CHECK,
-    )
+    try:
+        text_block, step2_cost, stop_reason = await _call_route(
+            route, prompt, cache_prefix=cache_prefix, effort=settings.OPENAI_EFFORT_CHECK,
+        )
+    except MissingApiKeyError:
+        return [_missing_key_warning(route)], search_cost
     findings = _filter_findings_by_checks(_apply_confidence_threshold(parse_json_array(text_block)), checks)
     if stop_reason == "max_tokens":
         findings = findings + [_truncation_warning()]
@@ -2486,6 +2515,9 @@ async def run_ai_checks_batch(
         text_block, step2_cost, stop_reason = await _call_route(
             route, prompt, cache_prefix=cache_prefix, effort=settings.OPENAI_EFFORT_CHECK,
         )
+    except MissingApiKeyError:
+        route_used = route_for_model_id(model_override) if model_override else route_for_lang(target_lang)
+        return {}, search_cost, False, [_missing_key_warning(route_used)]
     except _BRANCH_FAILURE_EXCEPTIONS:
         return {}, search_cost, False, search_warnings + [_step2_call_failure_warning()]
     raw = _apply_confidence_threshold(parse_json_array(text_block))

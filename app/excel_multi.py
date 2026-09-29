@@ -1211,6 +1211,7 @@ async def run_multi_check(
     result_sheets = []
     total_findings = 0
     total_rows_checked = 0
+    cost_by_model: dict[str, float] = {}
     total_cost_usd = 0.0
 
     async def _run_one(sheet: dict, lang: str) -> tuple[list[dict], float]:
@@ -1245,6 +1246,8 @@ async def run_multi_check(
             languages_out[lang] = findings_list
             total_findings += _count_real_findings(findings_list)
             total_cost_usd += lang_cost
+            label = route_for_lang(lang).label
+            cost_by_model[label] = cost_by_model.get(label, 0.0) + lang_cost
 
         total_rows_checked += len(sheet["rows"])
         result_sheets.append({
@@ -1265,6 +1268,9 @@ async def run_multi_check(
         "models_by_lang": {
             l: route_for_lang(l).label for s_ in result_sheets for l in s_["languages_checked"]
         },
+        # Cost split per model (2026-10-01): which vendor's balance each part
+        # of «Стоимость» comes from. Includes the 18% top-up tax like the total.
+        "cost_by_model": {k: round(v, 6) for k, v in cost_by_model.items()},
     }
     return {"sheets": result_sheets, "summary": summary}
 
