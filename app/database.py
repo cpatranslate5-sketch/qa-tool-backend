@@ -231,6 +231,19 @@ def _run_migrations():
             if "translator_review" not in cols:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN translator_review JSON"))
 
+    # 2026-10-01: «Сохранённое» became per-folder (see models.SavedCase).
+    # Older rows get the folder of the report they were saved from.
+    if "saved_cases" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("saved_cases")}
+        if "manager_id" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE saved_cases ADD COLUMN manager_id INTEGER"))
+                conn.execute(text(
+                    "UPDATE saved_cases SET manager_id = "
+                    "(SELECT manager_id FROM multi_checks WHERE multi_checks.id = saved_cases.multi_check_id) "
+                    "WHERE manager_id IS NULL"
+                ))
+
     # The target-language checkbox catalog is now its own table, fully
     # decoupled from tone_rules — Александр asked for the checkbox list to
     # change ONLY when he explicitly adds or removes a language, never as

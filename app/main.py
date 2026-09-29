@@ -1193,7 +1193,9 @@ async def multi_check_detail(
         # Blocks of this report already in «Сохранённое» ("<sheet>|<lang>|<row>").
         "saved_keys": [
             sc.source_key.split("|", 1)[1]
-            for sc in db.query(models.SavedCase).filter(models.SavedCase.multi_check_id == record.id).all()
+            for sc in db.query(models.SavedCase).filter(
+                models.SavedCase.multi_check_id == record.id, models.SavedCase.manager_id == record.manager_id,
+            ).all()
         ],
     }
 
@@ -1384,7 +1386,7 @@ def shared_report_respond(token: str, payload: schemas.TranslatorResponseIn, db:
 
 # ------------------------------------------------------------ «Сохранённое» ---
 # Interesting cases saved from reports with the 💾 button (2026-10-01,
-# Александр). Shared by every folder, like the language dictionary.
+# Александр). Each folder sees and deletes only its own.
 
 def _saved_case_out(sc: models.SavedCase) -> dict:
     return {
@@ -1403,8 +1405,14 @@ def _saved_case_out(sc: models.SavedCase) -> dict:
 
 
 @app.get("/saved-cases")
-def list_saved_cases(db: Session = Depends(get_db)):
-    rows = db.query(models.SavedCase).order_by(models.SavedCase.created_at.desc(), models.SavedCase.id.desc()).all()
+def list_saved_cases(manager_id: int, db: Session = Depends(get_db)):
+    _get_manager(manager_id, db)
+    rows = (
+        db.query(models.SavedCase)
+        .filter(models.SavedCase.manager_id == manager_id)
+        .order_by(models.SavedCase.created_at.desc(), models.SavedCase.id.desc())
+        .all()
+    )
     return {"cases": [_saved_case_out(r) for r in rows]}
 
 
@@ -1428,6 +1436,7 @@ def save_case(project_id: int, multi_check_id: int, payload: schemas.SaveCaseIn,
         existing = models.SavedCase(
             source_key=source_key,
             multi_check_id=record.id,
+            manager_id=manager.id,
             project_name=project.name if project else "",
             filename=record.filename or "",
             lang=payload.lang,
@@ -1451,7 +1460,7 @@ def save_case(project_id: int, multi_check_id: int, payload: schemas.SaveCaseIn,
 def delete_saved_case(case_id: int, manager_id: int, db: Session = Depends(get_db)):
     _get_manager(manager_id, db)
     row = db.get(models.SavedCase, case_id)
-    if row is None:
+    if row is None or row.manager_id != manager_id:
         raise HTTPException(404, "Этот кейс уже удалён.")
     db.delete(row)
     db.commit()

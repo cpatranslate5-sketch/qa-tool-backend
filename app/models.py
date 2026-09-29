@@ -261,8 +261,8 @@ class SavedCase(Base):
     """«Сохранённое» (2026-10-01, Александр): interesting findings a manager
     saved from a report with the 💾 button — one row of one language, with
     its source, translation and the platform's comments, copied here so it
-    survives even if the report itself is deleted later. Shared by every
-    folder, like the language dictionary; anyone can delete a case."""
+    survives even if the report itself is deleted later. Private to the
+    folder that saved it (Александр, 2026-10-01)."""
     __tablename__ = "saved_cases"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -270,6 +270,8 @@ class SavedCase(Base):
     # can't be saved twice.
     source_key: Mapped[str] = mapped_column(String(200), unique=True, index=True, nullable=False)
     multi_check_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The folder that saved it — only that folder sees it (2026-10-01).
+    manager_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     project_name: Mapped[str] = mapped_column(String(200), default="")
     filename: Mapped[str] = mapped_column(String(300), default="")
     lang: Mapped[str] = mapped_column(String(40), default="")
