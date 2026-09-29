@@ -105,6 +105,31 @@ def _t(v) -> str:
     return "".join(out)
 
 
+# Row numbers mean nothing to translators (Crowdin splits strings its own
+# way — Александр, 2026-10-01), so the translator page never shows them.
+_ALSO_ROWS_RE = re.compile(r"\s*\(также в строках:[^)]*\)\s*$")
+
+
+def _strip_rows(message: str) -> str:
+    return _ALSO_ROWS_RE.sub("", str(message or ""))
+
+
+def _tone_text(f: dict) -> str:
+    """The tone summary without row numbers: «Вы», «ты», or the majority
+    plus the actual exception texts (when the check kept them)."""
+    majority = f.get("register_majority")
+    word = "Вы" if majority == "formal" else "ты" if majority == "informal" else ""
+    if not word:
+        return re.sub(r",?\s*кроме:.*$", "", _strip_rows(f.get("message"))).rstrip(".") or ""
+    exceptions = f.get("register_exceptions") or []
+    texts = [str(e.get("text") or "").strip() for e in exceptions if str(e.get("text") or "").strip()]
+    if texts:
+        return f"{word}, кроме: " + "; ".join(f"«{t}»" for t in texts)
+    if exceptions or f.get("register_exception_labels"):
+        return f"{word} (есть отдельные исключения)"
+    return word
+
+
 def _links_html(raw: str) -> str:
     parts = [p for p in re.split(r"\s+", raw or "") if p]
     if not parts:
@@ -297,14 +322,14 @@ def render_shared_report(
             classes.append(tr_decision)
 
         if row is None:
-            body_html = f'<div class="field"><span class="label">Тон обращения:</span> {_e(f.get("message"))}</div>'
+            body_html = f'<div class="field"><span class="label">Тон обращения:</span> {_t(_tone_text(f))}</div>'
             platform_html = ""
         else:
             body_html = (
                 f'<div class="field"><span class="label">Источник:</span> {_t(row.get("source"))}</div>'
                 f'<div class="field"><span class="label">Перевод:</span> {_t(row.get("translation"))}</div>'
             )
-            platform_html = f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(f.get("message"))}</div>'
+            platform_html = f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(_strip_rows(f.get("message")))}</div>'
         links_html = _links_html(entry.get("links", ""))
         if pending:
             # The QA head can add or fix the Crowdin link(s) at this stage.
