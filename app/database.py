@@ -230,6 +230,9 @@ def _run_migrations():
             # 2026-09-30: translators' answers (see models.MultiCheck.translator_review).
             if "translator_review" not in cols:
                 conn.execute(text("ALTER TABLE multi_checks ADD COLUMN translator_review JSON"))
+            # 2026-10-01: report view of a single check (see models.MultiCheck.single_check_id).
+            if "single_check_id" not in cols:
+                conn.execute(text("ALTER TABLE multi_checks ADD COLUMN single_check_id INTEGER"))
 
     # 2026-10-01: «Сохранённое» became per-folder (see models.SavedCase).
     # Older rows get the folder of the report they were saved from.

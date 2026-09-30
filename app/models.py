@@ -226,6 +226,10 @@ class MultiCheck(Base):
     # — {finding_key: {"decision": "accept"|"reject"|None, "comment": str}}.
     # Kept apart from the manager's review so neither side overwrites the other.
     translator_review: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 2026-10-01: set when this record is the report view of a single
+    # («точечная») check — it then reuses the whole review / translator-link
+    # flow, and is hidden from the file-check history.
+    single_check_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     # When this record's batch actually finished (flipped to "completed") —
     # together with created_at and batch_volume_chars, this is the
     # historical data _estimate_batch_minutes learns from. NULL for a

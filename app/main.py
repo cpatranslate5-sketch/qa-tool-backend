@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.auth import hash_code, verify_code
-from app.claude_client import domain_note_for_names, run_ai_checks
+from app.claude_client import domain_note_for_names, route_for_lang, run_ai_checks
 from app.share_page import ALL_LANGS, numbered_findings, report_langs, pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
@@ -752,9 +752,86 @@ def delete_single_check(project_id: int, single_check_id: int, manager_id: int, 
     record = db.get(models.SingleCheck, single_check_id)
     if record is None or record.project_id != project_id or record.manager_id != manager_id:
         raise HTTPException(404, "Проверка не найдена.")
+    # Its report view (and translator links) go with it.
+    for mc in db.query(models.MultiCheck).filter(models.MultiCheck.single_check_id == record.id).all():
+        db.delete(mc)
     db.delete(record)
     db.commit()
     return {"ok": True}
+
+
+def _single_check_as_results(sc: models.SingleCheck) -> dict:
+    """A single check in the multi-check results shape: one sheet, one
+    language, one row (plus the usual row-0 tone / system boxes)."""
+    lang = sc.target_lang or "xx"
+    findings = sc.findings or []
+    tone = [f for f in findings if f.get("type") == "register_summary"]
+    system = [f for f in findings if f.get("type") == "system"]
+    real = [f for f in findings if f.get("type") not in ("register_summary", "system")]
+    rows = []
+    if real:
+        rows.append({"excel_row": 1, "context": "", "source": sc.source, "translation": sc.translation, "findings": real})
+    if tone:
+        rows.append({"excel_row": 0, "context": "ℹ️ Тон обращения", "source": "", "translation": "", "findings": tone})
+    if system:
+        rows.append({"excel_row": 0, "context": "⚠ Системное предупреждение", "source": "", "translation": "", "findings": system})
+    summary = {
+        "sheets": 1,
+        "rows_checked": 1,
+        "languages_checked": [lang],
+        "total_findings": len(real),
+        "cost_usd": sc.cost_usd or 0.0,
+        "models_by_lang": {lang: route_for_lang(lang).label},
+    }
+    return {
+        "sheets": [{
+            "sheet_name": "Точечная проверка",
+            "source_lang": sc.source_lang,
+            "languages_checked": [lang],
+            "languages": {lang: rows},
+            "unrecognized_columns": [],
+        }],
+        "summary": summary,
+    }
+
+
+@app.post("/projects/{project_id}/history/{single_check_id}/report")
+def single_check_report(project_id: int, single_check_id: int, manager_id: int, db: Session = Depends(get_db)):
+    """Report for a single («точечная») check (2026-10-01, Александр): made
+    once as a report record, so ✓ / ? / ✕, the translator link, the QA
+    head's step, 💾 — everything works exactly like for a file check.
+    Returns its multi_check_id; the same one on every later call."""
+    _get_project(project_id, db)
+    sc = db.get(models.SingleCheck, single_check_id)
+    if sc is None or sc.project_id != project_id or sc.manager_id != manager_id:
+        raise HTTPException(404, "Проверка не найдена.")
+    mc = db.query(models.MultiCheck).filter(models.MultiCheck.single_check_id == sc.id).first()
+    if mc is None:
+        results = _single_check_as_results(sc)
+        when = ""
+        if sc.created_at:
+            created = sc.created_at if sc.created_at.tzinfo else sc.created_at.replace(tzinfo=datetime.timezone.utc)
+            moscow = datetime.timezone(datetime.timedelta(hours=3))  # MSK, no DST
+            when = created.astimezone(moscow).strftime("%d.%m.%Y %H:%M")
+        mc = models.MultiCheck(
+            project_id=project_id,
+            manager_id=manager_id,
+            filename=f"Точечная проверка {when}".strip(),
+            source_lang=sc.source_lang or "",
+            checks_run=sc.checks_run or [],
+            summary=results["summary"],
+            results=results,
+            status="completed",
+            performed_by_name=sc.performed_by_name or "",
+            cost_usd=sc.cost_usd or 0.0,
+            created_at=sc.created_at,
+            completed_at=sc.created_at,
+            single_check_id=sc.id,
+        )
+        db.add(mc)
+        db.commit()
+        db.refresh(mc)
+    return {"multi_check_id": mc.id}
 
 
 # ---------------------------------------------------------- multi check ---
@@ -1047,6 +1124,7 @@ async def multi_check_history(
     records = db.query(models.MultiCheck).filter(
         models.MultiCheck.project_id == project_id,
         models.MultiCheck.manager_id == manager_id,
+        models.MultiCheck.single_check_id.is_(None),
     ).order_by(models.MultiCheck.created_at.desc()).limit(50).all()
 
     out = []
