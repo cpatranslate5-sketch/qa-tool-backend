@@ -12,6 +12,8 @@ import re
 import openpyxl
 
 from app.claude_client import (
+    fallback_warnings,
+    new_route_events,
     REGISTER_VALUE_TYPE,
     _ai_failure_warning,
     _filter_findings_by_checks,
@@ -1212,11 +1214,28 @@ async def run_multi_check(
     total_findings = 0
     total_rows_checked = 0
     cost_by_model: dict[str, float] = {}
+    lang_events: dict = {}
     total_cost_usd = 0.0
 
     async def _run_one(sheet: dict, lang: str) -> tuple[list[dict], float]:
+        # Each language runs in its own task, so this record is per language:
+        # which model actually paid for what, and any switch to the backup.
+        events = new_route_events()
+        lang_events[(id(sheet), lang)] = events
         try:
-            return await _check_language_for_sheet(sheet, lang, source_lang, checks, extra_instructions, semaphore)
+            findings_list, cost = await _check_language_for_sheet(
+                sheet, lang, source_lang, checks, extra_instructions, semaphore,
+            )
+            warns = fallback_warnings(events)
+            if warns:
+                findings_list = list(findings_list) + [{
+                    "excel_row": 0,
+                    "context": "⚠ Системное предупреждение",
+                    "source": "",
+                    "translation": "",
+                    "findings": warns,
+                }]
+            return findings_list, cost
         except Exception:
             logger.exception("check failed unexpectedly for language=%s", lang)
             return (
@@ -1246,8 +1265,14 @@ async def run_multi_check(
             languages_out[lang] = findings_list
             total_findings += _count_real_findings(findings_list)
             total_cost_usd += lang_cost
-            label = route_for_lang(lang).label
-            cost_by_model[label] = cost_by_model.get(label, 0.0) + lang_cost
+            # Which model's balance actually paid (the backup's, after a fallback).
+            by_label = (lang_events.get((id(sheet), lang)) or {}).get("cost_by_label") or {}
+            for label, c in by_label.items():
+                cost_by_model[label] = cost_by_model.get(label, 0.0) + c
+            rest = lang_cost - sum(by_label.values())
+            if rest > 1e-9:
+                label = route_for_lang(lang).label
+                cost_by_model[label] = cost_by_model.get(label, 0.0) + rest
 
         total_rows_checked += len(sheet["rows"])
         result_sheets.append({

@@ -1,12 +1,17 @@
 import asyncio
+import contextvars
 import json
 import re
+
+import logging
 
 import httpx
 from typing import NamedTuple
 
 from app.config import settings
 from app.rule_checks import RULE_BASED_TYPES
+
+logger = logging.getLogger(__name__)
 
 # "register" (tone of address) is NOT in here — as of 2026-09-16 it isn't
 # an error-finding check at all any more, so it never appears in the
@@ -1739,9 +1744,35 @@ def route_for_lang(target_lang: str) -> ModelRoute:
     return ModelRoute(_TIER_VENDOR[tier], _tier_model_id(tier), _TIER_LABEL[tier])
 
 
+# Backup model for each tier (2026-10-01, Александр): if a language's own
+# model fails (outage, no credit, missing key), its partner from the OTHER
+# vendor checks it instead — Sonnet ↔ Terra, Opus ↔ Sol — and the report
+# says so.
+BACKUP_TIER = {"sonnet": "terra", "terra": "sonnet", "opus": "sol", "sol": "opus"}
+
+
+def _route_for_tier(tier: str) -> ModelRoute:
+    return ModelRoute(_TIER_VENDOR[tier], _tier_model_id(tier), _TIER_LABEL[tier])
+
+
+def _tier_for_route(route: ModelRoute) -> str | None:
+    for tier in _TIER_VENDOR:
+        if _tier_model_id(tier) == route.model:
+            return tier
+    return None
+
+
+def backup_route(route: ModelRoute) -> ModelRoute | None:
+    tier = _tier_for_route(route)
+    return _route_for_tier(BACKUP_TIER[tier]) if tier in BACKUP_TIER else None
+
+
 def route_for_model_id(model_id: str) -> ModelRoute:
     """For an explicit model id (diagnostics / overrides): vendor by id shape."""
     mid = (model_id or "").strip()
+    for tier in _TIER_VENDOR:
+        if _tier_model_id(tier) == mid:
+            return _route_for_tier(tier)
     vendor = "openai" if re.match(r"^(gpt|o\d|chatgpt)", mid.lower()) else "anthropic"
     return ModelRoute(vendor, mid, mid)
 
@@ -2103,7 +2134,63 @@ def _missing_key_warning(route: "ModelRoute") -> dict:
     }
 
 
+# Per-language record of what _call_route actually did — which model's
+# balance each call was paid from, and every switch to a backup model — so
+# the report can show both (set fresh per language by the caller; child
+# tasks share the same dict).
+ROUTE_EVENTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar("route_events", default=None)
+
+
+def new_route_events() -> dict:
+    events = {"fallbacks": [], "cost_by_label": {}}
+    ROUTE_EVENTS.set(events)
+    return events
+
+
+def fallback_warning(primary_label: str, backup_label: str) -> dict:
+    return {
+        "type": "system",
+        "severity": "medium",
+        "message": (
+            f"Страховка сработала: модель {primary_label} была недоступна (сбой сервиса, закончились средства "
+            f"или не задан ключ), поэтому этот язык (полностью или частично) проверила запасная модель "
+            f"{backup_label}. Проверка выполнена, но стиль и строгость замечаний могут немного отличаться от "
+            f"обычных. Если повторяется — проверьте баланс и ключ для {primary_label}."
+        ),
+    }
+
+
+def fallback_warnings(events: dict | None) -> list[dict]:
+    seen, out = set(), []
+    for pair in (events or {}).get("fallbacks", []):
+        if pair not in seen:
+            seen.add(pair)
+            out.append(fallback_warning(*pair))
+    return out
+
+
 async def _call_route(
+    route: ModelRoute, prompt: str, cache_prefix: str | None = None, effort: str | None = None,
+) -> tuple[str | None, float, str | None]:
+    """Calls the language's own model; if that fails outright, its backup
+    from the other vendor (BACKUP_TIER) — recorded in ROUTE_EVENTS so the
+    report shows a warning. Only when both fail does the error reach the
+    caller (which then shows its own «не проверено» warning)."""
+    try:
+        return await _call_route_once(route, prompt, cache_prefix=cache_prefix, effort=effort)
+    except _BRANCH_FAILURE_EXCEPTIONS as primary_error:
+        backup = backup_route(route)
+        if backup is None:
+            raise
+        logger.warning("model %s failed (%r) — falling back to %s", route.label, primary_error, backup.label)
+        result = await _call_route_once(backup, prompt, cache_prefix=cache_prefix, effort=effort)
+        events = ROUTE_EVENTS.get()
+        if events is not None:
+            events["fallbacks"].append((route.label, backup.label))
+        return result
+
+
+async def _call_route_once(
     route: ModelRoute, prompt: str, cache_prefix: str | None = None, effort: str | None = None,
 ) -> tuple[str | None, float, str | None]:
     """One call to whichever vendor a language is routed to — returns
@@ -2116,9 +2203,14 @@ async def _call_route(
         raise MissingApiKeyError("ANTHROPIC_API_KEY is not set")
     if route.vendor == "openai":
         text, usage, stop = await _call_openai(prompt, model=route.model, effort=effort)
-        return text, _openai_usage_cost(route.model, usage), stop
-    text, usage, stop = await _call_claude(prompt, model=route.model, cache_prefix=cache_prefix)
-    return text, _usage_cost(route.model, usage), stop
+        cost = _openai_usage_cost(route.model, usage)
+    else:
+        text, usage, stop = await _call_claude(prompt, model=route.model, cache_prefix=cache_prefix)
+        cost = _usage_cost(route.model, usage)
+    events = ROUTE_EVENTS.get()
+    if events is not None:
+        events["cost_by_label"][route.label] = events["cost_by_label"].get(route.label, 0.0) + cost
+    return text, cost, stop
 
 
 def _salvage_json_objects(text: str) -> list:
@@ -2218,6 +2310,18 @@ def _ai_failure_warning(reason: str) -> dict:
 
 
 async def run_ai_checks(
+    source: str, translation: str, checks: list[str], extra_instructions: str = "",
+    target_lang: str = "", source_lang: str = "",
+) -> tuple[list[dict], float]:
+    """Single-pair check; adds a warning when the backup model had to step in."""
+    events = new_route_events()
+    findings, cost = await _run_ai_checks_inner(
+        source, translation, checks, extra_instructions, target_lang, source_lang,
+    )
+    return findings + fallback_warnings(events), cost
+
+
+async def _run_ai_checks_inner(
     source: str, translation: str, checks: list[str], extra_instructions: str = "",
     target_lang: str = "", source_lang: str = "",
 ) -> tuple[list[dict], float]:
