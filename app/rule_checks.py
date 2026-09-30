@@ -733,6 +733,24 @@ def _extract_emoji(text: str) -> list[str]:
 # directly against the emoji with nothing between them.
 
 
+def _emoji_context(text: str, m: "re.Match") -> str:
+    """A short quote around one emoji, for the finding message."""
+    start = max(0, m.start() - 15)
+    end = min(len(text), m.end() + 8)
+    return ("…" if start > 0 else "") + text[start:end].strip() + ("…" if end < len(text) else "")
+
+
+def _emoji_at_edges(text: str) -> bool:
+    """True when every emoji of the text sits at its very start or end
+    (ignoring spaces, punctuation and neighbouring emoji)."""
+    ms = list(EMOJI_RE.finditer(text))
+    if not ms:
+        return False
+    stripped = EMOJI_RE.sub("\x00", text)
+    core = re.sub(r"^[\s\x00\W_]*|[\s\x00\W_]*$", "", stripped)
+    return "\x00" not in core
+
+
 def check_emoji(source: str, translation: str) -> list[dict]:
     findings = []
     src_emoji = _extract_emoji(source)
@@ -761,15 +779,44 @@ def check_emoji(source: str, translation: str) -> list[dict]:
     # and doesn't care whether the presence check above also fired.
     matches = list(EMOJI_RE.finditer(translation))
     unspaced = []
+    # 2026-10-01 (Александр — «очень важный момент»): an emoji with a LETTER
+    # right after it sits inside the text flow — it splits a word from its
+    # particle/ending («Spin Express 🎰에서») or glues onto the next word.
+    # Always a real error, reported loud (high) with the spot quoted.
+    splits = []
+    for i, m in enumerate(matches):
+        touches_next_emoji = i + 1 < len(matches) and matches[i + 1].start() == m.end()
+        if m.end() < len(translation) and not touches_next_emoji and translation[m.end()].isalnum():
+            splits.append(_emoji_context(translation, m))
+    if splits:
+        findings.append({
+            "type": "emoji",
+            "severity": "high",
+            "message": (
+                "Эмодзи стоит внутри фразы вплотную к следующему слову и разрывает текст (например, отделяет "
+                "слово от его частицы или окончания): " + "; ".join(f"«{s}»" for s in splits)
+                + ". Перенесите эмодзи за пределы фразы — как в исходнике (обычно в начало или конец)."
+            ),
+        })
+    # Moved from the edge of the line into the middle of the text.
+    if not splits and matches and _emoji_at_edges(source) and not _emoji_at_edges(translation):
+        findings.append({
+            "type": "emoji",
+            "severity": "medium",
+            "message": (
+                "В исходнике эмодзи стоит в начале/конце строки, а в переводе — посреди текста: "
+                + "; ".join(f"«{_emoji_context(translation, m)}»" for m in matches)
+                + ". Проверьте, не разрывает ли он фразу."
+            ),
+        })
     for i, m in enumerate(matches):
         touches_prev = i > 0 and matches[i - 1].end() == m.start()
         touches_next = i + 1 < len(matches) and matches[i + 1].start() == m.end()
         before_ok = (
             m.start() == 0 or touches_prev or not translation[m.start() - 1].isalnum()
         )
-        after_ok = (
-            m.end() == len(translation) or touches_next or not translation[m.end()].isalnum()
-        )
+        # A letter right AFTER the emoji is already reported above (splits).
+        after_ok = True
         if not before_ok or not after_ok:
             unspaced.append(m.group(0))
     if unspaced:
@@ -1118,7 +1165,6 @@ def check_punctuation(
         findings += check_hyphen_for_dash(translation)
 
     findings += check_mixed_script(translation)
-    findings += check_emoji(source, translation)
 
     return findings
 
@@ -1199,4 +1245,6 @@ def run_rule_checks(
         findings += check_punctuation(source, translation, lang_code, checks)
     if "sms_charset" in checks:
         findings += check_sms_charset(translation)
+    # Emoji checks are free and important — always on (2026-10-01).
+    findings += check_emoji(source, translation)
     return findings
