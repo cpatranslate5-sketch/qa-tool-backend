@@ -62,6 +62,7 @@ _CSS = """
   .item.done { background: #eaf7ef; border-color: #9fd5b3; }
   .item.na { background: #fdeeee; border-color: #f0b4b4; }
   .field { font-size: 0.9rem; margin-top: 4px; }
+  .links { margin-top: 10px; }
   .links a { color: #4f46e5; word-break: break-all; display: block; }
   .comment { border-left: 3px solid #d98a1f; background: rgba(0,0,0,0.03); padding: 6px 10px; margin-top: 8px; font-size: 0.9rem; }
   .block-label { display: block; font-size: 0.85rem; margin-top: 10px; }
@@ -84,6 +85,16 @@ _CSS = """
   .lang-title { font-size: 1.15rem; margin: 0 0 4px; padding-bottom: 6px; border-bottom: 2px solid #c7d2fe; }
   .corner { position: absolute; top: 10px; right: 12px; display: flex; align-items: center; gap: 6px; }
   .num { padding-right: 150px; }
+  .conf { font-weight: 600; color: #6b7280; font-size: 0.85rem; }
+  .undo-bar { display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 8px 12px; border-radius: 8px;
+              background: #1c2230; color: #fff; font-size: 0.88rem; }
+  .undo-bar button { margin-left: auto; background: #fff; color: #1c2230; border: none; border-radius: 6px; padding: 5px 12px;
+                     font: inherit; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
+  .item.undoable .actions, .item.undoable textarea, .item.undoable .block-label { display: none; }
+  .item.undo-keep { background: #eaf7ef; border-color: #17703c; }
+  .item.undo-remove { background: #fdeeee; border-color: #b42318; opacity: 0.85; }
+  .item.kept .actions, .item.kept textarea.okk-comment, .item.kept textarea.okk-links, .item.kept .block-label { display: none; }
+  .kept-note { margin-top: 10px; color: #17703c; font-weight: 600; font-size: 0.88rem; }
   .save-btn { background: #fff; border: 1px solid #dde1e7; border-radius: 6px; width: 30px; height: 26px; cursor: pointer;
               font-size: 0.9rem; line-height: 1; padding: 0; }
   .save-btn:hover { border-color: #6366f1; }
@@ -264,14 +275,72 @@ _SCRIPT = """
     }).catch(function () { if (st) st.textContent = "⚠ Не сохранилось — проверьте интернет"; });
   }
   function key(item) { return item.getAttribute("data-key"); }
-  function sendOkk(item, action) {
+  function okkBody(item, action) {
     var c = item.querySelector(".okk-comment");
     var l = item.querySelector(".okk-links");
-    post("/okk", { key: key(item), action: action || null, comment: c ? c.value : "", links: l ? l.value : null }, item, function () {
+    return { key: key(item), action: action || null, comment: c ? c.value : "", links: l ? l.value : null };
+  }
+  function sendOkk(item, action) {
+    post("/okk", okkBody(item, action), item, function () {
       if (action === "remove") item.parentNode.removeChild(item);
-      if (action === "keep") location.reload();
+      if (action === "keep") {
+        item.classList.add("kept");
+        var n = document.createElement("div");
+        n.className = "kept-note";
+        n.textContent = "✓ Оставлено переводчику. Обновите страницу, чтобы увидеть, как блок выглядит у переводчика.";
+        item.appendChild(n);
+      }
     });
   }
+  // «Оставить переводчику» / «Убрать» can be undone for 10 seconds; acting on
+  // the next finding ends that window early (2026-10-01, Александр).
+  var undo = null;
+  function clearUndo(u) {
+    clearInterval(u.tick);
+    if (u.bar && u.bar.parentNode) u.bar.parentNode.removeChild(u.bar);
+    u.item.classList.remove("undoable", "undo-keep", "undo-remove");
+  }
+  function commitUndo() {
+    if (!undo) return;
+    var u = undo; undo = null;
+    clearUndo(u);
+    if (u.action === "remove") u.item.style.display = "none";
+    sendOkk(u.item, u.action);
+  }
+  function startUndo(item, action) {
+    if (undo && undo.item === item) return;
+    commitUndo();
+    clearTimeout(timers[key(item)]);
+    var u = { item: item, action: action, left: 10 };
+    item.classList.add("undoable", action === "keep" ? "undo-keep" : "undo-remove");
+    var bar = document.createElement("div");
+    bar.className = "undo-bar";
+    var label = document.createElement("span");
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "Отменить";
+    bar.appendChild(label); bar.appendChild(btn);
+    item.appendChild(bar);
+    u.bar = bar;
+    function render() {
+      label.textContent = (action === "keep" ? "Оставлено переводчику." : "Убрано из отчёта.") + " Отменить можно ещё " + u.left + " с.";
+    }
+    render();
+    btn.addEventListener("click", function () { if (undo === u) { undo = null; clearUndo(u); } });
+    u.tick = setInterval(function () {
+      u.left -= 1;
+      if (u.left <= 0) { if (undo === u) commitUndo(); } else render();
+    }, 1000);
+    undo = u;
+  }
+  // Closing the page inside the 10 seconds still saves the decision.
+  window.addEventListener("pagehide", function () {
+    if (!undo) return;
+    var u = undo; undo = null;
+    try {
+      navigator.sendBeacon(base + "/okk", new Blob([JSON.stringify(okkBody(u.item, u.action))], { type: "application/json" }));
+    } catch (e) {}
+  });
   function sendAnswer(item) {
     var d = item.classList.contains("done") ? "done" : item.classList.contains("na") ? "na" : null;
     post("/respond", { key: key(item), decision: d, comment: item.querySelector(".tr-comment").value }, item);
@@ -281,8 +350,8 @@ _SCRIPT = """
     if (!b) return;
     var item = b.closest(".item");
     if (!item) return;
-    if (b.classList.contains("btn-keep")) { sendOkk(item, "keep"); return; }
-    if (b.classList.contains("btn-remove")) { sendOkk(item, "remove"); return; }
+    if (b.classList.contains("btn-keep")) { startUndo(item, "keep"); return; }
+    if (b.classList.contains("btn-remove")) { startUndo(item, "remove"); return; }
     var cls = b.classList.contains("btn-done") ? "done" : "na";
     var on = !item.classList.contains(cls);
     item.classList.remove("done", "na");
@@ -420,6 +489,13 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
         tr = translator_review.get(key) or {}
         tr_decision = {"accept": "done", "reject": "na"}.get(tr.get("decision"), tr.get("decision"))
         classes = ["item"]
+        # The AI's own confidence — for the QA head only (stage 1), never
+        # for the translator (2026-10-01).
+        conf = f.get("confidence", f.get("sonnet_percent"))
+        conf_html = (
+            f' <span class="conf" title="Уверенность ИИ в том, что это ошибка">· уверенность ИИ: {int(conf)}%</span>'
+            if (not entry.get("sent")) and row is not None and isinstance(conf, (int, float)) else ""
+        )
         if row is None:
             classes.append("tone")
         if pending:
@@ -479,13 +555,16 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             check_html = (
                 f'<label class="check" title="Для менеджера: правка проверена"><input type="checkbox" class="checked-box"{checked} /> Проверено</label>'
             )
+        # Crowdin link(s) are the last item, right above the buttons
+        # (Александр, 2026-10-01).
+        tail = tail.replace('<div class="actions">', links_html + '<div class="actions">', 1)
         items_html.append(
             f'<div class="{" ".join(classes)}" data-key="{_e(key)}">'
             '<div class="corner">'
             + ('<button type="button" class="save-btn" title="Сохранить в свою папку («Сохранённое»)">💾</button>' if row is not None else "")
             + f"{check_html}</div>"
-            f'<div class="num">№{num}</div>'
-            f"{body_html}{note_html}{links_html}{platform_html}{tail}"
+            f'<div class="num">№{num}{conf_html}</div>'
+            f"{body_html}{note_html}{platform_html}{tail}"
             "</div>"
         )
 

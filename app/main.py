@@ -904,8 +904,11 @@ async def detect_file_languages(project_id: int, file: UploadFile = File(...), d
     }
     known: set[str] = set()
     unknown: set[str] = set()
+    # Same normalization as the file's headers (e.g. an older «pt» → «pt-br»).
+    _amap = _load_alias_map(db)
+    catalog_norm = {_label_to_code(c, _amap) for c in catalog}
     for code in langs:
-        target = known if lang_matches_exactly(code, catalog) else unknown
+        target = known if lang_matches_exactly(code, catalog_norm) else unknown
         target.add(code)
 
     return {
@@ -1045,8 +1048,24 @@ async def multi_check(
 
     selected_checks = [c.strip() for c in checks.split(",") if c.strip()] or DEFAULT_MULTI_CHECKS
 
-    target_filter = {c.strip().lower() for c in target_langs.split(",") if c.strip()} or None
+    # Ticked catalog codes go through the SAME dictionary + spelling
+    # normalization as the file's headers (and as «Подтвердить выбор
+    # языков»), so e.g. an older catalog entry «pt» meets the file's
+    # «pt-BR» column («pt» → «pt-br»). Before this fix the confirmation said
+    # «найден», but the check itself silently skipped the language.
+    alias_map = _load_alias_map(db)
+    target_filter = {
+        _label_to_code(c.strip(), alias_map).lower() for c in target_langs.split(",") if c.strip()
+    } or None
     resolved_source = pick_source_lang(sheets, source_lang.strip().lower() or None)
+    if target_filter is not None:
+        file_targets = {l.lower() for s_ in sheets for l in s_["languages"] if l != resolved_source}
+        if not (target_filter & file_targets):
+            raise HTTPException(
+                400,
+                "Ни один из выбранных языков не найден в файле — проверка не запущена. "
+                "Нажмите «Подтвердить выбор языков» и при необходимости добавьте написание в «Словарь языков».",
+            )
 
     # 2026-09-29 redesign: every upload runs through the live background path.
     # Languages are now routed to different vendors (Claude or GPT, see

@@ -1725,12 +1725,15 @@ class ModelRoute(NamedTuple):
 
 
 def _tier_model_id(tier: str) -> str:
+    # Stripped: a stray space in a Railway variable used to make the model id
+    # stop matching its own tier — the report then showed «claude-sonnet-5»
+    # instead of «Claude Sonnet», and the backup model never kicked in.
     return {
         "opus": settings.MODEL_CLAUDE_OPUS,
         "sonnet": settings.MODEL_CLAUDE_SONNET,
         "sol": settings.MODEL_GPT_SOL,
         "terra": settings.MODEL_GPT_TERRA,
-    }[tier]
+    }[tier].strip()
 
 
 def tier_for_lang(target_lang: str) -> str:
@@ -1758,8 +1761,12 @@ def _route_for_tier(tier: str) -> ModelRoute:
 
 
 def _tier_for_route(route: ModelRoute) -> str | None:
+    mid = (route.model or "").strip().lower()
     for tier in _TIER_VENDOR:
-        if _tier_model_id(tier) == route.model:
+        if _tier_model_id(tier).lower() == mid:
+            return tier
+    for tier, label in _TIER_LABEL.items():
+        if label == route.label:
             return tier
     return None
 
@@ -1773,7 +1780,7 @@ def route_for_model_id(model_id: str) -> ModelRoute:
     """For an explicit model id (diagnostics / overrides): vendor by id shape."""
     mid = (model_id or "").strip()
     for tier in _TIER_VENDOR:
-        if _tier_model_id(tier) == mid:
+        if _tier_model_id(tier).lower() == mid.lower():
             return _route_for_tier(tier)
     vendor = "openai" if re.match(r"^(gpt|o\d|chatgpt)", mid.lower()) else "anthropic"
     return ModelRoute(vendor, mid, mid)
