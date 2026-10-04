@@ -341,6 +341,31 @@ PROJECTS_SEED: list[tuple[str, dict]] = [
 ]
 
 
+# Each project's languages = the languages that have a tone of address in
+# the client's ToV sheet for that project (Александр, 2026-10-04). Stored as
+# the project's «Языки проекта» catalog, in the codes the files use.
+_GROUP_1WIN = ["ar-eg", "es-es", "es-ar", "fr-ci", "fr-fr", "it-it", "ja-jp", "pl-pl", "pt-br"]
+PROJECT_LANGS: dict[str, list[str]] = {
+    "1win": _GROUP_1WIN,
+    "1win SMM": _GROUP_1WIN + ["ru-ru", "sw-ke"],
+    "WL regular": _GROUP_1WIN,
+    "Blogger": ["ar-eg", "az-az", "en-001", "ky-kg", "ro-md", "ro-ro", "ru-ru", "tg-tj", "uz-uz"],
+    "Jetton": ["az-az", "en-001", "es-ar", "id-id", "kk-kz", "pl-pl", "pt-br", "ru-ru", "tg-tj", "tr-tr", "uz-uz"],
+    "TonPlay": ["az-az", "en-001", "id-id", "kk-kz", "pl-pl", "ru-ru", "tg-tj", "uk-ua", "uz-uz"],
+    "WinGram": ["en-001", "pl-pl", "uk-ua", "uz-uz"],
+}
+
+
+def keys_for_codes(codes) -> list[str]:
+    """Styleguide language keys for a list of file/catalog codes."""
+    out: list[str] = []
+    for c in codes or []:
+        k = lang_key_for(c)
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
 # ---------------------------------------------------------------- merging ---
 def effective_rules(client_sg: dict | None, project_sg: dict | None) -> dict:
     """{lang: {section: value}} — the project's own sections win."""

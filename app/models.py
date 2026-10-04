@@ -103,6 +103,8 @@ class Client(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
     styleguide: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Which one-time seed steps were already applied (see main._seed_clients).
+    seed_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     projects: Mapped[list["Project"]] = relationship(back_populates="client")

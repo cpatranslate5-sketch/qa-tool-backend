@@ -58,6 +58,12 @@ def _run_migrations():
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE managers ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE"))
 
+    if "clients" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("clients")}
+        if "seed_version" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE clients ADD COLUMN seed_version INTEGER NOT NULL DEFAULT 0"))
+
     if "projects" in existing_tables:
         cols = {c["name"] for c in insp.get_columns("projects")}
         with engine.begin() as conn:

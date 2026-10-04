@@ -126,24 +126,38 @@ def _seed_clients(db: Session) -> None:
     """Creates the «1win» client with its styleguide and its seven projects
     once (2026-10-04, Александр). Existing projects with the same names
     (case-insensitive) are moved into the client instead of duplicated.
-    Never runs again once the client exists — later edits are the admin's."""
-    existing_client = db.query(models.Client).filter(models.Client.name == "1win").first()
-    if existing_client is not None:
-        _patch_vi_ranges(existing_client, db)
-        return
-    client = models.Client(name="1win", styleguide=sg_mod.build_client_seed())
-    db.add(client)
-    db.flush()
-    existing = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
-    for name, overrides in sg_mod.PROJECTS_SEED:
-        project = existing.get(name.lower())
-        if project is None:
-            project = models.Project(name=name, created_by_name="Система")
-            db.add(project)
-        project.client_id = client.id
-        if overrides and not project.styleguide:
-            project.styleguide = overrides
+    Each later step runs once too (client.seed_version) — later edits are
+    the admin's and are never overwritten."""
+    client = db.query(models.Client).filter(models.Client.name == "1win").first()
+    if client is None:
+        client = models.Client(name="1win", styleguide=sg_mod.build_client_seed(), seed_version=0)
+        db.add(client)
+        db.flush()
+        existing = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
+        for name, overrides in sg_mod.PROJECTS_SEED:
+            project = existing.get(name.lower())
+            if project is None:
+                project = models.Project(name=name, created_by_name="Система")
+                db.add(project)
+            project.client_id = client.id
+            if overrides and not project.styleguide:
+                project.styleguide = overrides
+        db.flush()
+    if (client.seed_version or 0) < 2:
+        # Step 2 (2026-10-04): each project's languages = the ToV table.
+        by_name = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
+        for name, codes in sg_mod.PROJECT_LANGS.items():
+            project = by_name.get(name.lower())
+            if project is None:
+                continue
+            db.query(models.LanguageCatalogEntry).filter(
+                models.LanguageCatalogEntry.project_id == project.id
+            ).delete()
+            for code in codes:
+                db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
+        client.seed_version = 2
     db.commit()
+    _patch_vi_ranges(client, db)
 
 
 def _patch_vi_ranges(client: models.Client, db: Session) -> None:
@@ -174,7 +188,18 @@ def _project_styleguide(project: models.Project | None) -> dict | None:
     client = project.client
     if client is None:
         return None
-    return sg_mod.effective_rules(client.styleguide, project.styleguide)
+    rules = sg_mod.effective_rules(client.styleguide, project.styleguide)
+    allowed = _project_sg_langs(project)
+    if allowed is not None:
+        rules = {k: v for k, v in rules.items() if k in allowed}
+    return rules
+
+
+def _project_sg_langs(project: models.Project) -> list[str] | None:
+    """Styleguide languages of a project = its «Языки проекта» catalog
+    (Александр, 2026-10-04). None when the catalog is empty (no limit)."""
+    codes = [e.lang_code for e in project.language_catalog]
+    return sg_mod.keys_for_codes(codes) if codes else None
 
 
 async def _run_second_opinion_background(multi_check_id: int, results: dict) -> None:
@@ -610,6 +635,7 @@ def get_project_styleguide(project_id: int, db: Session = Depends(get_db)):
         "client": _client_out(client) if client else None,
         "client_rules": (client.styleguide if client else None) or {},
         "own": project.styleguide or {},
+        "langs": _project_sg_langs(project),
         "history": _history(db, project.client_id, project.id),
     }
 
