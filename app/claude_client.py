@@ -745,6 +745,15 @@ def _search_task_context(extra_instructions: str) -> str:
     )
 
 
+def search_cache_prefix(source_lang: str = "", extra_instructions: str = "") -> str:
+    """Step 1's fixed leading text — the same for every language and chunk
+    of one run (used by _search_findings and by the cache warm-up)."""
+    return _FINDINGS_SEARCH_PROMPT_PREFIX.format(
+        source_lang_note=_source_lang_note(source_lang),
+        task_context=_search_task_context(extra_instructions),
+    )
+
+
 async def _search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
     route: "ModelRoute | None" = None, extra_instructions: str = "",
@@ -769,10 +778,7 @@ async def _search_findings(
     # of one language's Step 1 calls, but across every DIFFERENT target
     # language in the same run too (target_lang_line lives in the suffix
     # now, precisely so it no longer breaks that sharing).
-    cache_prefix = _FINDINGS_SEARCH_PROMPT_PREFIX.format(
-        source_lang_note=_source_lang_note(source_lang),
-        task_context=_search_task_context(extra_instructions),
-    )
+    cache_prefix = search_cache_prefix(source_lang, extra_instructions)
     prompt = cache_prefix + _FINDINGS_SEARCH_PROMPT_SUFFIX.format(
         target_lang_line=_target_lang_line(target_lang),
         pairs_block=_pairs_block(checkable),
@@ -2018,6 +2024,7 @@ async def _post_json_with_retries(url: str, headers: dict, payload: dict) -> htt
 
 async def _call_claude(
     prompt: str, model: str | None = None, cache_prefix: str | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str | None, dict, str | None]:
     """Returns (response_text, usage, stop_reason) — usage is Anthropic's raw
     {"input_tokens": int, "output_tokens": int, ...} dict (empty when no API
@@ -2068,7 +2075,7 @@ async def _call_claude(
         },
         {
             "model": resolved_model,
-            "max_tokens": AI_MAX_TOKENS,
+            "max_tokens": max_tokens or AI_MAX_TOKENS,
             "messages": [{"role": "user", "content": content}],
         },
     )
@@ -2220,6 +2227,33 @@ async def _call_route_once(
     if events is not None:
         events["cost_by_label"][route.label] = events["cost_by_label"].get(route.label, 0.0) + cost
     return text, cost, stop
+
+
+# Cache warm-up (2026-10-02, Александр: «рад любому решению, что удешевит
+# и не ухудшит качество»). Languages and chunks start in parallel, so
+# several calls with the SAME long instructions used to reach Anthropic at
+# the same moment — none of them could read the cache yet, and each paid
+# the +25% cache-write price for the same text. One tiny call per shared
+# prefix (1 output token) now writes it first; every real call after it
+# reads those instructions at ~10% price. The model sees exactly the same
+# text in every real call — only billing changes, never what is checked.
+_WARMUP_SUFFIX = "\n\n(Служебный запрос: ответь одним словом «ok».)"
+
+
+async def warm_prompt_cache(route: ModelRoute, cache_prefix: str | None) -> float:
+    """Writes cache_prefix into Anthropic's prompt cache for route.model.
+    Returns its cost (0.0 for OpenAI routes, which cache by themselves, or
+    when anything goes wrong — a failed warm-up only means no discount)."""
+    if not cache_prefix or route.vendor == "openai" or not settings.ANTHROPIC_API_KEY:
+        return 0.0
+    try:
+        _, usage, _ = await _call_claude(
+            cache_prefix + _WARMUP_SUFFIX, model=route.model, cache_prefix=cache_prefix, max_tokens=1,
+        )
+    except Exception:
+        logger.warning("cache warm-up failed for model=%s", route.model, exc_info=True)
+        return 0.0
+    return _usage_cost(route.model, usage)
 
 
 def _salvage_json_objects(text: str) -> list:

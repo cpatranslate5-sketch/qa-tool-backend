@@ -37,7 +37,13 @@ from app.claude_client import (
     run_term_consistency_check,
 )
 from app.rule_checks import run_rule_checks
-from app.claude_client import route_for_lang
+from app.claude_client import (
+    _checkable_items,
+    _checks_description,
+    route_for_lang,
+    search_cache_prefix,
+    warm_prompt_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1030,15 +1036,8 @@ async def _run_ai_chunks(
     return ai_findings_by_idx, cost_usd, truncated, search_warnings
 
 
-async def _check_language_for_sheet(
-    sheet: dict,
-    lang: str,
-    source_lang: str,
-    checks: list[str],
-    extra_instructions: str,
-    semaphore: asyncio.Semaphore,
-) -> tuple[list[dict], float]:
-    """Returns (rows-with-findings, production cost_usd)."""
+def _rows_and_items(sheet: dict, lang: str, source_lang: str) -> tuple[list[dict], list[dict]]:
+    """The rows one language actually checks, and their AI items."""
     relevant_rows = []
     ai_items = []
     for row in sheet["rows"]:
@@ -1050,6 +1049,62 @@ async def _check_language_for_sheet(
             continue
         relevant_rows.append(row)
         ai_items.append({"context": row["context"], "source": src, "translation": tgt})
+    return relevant_rows, ai_items
+
+
+def _shared_cache_prefixes(
+    sheet: dict, target_langs: list[str], source_lang: str, checks: list[str], extra_instructions: str,
+) -> list[tuple]:
+    """(route, prefix) pairs that two or more Claude calls of this sheet will
+    start with — only those are worth warming (see warm_prompt_cache)."""
+    has_search = bool(_checks_description(checks))
+    search_prefix = search_cache_prefix(source_lang, extra_instructions) if has_search else None
+    counts: dict[tuple[str, str], list] = {}
+
+    def _add(route, prefix):
+        if prefix:
+            entry = counts.setdefault((route.model, prefix), [route, 0])
+            entry[1] += 1
+
+    for lang in target_langs:
+        route = route_for_lang(lang)
+        if route.vendor == "openai":
+            continue
+        _, ai_items = _rows_and_items(sheet, lang, source_lang)
+        for chunk in _chunk_list(ai_items, _chunk_size_for_lang(lang)):
+            if not _checkable_items(chunk):
+                continue
+            _add(route, search_prefix)
+            _, step2_prefix, _ = build_batch_prompt(chunk, checks, extra_instructions, lang, source_lang)
+            _add(route, step2_prefix)
+    return [(route, prefix) for (_, prefix), (route, n) in counts.items() if n >= 2]
+
+
+async def _warm_caches(
+    sheet: dict, target_langs: list[str], source_lang: str, checks: list[str], extra_instructions: str,
+) -> dict[str, float]:
+    """Runs the warm-up calls for one sheet; returns their cost per model label."""
+    pairs = _shared_cache_prefixes(sheet, target_langs, source_lang, checks, extra_instructions)
+    if not pairs:
+        return {}
+    costs = await asyncio.gather(*[warm_prompt_cache(r, p) for r, p in pairs])
+    by_label: dict[str, float] = {}
+    for (route, _), c in zip(pairs, costs):
+        if c:
+            by_label[route.label] = by_label.get(route.label, 0.0) + c
+    return by_label
+
+
+async def _check_language_for_sheet(
+    sheet: dict,
+    lang: str,
+    source_lang: str,
+    checks: list[str],
+    extra_instructions: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[list[dict], float]:
+    """Returns (rows-with-findings, production cost_usd)."""
+    relevant_rows, ai_items = _rows_and_items(sheet, lang, source_lang)
 
     if not relevant_rows:
         return [], 0.0
@@ -1253,6 +1308,17 @@ async def run_multi_check(
         target_langs = [l for l in sheet["languages"] if l != source_lang]
         if target_langs_filter is not None:
             target_langs = [l for l in target_langs if _lang_selected(l, target_langs_filter)]
+        # Cache warm-up first (see claude_client.warm_prompt_cache) — a few
+        # seconds, then every language reads the shared instructions cheaply.
+        if target_langs:
+            try:
+                warm_costs = await _warm_caches(sheet, target_langs, source_lang, checks, extra_instructions)
+            except Exception:
+                logger.warning("cache warm-up skipped", exc_info=True)
+                warm_costs = {}
+            for label, c in warm_costs.items():
+                cost_by_model[label] = cost_by_model.get(label, 0.0) + c
+                total_cost_usd += c
         tasks = [_run_one(sheet, lang) for lang in target_langs]
         per_lang_results = await asyncio.gather(*tasks) if tasks else []
 
