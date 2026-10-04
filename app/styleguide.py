@@ -235,7 +235,7 @@ AUTO = {
     "uk": {"quotes": ["guillemets"], "em_dash": "spaced", "ranges": "en", "range_spaces": "none", "no_period_after_currency": True},
     "ur": {"quotes": ["straight", "curly"], "em_dash": "spaced", "ranges": "en", "range_spaces": "none", "hyphen_forbidden": True},
     "uz": {"quotes": ["curly"], "em_dash": "spaced", "ranges": "en", "range_spaces": "none"},
-    "vi": {"quotes": ["curly"], "em_dash": "unspaced"},
+    "vi": {"quotes": ["curly"], "em_dash": "unspaced", "ranges": "en_or_hyphen", "range_spaces": "none"},
     "zh": {"quotes": ["curly"], "cjk_punct": "zh", "zh_latin_space": True},
 }
 
@@ -244,6 +244,7 @@ NOTES = {
     ("fr", "marks"): "Уточнение: перед : ; ! ? допустим обычный или неразрывный пробел; после знака тоже нужен пробел, кроме конца предложения/сегмента.",
     ("fr", "ordinals"): "Уточнение: только «1ère»; «1re» — ошибка.",
     ("ar", "service_buttons"): "Уточнение: повелительное наклонение на служебной кнопке — ошибка.",
+    ("vi", "en_dash"): "Уточнение: диапазоны пишутся без пробелов (1-3 / 1–3), как в примере «Cấp độ phụ 1-3».",
     ("ms", "tone"): "Уточнение: kami — так компания говорит о себе (не kita; kita только в SMM). Конкретная форма обращения к игроку не задана.",
 }
 FS_FB_NOTE = (

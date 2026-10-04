@@ -127,7 +127,9 @@ def _seed_clients(db: Session) -> None:
     once (2026-10-04, Александр). Existing projects with the same names
     (case-insensitive) are moved into the client instead of duplicated.
     Never runs again once the client exists — later edits are the admin's."""
-    if db.query(models.Client).filter(models.Client.name == "1win").first() is not None:
+    existing_client = db.query(models.Client).filter(models.Client.name == "1win").first()
+    if existing_client is not None:
+        _patch_vi_ranges(existing_client, db)
         return
     client = models.Client(name="1win", styleguide=sg_mod.build_client_seed())
     db.add(client)
@@ -141,6 +143,26 @@ def _seed_clients(db: Session) -> None:
         project.client_id = client.id
         if overrides and not project.styleguide:
             project.styleguide = overrides
+    db.commit()
+
+
+def _patch_vi_ranges(client: models.Client, db: Session) -> None:
+    """2026-10-04 (Александр): Vietnamese ranges without spaces. Applied to
+    an already-seeded client only while its Vietnamese settings are still
+    the untouched seed values."""
+    data = dict(client.styleguide or {})
+    vi = dict(data.get("vi") or {})
+    auto = dict(vi.get("auto") or {})
+    if not auto or auto.get("ranges") != "any" or auto.get("range_spaces") != "any":
+        return
+    seed_vi = sg_mod.build_client_seed().get("vi") or {}
+    auto["ranges"], auto["range_spaces"] = "en_or_hyphen", "none"
+    vi["auto"] = auto
+    text = ((vi.get("en_dash") or {}).get("text") or "")
+    if "Уточнение: диапазоны" not in text and seed_vi.get("en_dash"):
+        vi["en_dash"] = seed_vi["en_dash"]
+    data["vi"] = vi
+    client.styleguide = data
     db.commit()
 
 
