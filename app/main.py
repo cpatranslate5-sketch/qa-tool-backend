@@ -156,6 +156,25 @@ def _seed_clients(db: Session) -> None:
             for code in codes:
                 db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
         client.seed_version = 2
+    if (client.seed_version or 0) < 3:
+        # Step 3 (2026-10-04, Александр: «где все остальные?»): step 2
+        # replaced the language lists, which dropped languages the team
+        # really checks. Put back every language these projects were
+        # actually checked in — taken from their check history.
+        names = {n.lower() for n, _ in sg_mod.PROJECTS_SEED}
+        for project in db.query(models.Project).all():
+            if project.name.strip().lower() not in names:
+                continue
+            have = {e.lang_code for e in project.language_catalog}
+            used: set[str] = set()
+            for mc in db.query(models.MultiCheck).filter(models.MultiCheck.project_id == project.id).all():
+                for sheet in ((mc.results or {}).get("sheets") or []):
+                    used.update((c or "").strip().lower() for c in sheet.get("languages_checked") or [])
+            for sc in db.query(models.SingleCheck).filter(models.SingleCheck.project_id == project.id).all():
+                used.add((sc.target_lang or "").strip().lower())
+            for code in sorted(c for c in used if c and c not in have):
+                db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
+        client.seed_version = 3
     db.commit()
     _patch_vi_ranges(client, db)
 
