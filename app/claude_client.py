@@ -1072,8 +1072,18 @@ LANG_CODE_MEANING_OVERRIDES = {
 # really is expected) — so Александр explicitly widened the carve-out to
 # cover this specific shape (2026-09-26), while the plain single-threshold
 # case with a literal number is UNCHANGED and still gets normal judgment.
+_TURKIC_HINT = (
+    "Общее уточнение для тюркских языков (по реакции переводчиков-носителей, 2026-10-04): живая норма здесь мягче учебной грамматики. Не считай ошибкой: (1) отсутствие аффикса винительного/родительного падежа (-ni/-ning и аналоги) у неопределённого объекта и у латинских сокращений (FS, FB, VIP, ID и т. п.) — в рекламных текстах это естественно; (2) способ присоединения аффикса к латинской аббревиатуре или числу — слитно, через дефис, апостроф или пробел (MSKdan / MSK-dan / MSK dan); сообщай только если в одном тексте написание разное, и тогда с severity low; (3) выбор слова, которое в этом языке является стандартным финансовым или игровым термином, даже если его первое словарное значение другое. Прежде чем заявлять об «искажении смысла», убедись, что слово в этом контексте действительно не имеет нужного значения.\n"
+)
+_UZ_HINT = (
+    "Уточнение для узбекского (подтверждено переводчиком-носителем): «hisoblamoq / hisoblanmoq / hisoblangan» — стандартный термин для «начислять / начислено» (ish haqi hisoblandi — зарплата начислена), это НЕ «подсчитать»; «uzoq» значит и «далеко», и «долго», поэтому «uzoqqa emas» = «ненадолго».\n"
+)
+
 GRAMMAR_LANGUAGE_HINTS: dict[str, str] = {
-    "ky": (
+    "uz": _TURKIC_HINT + _UZ_HINT,
+    "az": _TURKIC_HINT,
+    "tr": _TURKIC_HINT,
+    "ky": _TURKIC_HINT + (
         'Важное уточнение для этого языка (подтверждено переводчиками-носителями): перед послелогом '
         '«баштап» ("начиная с"/"от") окончание исходного падежа присоединяется к последнему числу и '
         'зависит от его звучания — «10дон баштап», «12ден баштап» и т.п. — так что это НЕ единая, всегда '
@@ -1093,7 +1103,7 @@ GRAMMAR_LANGUAGE_HINTS: dict[str, str] = {
         '«{{...}} баштап») — это не ошибка и не искажение смысла, а равноценный, естественно звучащий вариант '
         'той же конструкции «начиная с/от X».\n'
     ),
-    "kk": (
+    "kk": _TURKIC_HINT + (
         'Важное уточнение для этого языка (подтверждено переводчиками-носителями): перед послелогом '
         '«бастап» ("начиная с"/"от") окончание исходного падежа (аффикс) присоединяется к последнему числу '
         'и зависит от его звучания — так что разные окончания для разных чисел — это правильно, а не '
@@ -1143,6 +1153,12 @@ def _lang_line_with_styleguide(target_lang: str, styleguide_text: str = "") -> s
     line = _target_lang_line(target_lang)
     sg = (styleguide_text or "").strip()
     return f"{line}\n\n{sg}" if sg else line
+
+
+def _with_feedback(line: str, feedback_text: str = "") -> str:
+    """Adds what translators taught the platform (Step 2 only)."""
+    fb = (feedback_text or "").strip()
+    return f"{line}\n\n{fb}" if fb else line
 
 
 def _types_enum(checks: list[str], styleguide_text: str = "") -> str:
@@ -2386,19 +2402,19 @@ def _ai_failure_warning(reason: str) -> dict:
 
 async def run_ai_checks(
     source: str, translation: str, checks: list[str], extra_instructions: str = "",
-    target_lang: str = "", source_lang: str = "", styleguide_text: str = "",
+    target_lang: str = "", source_lang: str = "", styleguide_text: str = "", feedback_text: str = "",
 ) -> tuple[list[dict], float]:
     """Single-pair check; adds a warning when the backup model had to step in."""
     events = new_route_events()
     findings, cost = await _run_ai_checks_inner(
-        source, translation, checks, extra_instructions, target_lang, source_lang, styleguide_text,
+        source, translation, checks, extra_instructions, target_lang, source_lang, styleguide_text, feedback_text,
     )
     return findings + fallback_warnings(events), cost
 
 
 async def _run_ai_checks_inner(
     source: str, translation: str, checks: list[str], extra_instructions: str = "",
-    target_lang: str = "", source_lang: str = "", styleguide_text: str = "",
+    target_lang: str = "", source_lang: str = "", styleguide_text: str = "", feedback_text: str = "",
 ) -> tuple[list[dict], float]:
     """Returns (findings, cost_usd) — cost_usd is this one API call's actual
     cost from Anthropic's reported token usage (0.0 when no AI check ran,
@@ -2440,7 +2456,7 @@ async def _run_ai_checks_inner(
         )
 
     prompt_kwargs = dict(
-        target_lang_line=_lang_line_with_styleguide(target_lang, styleguide_text),
+        target_lang_line=_with_feedback(_lang_line_with_styleguide(target_lang, styleguide_text), feedback_text),
         calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang, checks),
         source=source,
@@ -2501,6 +2517,7 @@ def build_batch_prompt(
     source_lang: str = "",
     prior_findings: dict[int, list[str]] | None = None,
     styleguide_text: str = "",
+    feedback_text: str = "",
 ) -> tuple[str | None, str | None, dict[int, int]]:
     """
     Builds the prompt for one language's batch of (context, source,
@@ -2557,7 +2574,7 @@ def build_batch_prompt(
         checks, batch=True, target_lang=target_lang, single_item=is_single_item,
     )
     common_kwargs = dict(
-        target_lang_line=_lang_line_with_styleguide(target_lang, styleguide_text),
+        target_lang_line=_with_feedback(_lang_line_with_styleguide(target_lang, styleguide_text), feedback_text),
         calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang, checks),
         extra_instructions=extra_instructions.strip() or "нет",
@@ -2633,6 +2650,7 @@ async def run_ai_checks_batch(
     source_lang: str = "",
     model_override: str | None = None,
     styleguide_text: str = "",
+    feedback_text: str = "",
 ) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
     """Synchronous path: builds the prompt, calls Claude right away, and
     returns (findings keyed by index into items, this call's cost_usd,
@@ -2688,7 +2706,7 @@ async def run_ai_checks_batch(
 
     prompt, cache_prefix, number_to_index = build_batch_prompt(
         items, checks, extra_instructions, target_lang, source_lang, prior_findings=prior_findings,
-        styleguide_text=styleguide_text,
+        styleguide_text=styleguide_text, feedback_text=feedback_text,
     )
     if prompt is None:
         return {}, search_cost, False, search_warnings

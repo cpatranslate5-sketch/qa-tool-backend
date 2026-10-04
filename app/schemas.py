@@ -316,6 +316,8 @@ class ShareOkkIn(BaseModel):
     action: str | None = None  # "keep" | "remove" | None (just save the comment)
     comment: str = ""  # «Комментарий для переводчика»
     links: str | None = None  # Crowdin link(s), editable by the QA head; None = keep as is
+    learn: bool = False  # «📚 На обучение» — removal goes to the admin's learning inbox
+    learn_note: str = ""  # the head of QA's reason, for the platform
 
 
 class ShareSaveIn(BaseModel):
@@ -363,3 +365,25 @@ class StyleguideSectionIn(BaseModel):
 
 class StyleguideRevertIn(BaseModel):
     manager_id: int
+
+
+# ---- «Обучение платформы» (2026-10-04) ----
+class LearnIn(BaseModel):
+    manager_id: int
+    text: str
+    scope: str = "project"  # "project" | "client" | "all"
+    lang_scope: str = "lang"  # "lang" | "all"
+
+
+class LearningStatusIn(BaseModel):
+    manager_id: int
+    status: str  # "new" | "postponed" | "dismissed"
+
+
+class LessonUpdateIn(BaseModel):
+    manager_id: int
+    text: str | None = None
+    scope: str | None = None
+    lang_scope: str | None = None
+    lang_key: str | None = None
+    status: str | None = None  # "active" | "disabled" | "deleted"

@@ -128,6 +128,79 @@ class StyleguideChange(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class LearningItem(Base):
+    """«Обучение платформы» inbox (2026-10-04, Александр): a finding that may
+    teach the platform something — removed by the head of QA with «На
+    обучение», or rejected by a translator («Не актуально», with or without a
+    comment). Nothing is learned until the admin verifies it in the
+    «Обучение платформы» folder (→ Lesson). status: new | postponed |
+    dismissed | learned."""
+
+    __tablename__ = "learning_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    origin: Mapped[str] = mapped_column(String(20), default="translator")  # "okk" | "translator"
+    status: Mapped[str] = mapped_column(String(20), default="new", index=True)
+    multi_check_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    finding_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    project_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    project_name: Mapped[str] = mapped_column(String(200), default="")
+    client_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    filename: Mapped[str] = mapped_column(String(300), default="")
+    lang_code: Mapped[str] = mapped_column(String(40), default="")
+    lang_key: Mapped[str] = mapped_column(String(40), default="")
+    excel_row: Mapped[int] = mapped_column(Integer, default=0)
+    context: Mapped[str] = mapped_column(Text, default="")
+    finding_type: Mapped[str] = mapped_column(String(60), default="")
+    finding_message: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(Text, default="")
+    translation: Mapped[str] = mapped_column(Text, default="")
+    translator_comment: Mapped[str] = mapped_column(Text, default="")
+    okk_note: Mapped[str] = mapped_column(Text, default="")
+    lesson_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resolved_by_name: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    resolved_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (UniqueConstraint("multi_check_id", "finding_key", "origin", name="uq_learning_item"),)
+
+
+class Lesson(Base):
+    """A verified lesson: what the checking model must take into account.
+    Scope: project_id set → that project only; else client_id set → every
+    project of that client; both empty → all projects. lang_key set → that
+    language only; empty → all languages. status: active | disabled |
+    deleted (deleted lessons stay for the history)."""
+
+    __tablename__ = "lessons"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    lang_key: Mapped[str] = mapped_column(String(40), default="", index=True)
+    example: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # finding/source/translation it came from
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    used_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_by_name: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class LessonHistory(Base):
+    """Every change of a lesson (created / edited / disabled / enabled /
+    deleted / restored) with a snapshot — «История запомненного»."""
+
+    __tablename__ = "lesson_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lesson_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    action: Mapped[str] = mapped_column(String(20), default="")
+    snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    by_name: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class LanguageCatalogEntry(Base):
     """One language in a project's manually-curated "which languages do I
     check here" catalog — this is what the target-language checkboxes are

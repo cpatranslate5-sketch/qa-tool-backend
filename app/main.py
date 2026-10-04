@@ -118,6 +118,11 @@ def on_startup():
     except Exception:
         logger.exception("client/styleguide seeding failed")
         db.rollback()
+    try:
+        _backfill_learning(db)
+    except Exception:
+        logger.exception("learning backfill failed")
+        db.rollback()
     finally:
         db.close()
 
@@ -329,6 +334,7 @@ async def _run_live_check_background(
     extra_instructions: str,
     target_filter: set[str] | None,
     styleguide: dict | None = None,
+    feedback: dict | None = None,
 ) -> None:
     """Runs the actual AI check (run_multi_check) for the live/"Срочно" path
     AFTER the initial request has already returned a "processing" response —
@@ -365,7 +371,7 @@ async def _run_live_check_background(
         try:
             results = await run_multi_check(
                 sheets, resolved_source, selected_checks, extra_instructions, target_filter,
-                styleguide=styleguide,
+                styleguide=styleguide, feedback=feedback,
             )
         except Exception:
             logger.exception("run_multi_check failed in background for multi_check_id=%s", multi_check_id)
@@ -400,7 +406,10 @@ async def _run_live_check_background(
 _CONTEXT_COLUMNS_NOTE = (
     "Контекст строки может содержать «ключ:» — технический ключ строки (по нему видно, кнопка это, заголовок, "
     "условие и т. п.) и «пометка:» — указание заказчика именно к этой строке. Пометка важнее общих правил: "
-    "например, если в ней сказано не переводить фразу или оставить её на английском, такой перевод — не ошибка."
+    "например, если в ней сказано не переводить фразу или оставить её на английском, такой перевод — не ошибка.\n"
+    "Служебные метки структуры текста в исходнике — «Тема:», «Заголовок:», «Подзаголовок:», «Кнопка:», «CTA:», "
+    "«Текст:», «Основной пост:», «Скрытый пост:», «Текст ТГ», «Текст Email» и т. п. — переводить не нужно: если они "
+    "оставлены как в исходнике, это НЕ ошибка и не неполный перевод."
 )
 
 
@@ -1052,6 +1061,8 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     for f in findings:
         f.setdefault("confidence", 100)  # algorithmic = certain, see excel_multi
     manager_obj = db.get(models.Manager, payload.manager_id) if payload.manager_id else None
+    single_lessons, single_used = _lessons_for(db, project, [payload.target_lang])
+    _count_lesson_use(db, single_used)
     extra_for_ai = _with_domain_note(
         payload.extra_instructions,
         project.name if project is not None else None,
@@ -1061,6 +1072,7 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     ai_findings, cost_usd = await run_ai_checks(
         payload.source, payload.translation, payload.checks, extra_for_ai,
         payload.target_lang, payload.source_lang, sg_mod.prompt_text(rules),
+        single_lessons.get(sg_mod.feedback_lang_key(payload.target_lang), ""),
     )
     findings += ai_findings
 
@@ -1425,6 +1437,10 @@ async def multi_check(
         _label_to_code(c.strip(), alias_map).lower() for c in target_langs.split(",") if c.strip()
     } or None
     resolved_source = pick_source_lang(sheets, source_lang.strip().lower() or None)
+    # Verified lessons for every language this file may check (see «Обучение платформы»).
+    lesson_texts, used_lessons = _lessons_for(
+        db, project_obj, sorted({l for s_ in sheets for l in s_["languages"] if l != resolved_source}),
+    )
     if target_filter is not None:
         file_targets = {l.lower() for s_ in sheets for l in s_["languages"] if l != resolved_source}
         if not (target_filter & file_targets):
@@ -1475,10 +1491,11 @@ async def multi_check(
         db.add(record)
         db.commit()
         db.refresh(record)
+        _count_lesson_use(db, used_lessons)
         background_tasks.add_task(
             _run_live_check_background,
             record.id, sheets, resolved_source, selected_checks, extra_instructions, target_filter,
-            _project_styleguide(project_obj),
+            _project_styleguide(project_obj), lesson_texts,
         )
         return {
             "multi_check_id": record.id,
@@ -1834,6 +1851,8 @@ def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Dep
         entry["sent"] = True
     elif payload.action == "remove":
         entry["okk_removed"] = True
+        if payload.learn and not key.startswith("tone|"):
+            _upsert_learning_item(db, mc, klang, key, "okk", okk_note=(payload.learn_note or "").strip()[:4000])
     review[key] = entry
     mc.review = review  # reassign so SQLAlchemy notices the JSON change
     db.commit()
@@ -1923,8 +1942,333 @@ def shared_report_respond(token: str, payload: schemas.TranslatorResponseIn, db:
     else:
         tr[key] = {"decision": payload.decision, "comment": comment, "checked": bool(prev.get("checked")) and bool(payload.decision)}
     mc.translator_review = tr  # reassign so SQLAlchemy notices the JSON change
+    _sync_translator_item(db, mc, klang, key, payload.decision, comment)
     db.commit()
     return {"ok": True}
+
+
+# ------------------------------------------------- «Обучение платформы» ---
+# 2026-10-04 (Александр): the platform learns ONLY what the admin verifies.
+# Candidates land in the admin's «Обучение платформы» inbox (LearningItem):
+#   • the head of QA removed a finding with «📚 На обучение» (share page);
+#   • a translator marked a finding «Не актуально» — with or without comment.
+# The admin turns a candidate into a Lesson (own wording + where it applies:
+# project / client / all projects × this language / all languages), dismisses
+# or postpones it. Active lessons go to the checking model (Step 2) of every
+# matching check; every change of a lesson is kept in LessonHistory.
+
+LESSONS_MAX_PER_CHECK = 20
+LESSONS_MAX_CHARS = 5000
+
+
+def _finding_for_key(mc: models.MultiCheck, klang: str, key: str):
+    return next(
+        ((row, f) for _, k, row, f in numbered_findings(klang, mc.results or {}) if k == key and row is not None),
+        None,
+    )
+
+
+def _upsert_learning_item(
+    db: Session, mc: models.MultiCheck, klang: str, key: str, origin: str,
+    translator_comment: str | None = None, okk_note: str | None = None,
+) -> None:
+    item = db.query(models.LearningItem).filter(
+        models.LearningItem.multi_check_id == mc.id,
+        models.LearningItem.finding_key == key,
+        models.LearningItem.origin == origin,
+    ).first()
+    if item is None:
+        found = _finding_for_key(mc, klang, key)
+        if found is None:
+            return
+        row, f = found
+        project = db.get(models.Project, mc.project_id)
+        item = models.LearningItem(
+            origin=origin, status="new", multi_check_id=mc.id, finding_key=key,
+            project_id=mc.project_id, project_name=project.name if project else "",
+            client_id=project.client_id if project else None, filename=mc.filename or "",
+            lang_code=klang, lang_key=sg_mod.feedback_lang_key(klang),
+            excel_row=row.get("excel_row") or 0, context=str(row.get("context") or ""),
+            finding_type=str(f.get("type") or ""), finding_message=str(f.get("message") or ""),
+            source=str(row.get("source") or ""), translation=str(row.get("translation") or ""),
+        )
+        db.add(item)
+    if translator_comment is not None:
+        item.translator_comment = translator_comment
+    if okk_note is not None:
+        item.okk_note = okk_note
+
+
+def _drop_new_learning_item(db: Session, mc_id: int, key: str, origin: str) -> None:
+    """A candidate the source took back (translator changed their answer,
+    QA head undid the removal) — only while the admin hasn't handled it."""
+    item = db.query(models.LearningItem).filter(
+        models.LearningItem.multi_check_id == mc_id,
+        models.LearningItem.finding_key == key,
+        models.LearningItem.origin == origin,
+    ).first()
+    if item is not None and item.status == "new":
+        db.delete(item)
+
+
+def _sync_translator_item(db: Session, mc: models.MultiCheck, klang: str, key: str, decision, comment: str) -> None:
+    if key.startswith("tone|"):
+        return
+    if decision == "na":
+        _upsert_learning_item(db, mc, klang, key, "translator", translator_comment=comment)
+    else:
+        _drop_new_learning_item(db, mc.id, key, "translator")
+
+
+def _backfill_learning(db: Session) -> None:
+    """Once: translators' «Не актуально» made before this existed."""
+    if db.query(models.LearningItem).first() is not None:
+        return
+    for mc in db.query(models.MultiCheck).all():
+        for key, entry in (mc.translator_review or {}).items():
+            parts = key.split("|")
+            if (entry or {}).get("decision") == "na" and len(parts) == 4:
+                _upsert_learning_item(db, mc, parts[1], key, "translator",
+                                      translator_comment=str((entry or {}).get("comment") or "").strip())
+    db.commit()
+
+
+def _scope_label(db: Session, lesson: models.Lesson) -> str:
+    if lesson.project_id:
+        p = db.get(models.Project, lesson.project_id)
+        where = f"проект «{p.name}»" if p else "проект (удалён)"
+    elif lesson.client_id:
+        c = db.get(models.Client, lesson.client_id)
+        where = f"все проекты заказчика «{c.name}»" if c else "заказчик (удалён)"
+    else:
+        where = "все проекты"
+    lang = sg_mod.LANG_LABEL.get(lesson.lang_key, lesson.lang_key) if lesson.lang_key else "все языки"
+    return f"{where} · {lang}"
+
+
+def _lesson_snapshot(lesson: models.Lesson) -> dict:
+    return {
+        "text": lesson.text, "project_id": lesson.project_id, "client_id": lesson.client_id,
+        "lang_key": lesson.lang_key, "status": lesson.status,
+    }
+
+
+def _log_lesson(db: Session, lesson: models.Lesson, action: str, by_name: str) -> None:
+    db.flush()
+    db.add(models.LessonHistory(lesson_id=lesson.id, action=action, snapshot=_lesson_snapshot(lesson), by_name=by_name))
+
+
+def _lessons_for(db: Session, project: models.Project | None, lang_codes) -> tuple[dict[str, str], list[int]]:
+    """{language key: prompt block} for a check in this project, plus the ids
+    of the lessons used. Most specific first: project+language, project,
+    client+language, client, language, everything."""
+    lessons = db.query(models.Lesson).filter(models.Lesson.status == "active").order_by(models.Lesson.id.desc()).all()
+    pid = project.id if project is not None else None
+    cid = project.client_id if project is not None else None
+    out: dict[str, str] = {}
+    used: set[int] = set()
+    for code in lang_codes:
+        lk = sg_mod.feedback_lang_key(code)
+        if lk in out:
+            continue
+        ranked = []
+        for les in lessons:
+            if les.lang_key and les.lang_key != lk:
+                continue
+            if les.project_id:
+                if les.project_id != pid:
+                    continue
+                rank = 0
+            elif les.client_id:
+                if les.client_id != cid:
+                    continue
+                rank = 2
+            else:
+                rank = 4
+            if not les.lang_key:
+                rank += 1
+            ranked.append((rank, les))
+        ranked.sort(key=lambda x: x[0])
+        lines, total = [], 0
+        for _, les in ranked[:LESSONS_MAX_PER_CHECK]:
+            ex = les.example or {}
+            line = f"- {les.text.strip()}"
+            if ex.get("finding_message"):
+                frag = str(ex.get("translation") or "").replace("\n", " ")[:140]
+                line += f" (пример: замечание «{str(ex['finding_message'])[:200]}» к переводу «{frag}» было ошибочным)"
+            if total + len(line) > LESSONS_MAX_CHARS:
+                break
+            lines.append(line)
+            total += len(line)
+            used.add(les.id)
+        if lines:
+            out[lk] = (
+                "ПРОВЕРЕННЫЕ УРОКИ (утверждены руководителем ОКК по прошлым проверкам) — обязательно учитывай: "
+                "в аналогичной ситуации не делай таких замечаний; настоящие, другие ошибки сообщай как обычно.\n"
+                + "\n".join(lines)
+            )
+    return out, sorted(used)
+
+
+def _count_lesson_use(db: Session, ids: list[int]) -> None:
+    if not ids:
+        return
+    for les in db.query(models.Lesson).filter(models.Lesson.id.in_(ids)).all():
+        les.used_count = (les.used_count or 0) + 1
+    db.commit()
+
+
+def _item_out(db: Session, it: models.LearningItem) -> dict:
+    return {
+        "id": it.id, "origin": it.origin, "status": it.status,
+        "multi_check_id": it.multi_check_id, "project_id": it.project_id, "project_name": it.project_name,
+        "client_id": it.client_id,
+        "client_name": (db.get(models.Client, it.client_id).name if it.client_id and db.get(models.Client, it.client_id) else ""),
+        "filename": it.filename, "lang_code": it.lang_code, "lang_key": it.lang_key,
+        "lang_label": sg_mod.LANG_LABEL.get(it.lang_key, it.lang_code), "excel_row": it.excel_row,
+        "context": it.context, "finding_type": it.finding_type, "finding_message": it.finding_message,
+        "source": it.source, "translation": it.translation, "translator_comment": it.translator_comment,
+        "okk_note": it.okk_note, "lesson_id": it.lesson_id, "resolved_by_name": it.resolved_by_name,
+        "created_at": it.created_at.isoformat() if it.created_at else None,
+        "resolved_at": it.resolved_at.isoformat() if it.resolved_at else None,
+    }
+
+
+def _lesson_out(db: Session, les: models.Lesson) -> dict:
+    hist = db.query(models.LessonHistory).filter(models.LessonHistory.lesson_id == les.id).order_by(models.LessonHistory.id.desc()).all()
+    return {
+        "id": les.id, "text": les.text, "project_id": les.project_id, "client_id": les.client_id,
+        "lang_key": les.lang_key, "lang_label": sg_mod.LANG_LABEL.get(les.lang_key, les.lang_key) if les.lang_key else "",
+        "scope_label": _scope_label(db, les), "example": les.example or {}, "status": les.status,
+        "used_count": les.used_count or 0, "created_by_name": les.created_by_name,
+        "created_at": les.created_at.isoformat() if les.created_at else None,
+        "updated_at": les.updated_at.isoformat() if les.updated_at else None,
+        "history": [
+            {"action": h.action, "snapshot": h.snapshot, "by_name": h.by_name,
+             "created_at": h.created_at.isoformat() if h.created_at else None}
+            for h in hist
+        ],
+    }
+
+
+def _apply_scope(db: Session, lesson: models.Lesson, scope: str, lang_scope: str, project_id, client_id, lang_key: str) -> None:
+    if scope not in ("project", "client", "all") or lang_scope not in ("lang", "all"):
+        raise HTTPException(400, "Неверная область действия.")
+    if scope == "project" and not project_id:
+        raise HTTPException(400, "У этого замечания нет проекта.")
+    if scope == "client" and not client_id:
+        raise HTTPException(400, "Проект не привязан к заказчику.")
+    lesson.project_id = project_id if scope == "project" else None
+    lesson.client_id = client_id if scope == "client" else None
+    lesson.lang_key = lang_key if lang_scope == "lang" else ""
+
+
+@app.get("/learning/summary")
+def learning_summary(manager_id: int, db: Session = Depends(get_db)):
+    """The red counter on the main page (admin only)."""
+    manager = _get_manager(manager_id, db)
+    if not manager.is_admin:
+        return {"new": 0}
+    return {"new": db.query(models.LearningItem).filter(models.LearningItem.status == "new").count()}
+
+
+@app.get("/learning/items")
+def learning_items(manager_id: int, status: str = "new", db: Session = Depends(get_db)):
+    _require_admin(manager_id, db)
+    rows = (
+        db.query(models.LearningItem).filter(models.LearningItem.status == status)
+        .order_by(models.LearningItem.id.desc()).limit(500).all()
+    )
+    counts = {
+        s_: db.query(models.LearningItem).filter(models.LearningItem.status == s_).count()
+        for s_ in ("new", "postponed", "dismissed", "learned")
+    }
+    return {"items": [_item_out(db, r) for r in rows], "counts": counts}
+
+
+@app.post("/learning/items/{item_id}/learn")
+def learning_item_learn(item_id: int, payload: schemas.LearnIn, db: Session = Depends(get_db)):
+    manager = _require_admin(payload.manager_id, db)
+    it = db.get(models.LearningItem, item_id)
+    if it is None:
+        raise HTTPException(404, "Не найдено.")
+    text_ = payload.text.strip()
+    if not text_:
+        raise HTTPException(400, "Опишите суть для платформы.")
+    lesson = models.Lesson(
+        text=text_[:2000], status="active", created_by_name=manager.name,
+        example={"finding_message": it.finding_message, "source": it.source, "translation": it.translation,
+                 "project_name": it.project_name, "lang_code": it.lang_code, "item_id": it.id},
+    )
+    _apply_scope(db, lesson, payload.scope, payload.lang_scope, it.project_id, it.client_id, it.lang_key)
+    db.add(lesson)
+    _log_lesson(db, lesson, "created", manager.name)
+    it.status = "learned"
+    it.lesson_id = lesson.id
+    it.resolved_by_name = manager.name
+    it.resolved_at = datetime.datetime.now(datetime.timezone.utc)
+    db.commit()
+    return {"item": _item_out(db, it), "lesson": _lesson_out(db, lesson)}
+
+
+@app.post("/learning/items/{item_id}/status")
+def learning_item_status(item_id: int, payload: schemas.LearningStatusIn, db: Session = Depends(get_db)):
+    manager = _require_admin(payload.manager_id, db)
+    it = db.get(models.LearningItem, item_id)
+    if it is None:
+        raise HTTPException(404, "Не найдено.")
+    if payload.status not in ("new", "postponed", "dismissed"):
+        raise HTTPException(400, "Неверный статус.")
+    it.status = payload.status
+    it.resolved_by_name = manager.name if payload.status != "new" else ""
+    it.resolved_at = datetime.datetime.now(datetime.timezone.utc) if payload.status != "new" else None
+    db.commit()
+    return {"item": _item_out(db, it)}
+
+
+@app.get("/learning/lessons")
+def learning_lessons(manager_id: int, db: Session = Depends(get_db)):
+    _require_admin(manager_id, db)
+    rows = db.query(models.Lesson).order_by(models.Lesson.id.desc()).all()
+    return {"lessons": [_lesson_out(db, r) for r in rows]}
+
+
+@app.put("/learning/lessons/{lesson_id}")
+def learning_lesson_update(lesson_id: int, payload: schemas.LessonUpdateIn, db: Session = Depends(get_db)):
+    manager = _require_admin(payload.manager_id, db)
+    les = db.get(models.Lesson, lesson_id)
+    if les is None:
+        raise HTTPException(404, "Не найдено.")
+    before = _lesson_snapshot(les)
+    action = "edited"
+    if payload.text is not None:
+        if not payload.text.strip():
+            raise HTTPException(400, "Текст урока пустой.")
+        les.text = payload.text.strip()[:2000]
+    if payload.scope is not None or payload.lang_scope is not None or payload.lang_key is not None:
+        ex = les.example or {}
+        item = db.get(models.LearningItem, ex.get("item_id")) if ex.get("item_id") else None
+        project_id = les.project_id or (item.project_id if item else None)
+        client_id = les.client_id or (item.client_id if item else None)
+        if project_id and not client_id:
+            p = db.get(models.Project, project_id)
+            client_id = p.client_id if p else None
+        lang_key = (payload.lang_key if payload.lang_key is not None else les.lang_key) or (item.lang_key if item else "")
+        scope = payload.scope or ("project" if les.project_id else "client" if les.client_id else "all")
+        lang_scope = payload.lang_scope or ("lang" if les.lang_key else "all")
+        _apply_scope(db, les, scope, lang_scope, project_id, client_id, lang_key)
+    if payload.status is not None:
+        if payload.status not in ("active", "disabled", "deleted"):
+            raise HTTPException(400, "Неверный статус.")
+        if payload.status != les.status:
+            action = {"active": "restored" if les.status == "deleted" else "enabled",
+                      "disabled": "disabled", "deleted": "deleted"}[payload.status]
+        les.status = payload.status
+    if _lesson_snapshot(les) != before:
+        les.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        _log_lesson(db, les, action, manager.name)
+    db.commit()
+    return _lesson_out(db, les)
 
 
 # ------------------------------------------------------------ «Сохранённое» ---

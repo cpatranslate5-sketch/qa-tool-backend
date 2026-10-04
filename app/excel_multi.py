@@ -1035,6 +1035,7 @@ async def _run_ai_chunks(
     semaphore: asyncio.Semaphore,
     model_override: str | None = None,
     styleguide_text: str = "",
+    feedback_text: str = "",
 ) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
     """Runs every chunk of one language's items through the AI (bounded by
     the shared semaphore) and merges the per-chunk results back into a
@@ -1063,7 +1064,7 @@ async def _run_ai_chunks(
         async with semaphore:
             return await run_ai_checks_batch(
                 chunk_items, checks, extra_instructions, lang, source_lang, model_override=model_override,
-                styleguide_text=styleguide_text,
+                styleguide_text=styleguide_text, feedback_text=feedback_text,
             )
 
     chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
@@ -1172,6 +1173,7 @@ async def _check_language_for_sheet(
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
     rules: dict | None = None,
+    feedback_text: str = "",
 ) -> tuple[list[dict], float]:
     """Returns (rows-with-findings, production cost_usd). `rules` is this
     language's client/project styleguide (app.styleguide), or None."""
@@ -1217,7 +1219,7 @@ async def _check_language_for_sheet(
             await asyncio.gather(
                 _run_ai_chunks(
                     item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
-                    model_override=model_for_lang, styleguide_text=sg_text,
+                    model_override=model_for_lang, styleguide_text=sg_text, feedback_text=feedback_text,
                 ),
                 _term_consistency(),
             )
@@ -1225,7 +1227,7 @@ async def _check_language_for_sheet(
     else:
         ai_findings_by_idx, cost_usd, truncated, search_warnings = await _run_ai_chunks(
             item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
-            model_override=model_for_lang, styleguide_text=sg_text,
+            model_override=model_for_lang, styleguide_text=sg_text, feedback_text=feedback_text,
         )
         term_grouped, term_cost, term_warning = {}, 0.0, None
     cost_usd += term_cost
@@ -1329,6 +1331,7 @@ async def run_multi_check(
     extra_instructions: str = "",
     target_langs_filter: set[str] | None = None,
     styleguide: dict | None = None,
+    feedback: dict[str, str] | None = None,
 ) -> dict:
     """
     styleguide: the project's effective styleguide (app.styleguide.
@@ -1374,6 +1377,7 @@ async def run_multi_check(
             findings_list, cost = await _check_language_for_sheet(
                 sheet, lang, source_lang, checks, extra_instructions, semaphore,
                 rules=sg_mod.rules_for_code(styleguide, lang),
+                feedback_text=(feedback or {}).get(sg_mod.feedback_lang_key(lang), ""),
             )
             warns = fallback_warnings(events)
             if warns:

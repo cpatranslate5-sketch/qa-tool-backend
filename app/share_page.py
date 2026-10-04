@@ -73,6 +73,11 @@ _CSS = """
   .status { font-size: 0.8rem; color: #6b7280; margin-right: auto; }
   .btn { border: 1px solid; border-radius: 8px; padding: 6px 16px; font: inherit; font-size: 0.88rem; cursor: pointer; background: #fff; }
   .btn-keep, .btn-done { color: #17703c; border-color: #17703c; }
+  .learn-box { margin-top: 8px; }
+  .learn-check { font-size: 0.85rem; color: #4f46e5; display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .okk-learn-note { display: none; margin-top: 6px; min-height: 40px; }
+  .learn-box.on .okk-learn-note { display: block; }
+  .item.kept .learn-box { display: none; }
   .btn-remove, .btn-na { color: #b42318; border-color: #b42318; }
   .item.done .btn-done { background: #17703c; color: #fff; }
   .item.na .btn-na { background: #b42318; color: #fff; }
@@ -279,7 +284,10 @@ _SCRIPT = """
   function okkBody(item, action) {
     var c = item.querySelector(".okk-comment");
     var l = item.querySelector(".okk-links");
-    return { key: key(item), action: action || null, comment: c ? c.value : "", links: l ? l.value : null };
+    var lc = item.querySelector(".okk-learn");
+    var ln = item.querySelector(".okk-learn-note");
+    return { key: key(item), action: action || null, comment: c ? c.value : "", links: l ? l.value : null,
+             learn: !!(lc && lc.checked && action === "remove"), learn_note: ln ? ln.value : "" };
   }
   function sendOkk(item, action) {
     post("/okk", okkBody(item, action), item, function () {
@@ -341,6 +349,13 @@ _SCRIPT = """
     try {
       navigator.sendBeacon(base + "/okk", new Blob([JSON.stringify(okkBody(u.item, u.action))], { type: "application/json" }));
     } catch (e) {}
+  });
+  document.addEventListener("change", function (ev) {
+    var t = ev.target;
+    if (t.classList && t.classList.contains("okk-learn")) {
+      var box = t.closest(".learn-box");
+      if (box) box.classList.toggle("on", t.checked);
+    }
   });
   function sendAnswer(item) {
     var d = item.classList.contains("done") ? "done" : item.classList.contains("na") ? "na" : null;
@@ -538,6 +553,10 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             tail = (
                 '<label class="label block-label">Комментарий для переводчика:</label>'
                 f'<textarea class="okk-comment" placeholder="Вопрос или уточнение для переводчика (необязательно)">{_e(okk_comment)}</textarea>'
+                '<div class="learn-box"><label class="learn-check"><input type="checkbox" class="okk-learn"> '
+                '📚 На обучение платформе (при «Убрать»)</label>'
+                '<textarea class="okk-learn-note" placeholder="Почему замечание ошибочное — для платформы (необязательно; '
+                'окончательно утвердите в «Обучение платформы»)"></textarea></div>'
                 '<div class="actions"><span class="status"></span>'
                 '<button type="button" class="btn btn-keep">Оставить переводчику</button>'
                 '<button type="button" class="btn btn-remove">Убрать</button></div>'

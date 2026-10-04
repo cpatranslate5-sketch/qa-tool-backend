@@ -79,6 +79,12 @@ def lang_key_for(code: str) -> str | None:
     return _ALIAS_TO_KEY.get((code or "").strip().lower())
 
 
+def feedback_lang_key(code: str) -> str:
+    """Language key translator feedback is grouped by: the styleguide key
+    when there is one, otherwise the code itself (lower-case)."""
+    return lang_key_for(code) or (code or "").strip().lower()
+
+
 # ----------------------------------------------------------------- sections --
 # (key, Russian title, who checks it). "ai" sections are a single {"text": ...}.
 SECTIONS: list[tuple[str, str, str]] = [
