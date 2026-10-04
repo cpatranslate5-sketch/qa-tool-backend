@@ -149,7 +149,8 @@ def _tone_text(f: dict) -> str:
     majority = f.get("register_majority")
     word = "Вы" if majority == "formal" else "ты" if majority == "informal" else ""
     if not word:
-        return re.sub(r",?\s*кроме:.*$", "", _strip_rows(f.get("message"))).rstrip(".") or ""
+        text = re.sub(r",?\s*кроме:.*$", "", _strip_rows(f.get("message"))).rstrip(".") or ""
+        return re.sub(r"^Тон:\s*", "", text)
     exceptions = f.get("register_exceptions") or []
     texts = [str(e.get("text") or "").strip() for e in exceptions if str(e.get("text") or "").strip()]
     if texts:
@@ -506,6 +507,11 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
 
         if row is None:
             body_html = f'<div class="field"><span class="label">Тон обращения:</span> {_t(_tone_text(f))}</div>'
+            if f.get("register_requirement"):
+                body_html += (
+                    '<div class="field"><span class="label">Требование проекта:</span> '
+                    f'{_t(f.get("register_requirement"))}</div>'
+                )
             platform_html = ""
         else:
             body_html = (

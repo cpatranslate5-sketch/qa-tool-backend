@@ -35,6 +35,7 @@ from app.excel_multi import (
 )
 from app.model_comparison import run_chunk_size_comparison, run_model_comparison
 from app.rule_checks import run_rule_checks
+from app import styleguide as sg_mod
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,47 @@ async def anthropic_call_failed(request: Request, exc: httpx.HTTPError):
 @app.on_event("startup")
 def on_startup():
     init_db()
+    db = SessionLocal()
+    try:
+        _seed_clients(db)
+    except Exception:
+        logger.exception("client/styleguide seeding failed")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _seed_clients(db: Session) -> None:
+    """Creates the «1win» client with its styleguide and its seven projects
+    once (2026-10-04, Александр). Existing projects with the same names
+    (case-insensitive) are moved into the client instead of duplicated.
+    Never runs again once the client exists — later edits are the admin's."""
+    if db.query(models.Client).filter(models.Client.name == "1win").first() is not None:
+        return
+    client = models.Client(name="1win", styleguide=sg_mod.build_client_seed())
+    db.add(client)
+    db.flush()
+    existing = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
+    for name, overrides in sg_mod.PROJECTS_SEED:
+        project = existing.get(name.lower())
+        if project is None:
+            project = models.Project(name=name, created_by_name="Система")
+            db.add(project)
+        project.client_id = client.id
+        if overrides and not project.styleguide:
+            project.styleguide = overrides
+    db.commit()
+
+
+def _project_styleguide(project: models.Project | None) -> dict | None:
+    """The effective styleguide for checks in this project (client's rules
+    with the project's own sections on top), or None without a client."""
+    if project is None or project.client_id is None:
+        return None
+    client = project.client
+    if client is None:
+        return None
+    return sg_mod.effective_rules(client.styleguide, project.styleguide)
 
 
 async def _run_second_opinion_background(multi_check_id: int, results: dict) -> None:
@@ -168,6 +210,7 @@ async def _run_live_check_background(
     selected_checks: list[str],
     extra_instructions: str,
     target_filter: set[str] | None,
+    styleguide: dict | None = None,
 ) -> None:
     """Runs the actual AI check (run_multi_check) for the live/"Срочно" path
     AFTER the initial request has already returned a "processing" response —
@@ -204,6 +247,7 @@ async def _run_live_check_background(
         try:
             results = await run_multi_check(
                 sheets, resolved_source, selected_checks, extra_instructions, target_filter,
+                styleguide=styleguide,
             )
         except Exception:
             logger.exception("run_multi_check failed in background for multi_check_id=%s", multi_check_id)
@@ -446,6 +490,196 @@ def delete_project(project_id: int, payload: schemas.ProjectDeleteIn, db: Sessio
     return {"ok": True}
 
 
+# ---------------------------------------------------- clients/styleguides ----
+# 2026-10-04 (Александр): «Заказчики» hold projects and a styleguide; every
+# project inherits it and may override single sections per language. Anyone
+# can view; only the admin folder edits. Each edit is logged (with «Вернуть»).
+
+def _client_out(c: models.Client) -> dict:
+    return {
+        "id": c.id,
+        "name": c.name,
+        "projects": [{"id": p.id, "name": p.name} for p in sorted(c.projects, key=lambda p: p.name.lower())],
+    }
+
+
+@app.get("/clients")
+def list_clients(db: Session = Depends(get_db)):
+    return [_client_out(c) for c in db.query(models.Client).order_by(models.Client.name).all()]
+
+
+@app.post("/clients")
+def create_client(payload: schemas.ClientIn, db: Session = Depends(get_db)):
+    _require_admin(payload.manager_id, db)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(400, "Введите название заказчика.")
+    if any(c.name.strip().lower() == name.lower() for c in db.query(models.Client).all()):
+        raise HTTPException(409, "Заказчик с таким названием уже есть.")
+    client = models.Client(name=name, styleguide={})
+    db.add(client)
+    db.commit()
+    db.refresh(client)
+    return _client_out(client)
+
+
+@app.put("/projects/{project_id}/client")
+def set_project_client(project_id: int, payload: schemas.ProjectClientIn, db: Session = Depends(get_db)):
+    _require_admin(payload.manager_id, db)
+    project = _get_project(project_id, db)
+    if payload.client_id is not None and db.get(models.Client, payload.client_id) is None:
+        raise HTTPException(404, "Заказчик не найден.")
+    project.client_id = payload.client_id
+    db.commit()
+    return {"ok": True, "client_id": project.client_id}
+
+
+def _get_client(client_id: int, db: Session) -> models.Client:
+    client = db.get(models.Client, client_id)
+    if client is None:
+        raise HTTPException(404, "Заказчик не найден.")
+    return client
+
+
+def _change_out(ch: models.StyleguideChange) -> dict:
+    return {
+        "id": ch.id,
+        "lang": ch.lang,
+        "lang_label": sg_mod.LANG_LABEL.get(ch.lang, ch.lang),
+        "section": ch.section,
+        "section_title": sg_mod.SECTION_TITLE.get(ch.section, ch.section),
+        "before": ch.value_before,
+        "after": ch.value_after,
+        "changed_by_name": ch.changed_by_name,
+        "created_at": ch.created_at.isoformat() if ch.created_at else None,
+    }
+
+
+def _history(db: Session, client_id: int | None, project_id: int | None) -> list[dict]:
+    q = db.query(models.StyleguideChange)
+    if project_id is not None:
+        q = q.filter(models.StyleguideChange.project_id == project_id)
+    else:
+        q = q.filter(models.StyleguideChange.client_id == client_id, models.StyleguideChange.project_id.is_(None))
+    return [_change_out(c) for c in q.order_by(models.StyleguideChange.id.desc()).limit(200).all()]
+
+
+@app.get("/styleguide/meta")
+def styleguide_meta():
+    return sg_mod.meta()
+
+
+@app.get("/clients/{client_id}/styleguide")
+def get_client_styleguide(client_id: int, db: Session = Depends(get_db)):
+    client = _get_client(client_id, db)
+    return {
+        "client": _client_out(client),
+        "rules": client.styleguide or {},
+        "history": _history(db, client.id, None),
+    }
+
+
+@app.get("/projects/{project_id}/styleguide")
+def get_project_styleguide(project_id: int, db: Session = Depends(get_db)):
+    project = _get_project(project_id, db)
+    client = project.client
+    return {
+        "project": {"id": project.id, "name": project.name},
+        "client": _client_out(client) if client else None,
+        "client_rules": (client.styleguide if client else None) or {},
+        "own": project.styleguide or {},
+        "history": _history(db, project.client_id, project.id),
+    }
+
+
+def _apply_section(container: dict | None, lang: str, section: str, value: dict | None) -> tuple[dict, dict | None]:
+    data = dict(container or {})
+    lang_rules = dict(data.get(lang) or {})
+    before = lang_rules.get(section)
+    if value is None:
+        lang_rules.pop(section, None)
+    else:
+        lang_rules[section] = value
+    if lang_rules:
+        data[lang] = lang_rules
+    else:
+        data.pop(lang, None)
+    return data, before
+
+
+def _validated(payload: schemas.StyleguideSectionIn, allow_none: bool) -> dict | None:
+    if payload.lang not in sg_mod.LANG_LABEL:
+        raise HTTPException(400, "Неизвестный язык.")
+    if payload.section not in sg_mod.SECTION_KEYS:
+        raise HTTPException(400, "Неизвестный раздел.")
+    if payload.value is None:
+        if not allow_none:
+            raise HTTPException(400, "Пустое значение.")
+        return None
+    if not sg_mod.section_is_valid(payload.section, payload.value):
+        raise HTTPException(400, "Неверное значение раздела.")
+    return sg_mod.clean_section(payload.section, payload.value)
+
+
+@app.put("/clients/{client_id}/styleguide")
+def update_client_styleguide(client_id: int, payload: schemas.StyleguideSectionIn, db: Session = Depends(get_db)):
+    manager = _require_admin(payload.manager_id, db)
+    client = _get_client(client_id, db)
+    value = _validated(payload, allow_none=False)
+    client.styleguide, before = _apply_section(client.styleguide, payload.lang, payload.section, value)
+    if before != value:
+        db.add(models.StyleguideChange(
+            client_id=client.id, project_id=None, lang=payload.lang, section=payload.section,
+            value_before=before, value_after=value, changed_by_name=manager.name,
+        ))
+    db.commit()
+    return get_client_styleguide(client_id, db)
+
+
+@app.put("/projects/{project_id}/styleguide")
+def update_project_styleguide(project_id: int, payload: schemas.StyleguideSectionIn, db: Session = Depends(get_db)):
+    manager = _require_admin(payload.manager_id, db)
+    project = _get_project(project_id, db)
+    value = _validated(payload, allow_none=True)
+    project.styleguide, before = _apply_section(project.styleguide, payload.lang, payload.section, value)
+    if before != value:
+        db.add(models.StyleguideChange(
+            client_id=project.client_id, project_id=project.id, lang=payload.lang, section=payload.section,
+            value_before=before, value_after=value, changed_by_name=manager.name,
+        ))
+    db.commit()
+    return get_project_styleguide(project_id, db)
+
+
+@app.post("/styleguide/changes/{change_id}/revert")
+def revert_styleguide_change(change_id: int, payload: schemas.StyleguideRevertIn, db: Session = Depends(get_db)):
+    """«Вернуть»: puts the section back to its value before that change
+    (logged as a new change, so the revert itself can be undone too)."""
+    manager = _require_admin(payload.manager_id, db)
+    ch = db.get(models.StyleguideChange, change_id)
+    if ch is None:
+        raise HTTPException(404, "Изменение не найдено.")
+    target = ch.value_before
+    if ch.project_id is not None:
+        project = _get_project(ch.project_id, db)
+        project.styleguide, before = _apply_section(project.styleguide, ch.lang, ch.section, target)
+    else:
+        if target is None:
+            client = _get_client(ch.client_id, db)
+            client.styleguide, before = _apply_section(client.styleguide, ch.lang, ch.section, None)
+        else:
+            client = _get_client(ch.client_id, db)
+            client.styleguide, before = _apply_section(client.styleguide, ch.lang, ch.section, target)
+    db.add(models.StyleguideChange(
+        client_id=ch.client_id, project_id=ch.project_id, lang=ch.lang, section=ch.section,
+        value_before=before, value_after=target, changed_by_name=f"{manager.name} (вернул)",
+    ))
+    db.commit()
+    if ch.project_id is not None:
+        return get_project_styleguide(ch.project_id, db)
+    return get_client_styleguide(ch.client_id, db)
+
+
 def _get_project(project_id: int, db: Session) -> models.Project:
     project = db.get(models.Project, project_id)
     if project is None:
@@ -682,6 +916,11 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         payload.source, payload.translation, payload.checks,
         lang_code=payload.target_lang,
     )
+    rules = sg_mod.rules_for_code(_project_styleguide(project), payload.target_lang)
+    if rules:
+        findings += sg_mod.check_row(
+            payload.source, payload.translation, rules, sg_mod.lang_key_for(payload.target_lang) or "",
+        )
     for f in findings:
         f.setdefault("confidence", 100)  # algorithmic = certain, see excel_multi
     manager_obj = db.get(models.Manager, payload.manager_id) if payload.manager_id else None
@@ -693,7 +932,7 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     )
     ai_findings, cost_usd = await run_ai_checks(
         payload.source, payload.translation, payload.checks, extra_for_ai,
-        payload.target_lang, payload.source_lang,
+        payload.target_lang, payload.source_lang, sg_mod.prompt_text(rules),
     )
     findings += ai_findings
 
@@ -1111,6 +1350,7 @@ async def multi_check(
         background_tasks.add_task(
             _run_live_check_background,
             record.id, sheets, resolved_source, selected_checks, extra_instructions, target_filter,
+            _project_styleguide(project_obj),
         )
         return {
             "multi_check_id": record.id,

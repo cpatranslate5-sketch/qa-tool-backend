@@ -1221,7 +1221,7 @@ def check_sms_charset(translation: str) -> list[dict]:
 # 100" prompt instruction — Александр was explicit that these must never
 # disappear from the filtered report, so it's guaranteed rather than hoped
 # for. Keep in sync with the "type" literals used above.
-RULE_BASED_TYPES = {"numbers", "placeholders", "max_length", "missing", "punctuation", "emoji", "sms_charset"}
+RULE_BASED_TYPES = {"numbers", "placeholders", "max_length", "missing", "punctuation", "emoji", "sms_charset", "style_rule"}
 
 
 def run_rule_checks(

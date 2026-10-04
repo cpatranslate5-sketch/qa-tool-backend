@@ -78,12 +78,52 @@ class Project(Base):
     # with every check in this project, see app.main._with_domain_note.
     description: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # 2026-10-04 (Александр): projects live inside a client («Заказчик») and
+    # inherit its styleguide. `styleguide` holds ONLY this project's own
+    # overrides — {lang key: {section: value}}; a section missing here means
+    # «как у заказчика» (see app.styleguide.effective_rules).
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("clients.id"), nullable=True)
+    styleguide: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    client: Mapped["Client | None"] = relationship(back_populates="projects")
     single_checks: Mapped[list["SingleCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     multi_checks: Mapped[list["MultiCheck"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     language_catalog: Mapped[list["LanguageCatalogEntry"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+
+
+class Client(Base):
+    """«Заказчик» (2026-10-04, Александр): a folder of projects that share one
+    styleguide — rules per language (tone of address, buttons, punctuation,
+    terms…), see app.styleguide. Projects may override any section."""
+
+    __tablename__ = "clients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    styleguide: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    projects: Mapped[list["Project"]] = relationship(back_populates="client")
+
+
+class StyleguideChange(Base):
+    """One edit of a styleguide section — the «История изменений» list, with
+    «Вернуть». value_before/value_after are the section's JSON values; for a
+    project, None means «как у заказчика» (no own override)."""
+
+    __tablename__ = "styleguide_changes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    lang: Mapped[str] = mapped_column(String(40), default="")
+    section: Mapped[str] = mapped_column(String(60), default="")
+    value_before: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    value_after: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    changed_by_name: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class LanguageCatalogEntry(Base):

@@ -72,6 +72,7 @@ class ProjectOut(BaseModel):
     name: str
     created_by_name: str
     description: str = ""
+    client_id: int | None = None
 
     class Config:
         from_attributes = True
@@ -339,3 +340,26 @@ class SaveCaseIn(BaseModel):
 class ShareLinkIn(BaseModel):
     manager_id: int
     lang: str
+
+
+# ---- clients / styleguides (2026-10-04) ----
+class ClientIn(BaseModel):
+    manager_id: int
+    name: str
+
+
+class ProjectClientIn(BaseModel):
+    manager_id: int
+    client_id: int | None = None
+
+
+class StyleguideSectionIn(BaseModel):
+    manager_id: int
+    lang: str
+    section: str
+    # For a project: None = «как у заказчика» (drop the project's own value).
+    value: dict | None = None
+
+
+class StyleguideRevertIn(BaseModel):
+    manager_id: int

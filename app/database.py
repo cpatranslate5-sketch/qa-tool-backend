@@ -70,6 +70,11 @@ def _run_migrations():
             # 2026-09-29: admin-written project description (see models.Project).
             if "description" not in cols:
                 conn.execute(text("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''"))
+            # 2026-10-04: client folders + per-project styleguide overrides.
+            if "client_id" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN client_id INTEGER"))
+            if "styleguide" not in cols:
+                conn.execute(text("ALTER TABLE projects ADD COLUMN styleguide JSON"))
             # The structured glossary (glossary_filename/glossary_uploaded_at
             # + the glossary_terms table) was later removed entirely too —
             # see the migration further below that drops it, alongside

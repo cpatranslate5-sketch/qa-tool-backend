@@ -335,6 +335,18 @@ def _apply_confidence_threshold(raw: list) -> list:
         if not isinstance(f, dict) or f.get("type") in (REGISTER_VALUE_TYPE, "system"):
             out.append(f)
             continue
+        if f.get("type") == STYLEGUIDE_TYPE:
+            # Styleguide violations always reach the report (Александр,
+            # 2026-10-04: «главное, чтобы все такие ошибки попадали в отчёт»)
+            # — the percent is shown, never used to drop the finding.
+            conf = f.get("confidence")
+            if isinstance(conf, str):
+                m = re.search(r"\d+", conf)
+                conf = int(m.group()) if m else None
+            if isinstance(conf, (int, float)) and not isinstance(conf, bool):
+                f = {**f, "confidence": max(0, min(100, int(round(conf))))}
+            out.append(f)
+            continue
         conf = f.get("confidence")
         if isinstance(conf, str):
             m = re.search(r"\d+", conf)
@@ -756,7 +768,7 @@ def search_cache_prefix(source_lang: str = "", extra_instructions: str = "") -> 
 
 async def _search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
-    route: "ModelRoute | None" = None, extra_instructions: str = "",
+    route: "ModelRoute | None" = None, extra_instructions: str = "", styleguide_text: str = "",
 ) -> tuple[dict[int, list[str]], float]:
     """Step 1 of the two-step pipeline — see FINDINGS_SEARCH_PROMPT's own
     comment above for the full rationale. Returns ({}, 0.0) with NO API
@@ -780,7 +792,7 @@ async def _search_findings(
     # now, precisely so it no longer breaks that sharing).
     cache_prefix = search_cache_prefix(source_lang, extra_instructions)
     prompt = cache_prefix + _FINDINGS_SEARCH_PROMPT_SUFFIX.format(
-        target_lang_line=_target_lang_line(target_lang),
+        target_lang_line=_lang_line_with_styleguide(target_lang, styleguide_text),
         pairs_block=_pairs_block(checkable),
     )
     if route is None:
@@ -866,7 +878,7 @@ def _model_branch_search_warning(model_label: str) -> dict:
 
 async def _ensemble_search_findings(
     items: list[dict], target_lang: str = "", source_lang: str = "", model_override: str | None = None,
-    extra_instructions: str = "",
+    extra_instructions: str = "", styleguide_text: str = "",
 ) -> tuple[dict[int, list[str]], float, list[dict]]:
     """Step 1 of the two-step pipeline, Александр's ask (2026-09-23): run
     it under Sonnet (Anthropic) and GPT (OpenAI) concurrently and merge
@@ -923,6 +935,7 @@ async def _ensemble_search_findings(
     try:
         findings, cost = await _search_findings(
             items, target_lang, source_lang, route=route, extra_instructions=extra_instructions,
+            styleguide_text=styleguide_text,
         )
     except _BRANCH_FAILURE_EXCEPTIONS:
         return {}, 0.0, [_model_branch_search_warning(route.label)]
@@ -1123,6 +1136,22 @@ def _grammar_language_hint(target_lang: str) -> str:
     return GRAMMAR_LANGUAGE_HINTS.get(target_lang.strip().lower().split("-")[0], "")
 
 
+def _lang_line_with_styleguide(target_lang: str, styleguide_text: str = "") -> str:
+    """The target-language line plus the client's styleguide for that
+    language (2026-10-04) — both live in the per-language SUFFIX, so the
+    shared cached prefix stays identical across languages."""
+    line = _target_lang_line(target_lang)
+    sg = (styleguide_text or "").strip()
+    return f"{line}\n\n{sg}" if sg else line
+
+
+def _types_enum(checks: list[str], styleguide_text: str = "") -> str:
+    allowed = set(_allowed_ai_types(checks))
+    if (styleguide_text or "").strip():
+        allowed.add(STYLEGUIDE_TYPE)
+    return "|".join(sorted(allowed))
+
+
 def _target_lang_line(target_lang: str) -> str:
     """Explicitly names the target language rather than leaving the model
     to infer it purely from the translated text — closely related
@@ -1211,6 +1240,9 @@ def _other_type_instruction(checks_description: str | None) -> str:
 # in run_ai_checks below) can tell them apart from a real finding and
 # route them to the report instead of the visible findings list.
 REGISTER_VALUE_TYPE = "register_value"
+# AI findings that break the client's styleguide (2026-10-04) — never
+# dropped by the confidence threshold, see _apply_confidence_threshold.
+STYLEGUIDE_TYPE = "styleguide"
 
 # Unlike formal/informal/neutral above, "mixed" (the model reports it when
 # ONE row's translation itself switches between «ты» and «вы» instead of
@@ -1558,7 +1590,7 @@ def _allowed_ai_types(checks: list[str]) -> set[str]:
 
 
 def _filter_findings_by_checks(findings: list[dict], checks: list[str]) -> list[dict]:
-    allowed = _allowed_ai_types(checks)
+    allowed = _allowed_ai_types(checks) | {STYLEGUIDE_TYPE}
     return [f for f in findings if f.get("type") in allowed]
 
 
@@ -2354,19 +2386,19 @@ def _ai_failure_warning(reason: str) -> dict:
 
 async def run_ai_checks(
     source: str, translation: str, checks: list[str], extra_instructions: str = "",
-    target_lang: str = "", source_lang: str = "",
+    target_lang: str = "", source_lang: str = "", styleguide_text: str = "",
 ) -> tuple[list[dict], float]:
     """Single-pair check; adds a warning when the backup model had to step in."""
     events = new_route_events()
     findings, cost = await _run_ai_checks_inner(
-        source, translation, checks, extra_instructions, target_lang, source_lang,
+        source, translation, checks, extra_instructions, target_lang, source_lang, styleguide_text,
     )
     return findings + fallback_warnings(events), cost
 
 
 async def _run_ai_checks_inner(
     source: str, translation: str, checks: list[str], extra_instructions: str = "",
-    target_lang: str = "", source_lang: str = "",
+    target_lang: str = "", source_lang: str = "", styleguide_text: str = "",
 ) -> tuple[list[dict], float]:
     """Returns (findings, cost_usd) — cost_usd is this one API call's actual
     cost from Anthropic's reported token usage (0.0 when no AI check ran,
@@ -2382,7 +2414,7 @@ async def _run_ai_checks_inner(
     not just checks_description alone."""
     checks_description = _checks_description(checks)
     register_instructions = _register_instructions(checks, batch=False, target_lang=target_lang)
-    if not checks_description and not register_instructions:
+    if not checks_description and not register_instructions and not (styleguide_text or "").strip():
         return [], 0.0
 
     # Step 1 of the two-step pipeline (see FINDINGS_SEARCH_PROMPT's own
@@ -2400,25 +2432,26 @@ async def _run_ai_checks_inner(
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
     search_warnings: list[dict] = []
-    if checks_description:
+    if checks_description or (styleguide_text or "").strip():
         prior_findings, search_cost, search_warnings = await _ensemble_search_findings(
             [{"context": "", "source": source, "translation": translation}],
             target_lang=target_lang, source_lang=source_lang, extra_instructions=extra_instructions,
+            styleguide_text=styleguide_text,
         )
 
     prompt_kwargs = dict(
-        target_lang_line=_target_lang_line(target_lang),
+        target_lang_line=_lang_line_with_styleguide(target_lang, styleguide_text),
         calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang, checks),
         source=source,
         translation=translation,
         prior_findings=_prior_findings_block(prior_findings.get(0)),
         extra_instructions=extra_instructions.strip() or "нет",
-        checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
+        checks_description=checks_description or "(нет — только стайлгайд и сбор информации о регистре обращения ниже)",
         other_type_instruction=_other_type_instruction(checks_description),
         register_instructions=register_instructions,
         register_array_note=_register_array_note(checks, target_lang=target_lang),
-        type_enum="|".join(sorted(_allowed_ai_types(checks))),
+        type_enum=_types_enum(checks, styleguide_text),
     )
     # cache_prefix: see _SINGLE_PROMPT_PREFIX's own comment — fixed per
     # (target_lang, checks), independent of this specific pair's text.
@@ -2467,6 +2500,7 @@ def build_batch_prompt(
     target_lang: str = "",
     source_lang: str = "",
     prior_findings: dict[int, list[str]] | None = None,
+    styleguide_text: str = "",
 ) -> tuple[str | None, str | None, dict[int, int]]:
     """
     Builds the prompt for one language's batch of (context, source,
@@ -2510,7 +2544,8 @@ def build_batch_prompt(
     # all?) — single_item doesn't affect WHETHER this is empty, only its
     # exact wording once we know len(checkable), so the real value used in
     # the prompt is recomputed below with the correct single_item flag.
-    if not checks_description and not _register_instructions(checks, batch=True, target_lang=target_lang):
+    if (not checks_description and not _register_instructions(checks, batch=True, target_lang=target_lang)
+            and not (styleguide_text or "").strip()):
         return None, None, {}
 
     checkable = _checkable_items(items)
@@ -2522,15 +2557,15 @@ def build_batch_prompt(
         checks, batch=True, target_lang=target_lang, single_item=is_single_item,
     )
     common_kwargs = dict(
-        target_lang_line=_target_lang_line(target_lang),
+        target_lang_line=_lang_line_with_styleguide(target_lang, styleguide_text),
         calibration=_calibration(checks),
         source_lang_note=_source_lang_note(source_lang, checks),
         extra_instructions=extra_instructions.strip() or "нет",
-        checks_description=checks_description or "(нет — только сбор информации о регистре обращения ниже)",
+        checks_description=checks_description or "(нет — только стайлгайд и сбор информации о регистре обращения ниже)",
         other_type_instruction=_other_type_instruction(checks_description),
         register_instructions=register_instructions,
         register_array_note=_register_array_note(checks, target_lang=target_lang),
-        type_enum="|".join(sorted(_allowed_ai_types(checks))),
+        type_enum=_types_enum(checks, styleguide_text),
     )
     if is_single_item:
         # See BATCH_PROMPT_SINGLE_ITEM's own comment — skips the whole
@@ -2597,6 +2632,7 @@ async def run_ai_checks_batch(
     target_lang: str = "",
     source_lang: str = "",
     model_override: str | None = None,
+    styleguide_text: str = "",
 ) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
     """Synchronous path: builds the prompt, calls Claude right away, and
     returns (findings keyed by index into items, this call's cost_usd,
@@ -2631,7 +2667,7 @@ async def run_ai_checks_batch(
     2's) makes that a separate, bigger change, deliberately deferred."""
     checks_description = _checks_description(checks)
     register_instructions = _register_instructions(checks, batch=True, target_lang=target_lang)
-    if not checks_description and not register_instructions:
+    if not checks_description and not register_instructions and not (styleguide_text or "").strip():
         return {}, 0.0, False, []
 
     # Step 1 — same rationale as run_ai_checks's own call to this,
@@ -2644,14 +2680,15 @@ async def run_ai_checks_batch(
     prior_findings: dict[int, list[str]] = {}
     search_cost = 0.0
     search_warnings: list[dict] = []
-    if checks_description:
+    if checks_description or (styleguide_text or "").strip():
         prior_findings, search_cost, search_warnings = await _ensemble_search_findings(
             items, target_lang=target_lang, source_lang=source_lang, model_override=model_override,
-            extra_instructions=extra_instructions,
+            extra_instructions=extra_instructions, styleguide_text=styleguide_text,
         )
 
     prompt, cache_prefix, number_to_index = build_batch_prompt(
         items, checks, extra_instructions, target_lang, source_lang, prior_findings=prior_findings,
+        styleguide_text=styleguide_text,
     )
     if prompt is None:
         return {}, search_cost, False, search_warnings

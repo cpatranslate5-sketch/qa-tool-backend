@@ -37,6 +37,7 @@ from app.claude_client import (
     run_term_consistency_check,
 )
 from app.rule_checks import run_rule_checks
+from app import styleguide as sg_mod
 from app.claude_client import (
     _checkable_items,
     _checks_description,
@@ -973,6 +974,7 @@ async def _run_ai_chunks(
     source_lang: str,
     semaphore: asyncio.Semaphore,
     model_override: str | None = None,
+    styleguide_text: str = "",
 ) -> tuple[dict[int, list[dict]], float, bool, list[dict]]:
     """Runs every chunk of one language's items through the AI (bounded by
     the shared semaphore) and merges the per-chunk results back into a
@@ -1001,6 +1003,7 @@ async def _run_ai_chunks(
         async with semaphore:
             return await run_ai_checks_batch(
                 chunk_items, checks, extra_instructions, lang, source_lang, model_override=model_override,
+                styleguide_text=styleguide_text,
             )
 
     chunk_results = await asyncio.gather(*[_run_chunk(c) for c in item_chunks])
@@ -1054,11 +1057,12 @@ def _rows_and_items(sheet: dict, lang: str, source_lang: str) -> tuple[list[dict
 
 def _shared_cache_prefixes(
     sheet: dict, target_langs: list[str], source_lang: str, checks: list[str], extra_instructions: str,
+    styleguide: dict | None = None,
 ) -> list[tuple]:
     """(route, prefix) pairs that two or more Claude calls of this sheet will
     start with — only those are worth warming (see warm_prompt_cache)."""
-    has_search = bool(_checks_description(checks))
-    search_prefix = search_cache_prefix(source_lang, extra_instructions) if has_search else None
+    has_checks = bool(_checks_description(checks))
+    search_prefix = search_cache_prefix(source_lang, extra_instructions)
     counts: dict[tuple[str, str], list] = {}
 
     def _add(route, prefix):
@@ -1070,21 +1074,26 @@ def _shared_cache_prefixes(
         route = route_for_lang(lang)
         if route.vendor == "openai":
             continue
+        sg_text = sg_mod.prompt_text(sg_mod.rules_for_code(styleguide, lang))
         _, ai_items = _rows_and_items(sheet, lang, source_lang)
         for chunk in _chunk_list(ai_items, _chunk_size_for_lang(lang)):
             if not _checkable_items(chunk):
                 continue
-            _add(route, search_prefix)
-            _, step2_prefix, _ = build_batch_prompt(chunk, checks, extra_instructions, lang, source_lang)
+            if has_checks or sg_text:
+                _add(route, search_prefix)
+            _, step2_prefix, _ = build_batch_prompt(
+                chunk, checks, extra_instructions, lang, source_lang, styleguide_text=sg_text,
+            )
             _add(route, step2_prefix)
     return [(route, prefix) for (_, prefix), (route, n) in counts.items() if n >= 2]
 
 
 async def _warm_caches(
     sheet: dict, target_langs: list[str], source_lang: str, checks: list[str], extra_instructions: str,
+    styleguide: dict | None = None,
 ) -> dict[str, float]:
     """Runs the warm-up calls for one sheet; returns their cost per model label."""
-    pairs = _shared_cache_prefixes(sheet, target_langs, source_lang, checks, extra_instructions)
+    pairs = _shared_cache_prefixes(sheet, target_langs, source_lang, checks, extra_instructions, styleguide)
     if not pairs:
         return {}
     costs = await asyncio.gather(*[warm_prompt_cache(r, p) for r, p in pairs])
@@ -1102,8 +1111,11 @@ async def _check_language_for_sheet(
     checks: list[str],
     extra_instructions: str,
     semaphore: asyncio.Semaphore,
+    rules: dict | None = None,
 ) -> tuple[list[dict], float]:
-    """Returns (rows-with-findings, production cost_usd)."""
+    """Returns (rows-with-findings, production cost_usd). `rules` is this
+    language's client/project styleguide (app.styleguide), or None."""
+    sg_text = sg_mod.prompt_text(rules)
     relevant_rows, ai_items = _rows_and_items(sheet, lang, source_lang)
 
     if not relevant_rows:
@@ -1145,7 +1157,7 @@ async def _check_language_for_sheet(
             await asyncio.gather(
                 _run_ai_chunks(
                     item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
-                    model_override=model_for_lang,
+                    model_override=model_for_lang, styleguide_text=sg_text,
                 ),
                 _term_consistency(),
             )
@@ -1153,7 +1165,7 @@ async def _check_language_for_sheet(
     else:
         ai_findings_by_idx, cost_usd, truncated, search_warnings = await _run_ai_chunks(
             item_chunks, checks, extra_instructions, lang, source_lang, semaphore,
-            model_override=model_for_lang,
+            model_override=model_for_lang, styleguide_text=sg_text,
         )
         term_grouped, term_cost, term_warning = {}, 0.0, None
     cost_usd += term_cost
@@ -1163,11 +1175,18 @@ async def _check_language_for_sheet(
     ai_findings_by_idx = _resolve_repeated_findings(ai_findings_by_idx, relevant_rows)
     ai_findings_by_idx, register_values_by_idx = _extract_register_values(ai_findings_by_idx)
 
+    sg_key = sg_mod.lang_key_for(lang) or ""
+    doc_style = sg_mod.check_document(
+        [(r["excel_row"], r["values"].get(lang, "")) for r in relevant_rows], rules, sg_key,
+    ) if rules else {}
     out = []
     for idx, row in enumerate(relevant_rows):
         src = row["values"].get(source_lang, "")
         tgt = row["values"].get(lang, "")
         findings = run_rule_checks(src, tgt, checks, max_length=row["max_length"], lang_code=lang)
+        if rules:
+            findings += sg_mod.check_row(src, tgt, rules, sg_key)
+            findings += doc_style.get(row["excel_row"], [])
         # Algorithmic checks are deterministic — shown as 100% confidence,
         # next to the AI model's own percent on its findings.
         for f in findings:
@@ -1228,6 +1247,16 @@ async def _check_language_for_sheet(
             for idx in register_values_by_idx
         }
         block = _register_summary_block(build_register_report(by_excel_row, texts_by_excel_row))
+        requirement = sg_mod.tone_requirement_text(rules)
+        if block is None and requirement:
+            # Styleguide sets a tone but the text never addresses the player.
+            block = {
+                "excel_row": 0, "context": "ℹ️ Тон обращения", "source": "", "translation": "",
+                "findings": [{"type": "register_summary", "severity": "low",
+                              "message": "Тон: обращение к игроку не встречается."}],
+            }
+        if block is not None and requirement:
+            block["findings"][0]["register_requirement"] = requirement
         if block is not None:
             out.append(block)
     return out, cost_usd
@@ -1239,8 +1268,12 @@ async def run_multi_check(
     checks: list[str],
     extra_instructions: str = "",
     target_langs_filter: set[str] | None = None,
+    styleguide: dict | None = None,
 ) -> dict:
     """
+    styleguide: the project's effective styleguide (app.styleguide.
+    effective_rules) — each language gets its own rules, if any.
+
     Each target language gets its own AI call, so the prompt for e.g.
     "es-mx" never carries the other 34 languages' rows.
 
@@ -1280,6 +1313,7 @@ async def run_multi_check(
         try:
             findings_list, cost = await _check_language_for_sheet(
                 sheet, lang, source_lang, checks, extra_instructions, semaphore,
+                rules=sg_mod.rules_for_code(styleguide, lang),
             )
             warns = fallback_warnings(events)
             if warns:
@@ -1312,7 +1346,9 @@ async def run_multi_check(
         # seconds, then every language reads the shared instructions cheaply.
         if target_langs:
             try:
-                warm_costs = await _warm_caches(sheet, target_langs, source_lang, checks, extra_instructions)
+                warm_costs = await _warm_caches(
+                    sheet, target_langs, source_lang, checks, extra_instructions, styleguide,
+                )
             except Exception:
                 logger.warning("cache warm-up skipped", exc_info=True)
                 warm_costs = {}
