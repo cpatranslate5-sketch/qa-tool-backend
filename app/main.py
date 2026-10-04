@@ -145,16 +145,7 @@ def _seed_clients(db: Session) -> None:
         db.flush()
     if (client.seed_version or 0) < 2:
         # Step 2 (2026-10-04): each project's languages = the ToV table.
-        by_name = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
-        for name, codes in sg_mod.PROJECT_LANGS.items():
-            project = by_name.get(name.lower())
-            if project is None:
-                continue
-            db.query(models.LanguageCatalogEntry).filter(
-                models.LanguageCatalogEntry.project_id == project.id
-            ).delete()
-            for code in codes:
-                db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
+        _apply_tov_languages(db)
         client.seed_version = 2
     if (client.seed_version or 0) < 3:
         # Step 3 (2026-10-04, Александр: «где все остальные?»): step 2
@@ -175,8 +166,69 @@ def _seed_clients(db: Session) -> None:
             for code in sorted(c for c in used if c and c not in have):
                 db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
         client.seed_version = 3
+    if (client.seed_version or 0) < 4:
+        # Step 4 (2026-10-04, Александр: «сделай чётко по документу ToV»):
+        # step 3 brought back every header spelling ever seen in files
+        # (AR, AR-EG, BD, KZ…) — duplicates. Each project's list is again
+        # exactly its ToV languages; later manual edits are never touched.
+        _apply_tov_languages(db)
+        client.seed_version = 4
+    if (client.seed_version or 0) < 5:
+        # Step 5 (2026-10-04, Александр: «тебя путают объединённые ячейки?»):
+        # the ToV sheet re-read with merged cells expanded — new language
+        # lists and project tones. A project's tone is replaced only where it
+        # is still the old seeded value (or absent), so manual edits stay.
+        _apply_tov_languages(db)
+        _apply_tov_tones(db)
+        client.seed_version = 5
     db.commit()
     _patch_vi_ranges(client, db)
+
+
+def _apply_tov_languages(db: Session) -> None:
+    """Sets each 1win project's «Языки проекта» to exactly its ToV list."""
+    db.flush()
+    by_name = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
+    for name, codes in sg_mod.PROJECT_LANGS.items():
+        project = by_name.get(name.lower())
+        if project is None:
+            continue
+        db.query(models.LanguageCatalogEntry).filter(
+            models.LanguageCatalogEntry.project_id == project.id
+        ).delete(synchronize_session=False)
+        for code in codes:
+            db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
+    db.flush()
+
+
+def _apply_tov_tones(db: Session) -> None:
+    old = dict(sg_mod.PROJECTS_SEED_V1)
+    new = dict(sg_mod.PROJECTS_SEED)
+    by_name = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
+    for name, overrides in new.items():
+        project = by_name.get(name.lower())
+        if project is None:
+            continue
+        data = {k: dict(v) for k, v in (project.styleguide or {}).items()}
+        old_over = old.get(name, {})
+        langs = set(overrides) | set(old_over)
+        for lang in langs:
+            current = (data.get(lang) or {}).get("tone")
+            seeded = (old_over.get(lang) or {}).get("tone")
+            if current is not None and current != seeded:
+                continue  # edited by hand — keep
+            target = (overrides.get(lang) or {}).get("tone")
+            lang_rules = dict(data.get(lang) or {})
+            if target is None:
+                lang_rules.pop("tone", None)
+            else:
+                lang_rules["tone"] = target
+            if lang_rules:
+                data[lang] = lang_rules
+            else:
+                data.pop(lang, None)
+        project.styleguide = data
+    db.flush()
 
 
 def _patch_vi_ranges(client: models.Client, db: Session) -> None:

@@ -303,7 +303,7 @@ def _tov(level: str, note: str = "") -> dict:
 
 # Project overrides from the client's ToV sheet (only where they differ from
 # main; 1win and WL regular follow main — Александр, 2026-10-04).
-PROJECTS_SEED: list[tuple[str, dict]] = [
+PROJECTS_SEED_V1: list[tuple[str, dict]] = [
     ("1win", {}),
     ("1win SMM", {"ru": {"tone": _tov("informal", "ToV: informal")}}),
     ("WL regular", {}),
@@ -341,16 +341,46 @@ PROJECTS_SEED: list[tuple[str, dict]] = [
 ]
 
 
+# Version 2 (2026-10-04): read with merged cells expanded — in the ToV
+# sheet one «formal»/«informal» cell often spans many language rows, which
+# version 1 missed. 1win / SMM / WL follow main where they differ (main has
+# no rules for en, hy, ru — those take the ToV value). Blogger's general
+# comment «Can be very informal» spans every language.
+_BLOGGER = "ToV: informal. Can be very informal"
+_NO_MAIN_1WIN = {
+    "en": {"tone": _tov("formal", "ToV: formal")},
+    "hy": {"tone": _tov("formal", "ToV: formal")},
+}
+PROJECTS_SEED: list[tuple[str, dict]] = [
+    ("1win", {**_NO_MAIN_1WIN, "ru": {"tone": _tov("formal", "ToV: formal")}}),
+    ("1win SMM", {**_NO_MAIN_1WIN, "ru": {"tone": _tov("informal", "ToV: informal")}}),
+    ("WL regular", {**_NO_MAIN_1WIN, "ru": {"tone": _tov("formal", "ToV: formal")}}),
+    ("Blogger", {k: {"tone": _tov("informal", _BLOGGER)} for k in ("az", "en", "ky", "ro", "ru", "tg", "uz")}),
+    ("Jetton", {
+        **{k: {"tone": _tov("informal", "ToV: informal")} for k in (
+            "en", "es-mx", "fr", "hi", "hing", "id", "pl", "ru", "tg", "tr", "uk")},
+    }),
+    ("TonPlay", {k: {"tone": _tov("informal", "ToV: informal")} for k in ("en", "id", "pl", "ru", "tg", "uk")}),
+    ("WinGram", {k: {"tone": _tov("informal", "ToV: informal")} for k in ("en", "pl", "uk")}),
+]
+
+
 # Each project's languages = the languages that have a tone of address in
 # the client's ToV sheet for that project (Александр, 2026-10-04). Stored as
 # the project's «Языки проекта» catalog, in the codes the files use.
-_GROUP_1WIN = ["ar-eg", "es-es", "es-ar", "fr-ci", "fr-fr", "it-it", "ja-jp", "pl-pl", "pt-br"]
+_ALL_TOV = [
+    "ar-eg", "az-az", "bn-bd", "de-de", "el-gr", "en-001", "es-es", "es-ar", "es-mx", "fr-ci", "fr-fr",
+    "hi-in", "hi-latn-in", "hy-am", "id-id", "it-it", "ja-jp", "kk-kz", "ko-kr", "ky-kg", "ms-my", "mr-in",
+    "pl-pl", "pt-br", "pt-pt", "ro-md", "ro-ro", "ru-ru", "sw-ke", "tl-ph", "tg-tj", "te-in", "th-th",
+    "tr-tr", "uk-ua", "ur-pk", "uz-uz", "vi-vn", "zh-cn",
+]
 PROJECT_LANGS: dict[str, list[str]] = {
-    "1win": _GROUP_1WIN,
-    "1win SMM": _GROUP_1WIN + ["ru-ru", "sw-ke"],
-    "WL regular": _GROUP_1WIN,
-    "Blogger": ["ar-eg", "az-az", "en-001", "ky-kg", "ro-md", "ro-ro", "ru-ru", "tg-tj", "uz-uz"],
-    "Jetton": ["az-az", "en-001", "es-ar", "id-id", "kk-kz", "pl-pl", "pt-br", "ru-ru", "tg-tj", "tr-tr", "uz-uz"],
+    "1win": _ALL_TOV,
+    "1win SMM": _ALL_TOV,
+    "WL regular": _ALL_TOV,
+    "Blogger": ["az-az", "en-001", "ky-kg", "ro-md", "ro-ro", "ru-ru", "tg-tj", "uz-uz"],
+    "Jetton": ["az-az", "en-001", "es-ar", "es-mx", "fr-ci", "fr-fr", "hi-in", "hi-latn-in", "id-id", "kk-kz",
+               "pl-pl", "pt-br", "ru-ru", "tg-tj", "tr-tr", "uk-ua", "uz-uz"],
     "TonPlay": ["az-az", "en-001", "id-id", "kk-kz", "pl-pl", "ru-ru", "tg-tj", "uk-ua", "uz-uz"],
     "WinGram": ["en-001", "pl-pl", "uk-ua", "uz-uz"],
 }
