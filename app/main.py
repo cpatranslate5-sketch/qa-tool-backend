@@ -188,11 +188,11 @@ def _project_styleguide(project: models.Project | None) -> dict | None:
     client = project.client
     if client is None:
         return None
-    rules = sg_mod.effective_rules(client.styleguide, project.styleguide)
-    allowed = _project_sg_langs(project)
-    if allowed is not None:
-        rules = {k: v for k, v in rules.items() if k in allowed}
-    return rules
+    # Every client language keeps its rules here: a language outside the
+    # project's own list is still checked by the client's general rules
+    # (Александр, 2026-10-04). The list only shapes the project's settings
+    # screen (see _project_sg_langs).
+    return sg_mod.effective_rules(client.styleguide, project.styleguide)
 
 
 def _project_sg_langs(project: models.Project) -> list[str] | None:
@@ -325,6 +325,14 @@ async def _run_live_check_background(
         db.close()
 
 
+# Context now carries labelled columns of the client's file (2026-10-04).
+_CONTEXT_COLUMNS_NOTE = (
+    "Контекст строки может содержать «ключ:» — технический ключ строки (по нему видно, кнопка это, заголовок, "
+    "условие и т. п.) и «пометка:» — указание заказчика именно к этой строке. Пометка важнее общих правил: "
+    "например, если в ней сказано не переводить фразу или оставить её на английском, такой перевод — не ошибка."
+)
+
+
 def _with_domain_note(
     extra_instructions: str, *names: str | None, project_description: str | None = None,
 ) -> str:
@@ -343,6 +351,7 @@ def _with_domain_note(
     note = domain_note_for_names(*names)
     if note:
         parts.append(note)
+    parts.append(_CONTEXT_COLUMNS_NOTE)
     extra = (extra_instructions or "").strip()
     if extra:
         parts.append(extra)

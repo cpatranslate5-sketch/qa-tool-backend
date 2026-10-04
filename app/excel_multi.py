@@ -166,6 +166,9 @@ META_COL_NAMES = {
     "context", "key", "id", "string id", "identifier", "comment",
     "status", "screenshot", "reference", "notes", "note",
     "контекст", "ключ", "тз", "комментарий", "примечание", "статус",
+    # Template columns with no text to check (2026-10-04).
+    "picture / visual reference", "visual reference", "promo visual", "deadline",
+    "jira task for designers", "geo", "макеты", "макет", "скриншот", "lim",
 }
 
 # A "label: number" shape — "NOTIF title: 20", "Лимиты: PUSH banner: 25" —
@@ -181,17 +184,46 @@ META_COL_NAMES = {
 _LIMIT_SPEC_RE = re.compile(r":\s*\d+\s*$")
 
 
+def _norm_header(header: str) -> str:
+    return re.sub(r"\s+", " ", header.replace("*", "")).strip().lower()
+
+
+# Context columns (2026-10-04, Александр: «по колонкам можешь учить»). Their
+# values are passed to the AI with every row. "type" = what the text is
+# (banner title, TG post…), kept for following rows when the cell is empty
+# (merged cells); "key" = the string key (cashback.weekly_…); "note" = a
+# per-row instruction («перевести только на английский») — never inherited.
+CONTEXT_COLS = {
+    "context": "type", "контекст": "type", "type of text": "type", "type of text + context": "type",
+    "type": "type", "тип текста": "type", "тип": "type", "content type": "type", "язык": "type",
+    "key": "key", "ключ": "key", "string id": "key", "identifier": "key", "id": "key",
+    "additional info": "note", "comment": "note", "комментарий": "note", "примечание": "note",
+    "notes": "note", "note": "note", "тз": "note", "instructions": "note", "инструкция": "note",
+}
+# Character-limit columns («Limit*», «Лимит символов», «Max. length»).
+# «lim» is deliberately NOT here: client files use it for =LEN() formulas.
+LIMIT_COLS = {
+    "max length", "max. length", "limit", "limits", "character limit", "char limit",
+    "лимит", "лимиты", "лимит символов", "макс. длина", "максимальная длина",
+}
+# The source text column of SMM/marketing templates. Taught dictionary
+# spellings still win over this (see parse_workbook).
+SOURCE_COLS = {"text to be localized": "ru", "text to be localised": "ru", "исходник": "ru", "оригинал": "ru"}
+# Header "RU (эталон)", "RU (эталон) стало" — a code plus a note in brackets.
+_CODE_WITH_NOTE_RE = re.compile(r"^([A-Za-z]{2,3})\s*\(([^)]*[^A-Za-z0-9)\s][^)]*|[A-Za-z]{6,})\)\s*.*$")
+
+
 def _is_context_col(header: str) -> bool:
-    return header.strip().lower() == "context"
+    return _norm_header(header) in CONTEXT_COLS
 
 
 def _is_max_length_col(header: str) -> bool:
-    h = header.strip().lower()
-    return "max" in h and "length" in h
+    h = _norm_header(header)
+    return ("max" in h and "length" in h) or h in LIMIT_COLS
 
 
 def _is_meta_col(header: str) -> bool:
-    return header.strip().lower() in META_COL_NAMES
+    return _norm_header(header) in META_COL_NAMES
 
 
 def _is_limit_spec_col(header: str) -> bool:
@@ -255,6 +287,11 @@ def _normalize_lang_label(label: str) -> str:
     m = _SPACE_LANG_RE.match(label)
     if m:
         return f"{m.group(1).lower()}-{m.group(2).lower()}"
+    # Lower-case "en ng", "es mx" (2026-10-04): only when the first word is
+    # a real language code, so ordinary two-word headers stay prose.
+    m = re.match(r"^([a-z]{2,3})\s+([a-z]{2})$", label)
+    if m and m.group(1) in INDEPENDENT_LANGUAGE_CODES:
+        return f"{m.group(1)}-{m.group(2)}"
     code = label.lower()
     return _DEFAULT_REGION_FOR_BARE_LANG.get(code, code)
 
@@ -592,6 +629,7 @@ def parse_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -
 
         header_row = _find_header_row(ws)
         context_col = max_length_col = None
+        context_cols: list[tuple[int, str]] = []  # (column, kind)
         lang_cols: dict[int, str] = {}
         unrecognized: list[str] = []
 
@@ -614,8 +652,17 @@ def parse_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -
                 # to also match one of those unrelated shapes.
                 lang_cols[c] = alias_hit
                 continue
+            norm = _norm_header(label)
+            if norm in SOURCE_COLS:
+                lang_cols[c] = SOURCE_COLS[norm]
+                continue
+            note_code = _CODE_WITH_NOTE_RE.match(label)
+            if note_code:
+                lang_cols[c] = _normalize_lang_label(note_code.group(1))
+                continue
             if _is_context_col(label):
-                context_col = c
+                context_cols.append((c, CONTEXT_COLS[norm]))
+                context_col = context_col or c
             elif _is_max_length_col(label):
                 max_length_col = c
             elif _is_meta_col(label):
@@ -656,7 +703,7 @@ def parse_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -
         }
 
         rows = []
-        last_context = ""
+        last_types: dict[int, str] = {}
         for r in range(header_row + 1, ws.max_row + 1):
             # When a code maps to 2+ columns (see duplicate_language_columns
             # above), a plain {code: ...} dict comprehension over lang_cols
@@ -686,14 +733,27 @@ def parse_workbook(file_bytes: bytes, alias_map: dict[str, str] | None = None) -
             if all(v is None or str(v).strip() == "" for v in values.values()):
                 continue
 
-            context = ""
-            if context_col:
-                raw_ctx = ws.cell(row=r, column=context_col).value
-                context = str(raw_ctx).strip() if raw_ctx else ""
-            if context:
-                last_context = context
-            else:
-                context = last_context
+            # Context = every context column of the row, labelled; a blank
+            # "type" cell repeats the one above (merged cells), keys and
+            # per-row notes never do.
+            ctx_parts = []
+            for cc, kind in context_cols:
+                raw_ctx = ws.cell(row=r, column=cc).value
+                val = str(raw_ctx).strip() if raw_ctx not in (None, "") else ""
+                if kind == "type":
+                    if val:
+                        last_types[cc] = val
+                    else:
+                        val = last_types.get(cc, "")
+                if not val or val == "-":
+                    continue
+                if kind == "key":
+                    ctx_parts.append(f"ключ: {val}")
+                elif kind == "note":
+                    ctx_parts.append(f"пометка: {val}")
+                else:
+                    ctx_parts.append(val)
+            context = " | ".join(ctx_parts)
 
             max_length = None
             if max_length_col:
