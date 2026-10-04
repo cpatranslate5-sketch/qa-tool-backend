@@ -387,3 +387,10 @@ class LessonUpdateIn(BaseModel):
     lang_scope: str | None = None
     lang_key: str | None = None
     status: str | None = None  # "active" | "disabled" | "deleted"
+
+
+class AdminMoveCheckIn(BaseModel):
+    manager_id: int
+    kind: str  # "file" | "point"
+    check_id: int
+    folder_id: int

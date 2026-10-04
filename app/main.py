@@ -1213,6 +1213,114 @@ def single_check_report(project_id: int, single_check_id: int, manager_id: int, 
     return {"multi_check_id": mc.id}
 
 
+# ------------------------------------------------- admin: folder checks ---
+# 2026-10-04 (Александр: «вернуть результаты в папке Аня-2»): the admin can
+# see every check a folder made, in ALL projects — by the folder itself or
+# by its name on the check (older checks may have no folder id) — plus
+# traces of reports that no longer exist (deleted), and move a check into
+# a folder.
+
+def _iso(dt) -> str:
+    return dt.isoformat() if dt else ""
+
+
+@app.get("/admin/folder-checks")
+def admin_folder_checks(manager_id: int, folder_id: int, db: Session = Depends(get_db)):
+    _require_admin(manager_id, db)
+    folder = _get_manager(folder_id, db)
+    fname = (folder.name or "").strip().lower()
+    projects = {p.id: p for p in db.query(models.Project).all()}
+    clients = {c.id: c.name for c in db.query(models.Client).all()}
+    managers = {m.id: m.name for m in db.query(models.Manager).all()}
+
+    def proj(pid):
+        p = projects.get(pid)
+        if p is None:
+            return {"project_id": pid, "project_name": "(проект удалён)", "client_name": ""}
+        return {"project_id": pid, "project_name": p.name, "client_name": clients.get(p.client_id, "")}
+
+    def owner(mid):
+        return managers.get(mid, "") if mid else ""
+
+    def matches(mid, performed):
+        return mid == folder.id or (performed or "").strip().lower() == fname
+
+    out = []
+    for r in db.query(models.MultiCheck).filter(models.MultiCheck.single_check_id.is_(None)).all():
+        if not matches(r.manager_id, r.performed_by_name):
+            continue
+        summary = r.summary or {}
+        out.append({
+            "kind": "file", "id": r.id, **proj(r.project_id),
+            "title": r.filename or "(без имени)",
+            "langs": summary.get("languages_checked") or [],
+            "findings": summary.get("total_findings"),
+            "status": r.status, "created_at": _iso(r.created_at),
+            "owner_id": r.manager_id, "owner_name": owner(r.manager_id),
+            "performed_by_name": r.performed_by_name or "",
+        })
+    for r in db.query(models.SingleCheck).all():
+        if not matches(r.manager_id, r.performed_by_name):
+            continue
+        real = [f for f in (r.findings or []) if f.get("type") not in ("register_summary", "system")]
+        preview = (r.source or "").strip().replace("\n", " ")
+        out.append({
+            "kind": "point", "id": r.id, **proj(r.project_id),
+            "title": "Точечная: " + (preview[:80] + ("…" if len(preview) > 80 else "")),
+            "langs": [r.target_lang] if r.target_lang else [],
+            "findings": len(real),
+            "status": "completed", "created_at": _iso(r.created_at),
+            "owner_id": r.manager_id, "owner_name": owner(r.manager_id),
+            "performed_by_name": r.performed_by_name or "",
+        })
+    out.sort(key=lambda x: x["created_at"], reverse=True)
+
+    # Traces of reports that are gone: ids still referenced by this folder's
+    # «Сохранённое» or by any «Обучение платформы» item.
+    existing = {i for (i,) in db.query(models.MultiCheck.id).all()}
+    traces: dict[int, dict] = {}
+    for sc in db.query(models.SavedCase).filter(models.SavedCase.manager_id == folder.id).all():
+        if sc.multi_check_id and sc.multi_check_id not in existing:
+            t = traces.setdefault(sc.multi_check_id, {"multi_check_id": sc.multi_check_id, "project_name": sc.project_name,
+                                                      "filename": sc.filename, "langs": set(), "seen_in": set(), "this_folder": True})
+            t["langs"].add(sc.lang or "")
+            t["seen_in"].add("Сохранённое")
+    for li in db.query(models.LearningItem).all():
+        if li.multi_check_id and li.multi_check_id not in existing:
+            t = traces.setdefault(li.multi_check_id, {"multi_check_id": li.multi_check_id, "project_name": li.project_name,
+                                                      "filename": li.filename, "langs": set(), "seen_in": set(), "this_folder": False})
+            t["langs"].add(li.lang_code or "")
+            t["seen_in"].add("Обучение платформы")
+    trace_list = [
+        {**t, "langs": sorted(x for x in t["langs"] if x), "seen_in": sorted(t["seen_in"])}
+        for t in sorted(traces.values(), key=lambda t: -t["multi_check_id"])
+    ]
+    return {"folder": {"id": folder.id, "name": folder.name}, "checks": out, "deleted_traces": trace_list}
+
+
+@app.post("/admin/checks/move")
+def admin_move_check(payload: schemas.AdminMoveCheckIn, db: Session = Depends(get_db)):
+    """Puts a check (and a point check's report) into another folder."""
+    _require_admin(payload.manager_id, db)
+    folder = _get_manager(payload.folder_id, db)
+    if payload.kind == "file":
+        rec = db.get(models.MultiCheck, payload.check_id)
+        if rec is None or rec.single_check_id is not None:
+            raise HTTPException(404, "Проверка не найдена.")
+        rec.manager_id = folder.id
+    elif payload.kind == "point":
+        rec = db.get(models.SingleCheck, payload.check_id)
+        if rec is None:
+            raise HTTPException(404, "Проверка не найдена.")
+        rec.manager_id = folder.id
+        for mc in db.query(models.MultiCheck).filter(models.MultiCheck.single_check_id == rec.id).all():
+            mc.manager_id = folder.id
+    else:
+        raise HTTPException(400, "Неизвестный вид проверки.")
+    db.commit()
+    return {"ok": True}
+
+
 # ---------------------------------------------------------- multi check ---
 
 DEFAULT_MULTI_CHECKS = [
