@@ -394,3 +394,8 @@ class AdminMoveCheckIn(BaseModel):
     kind: str  # "file" | "point"
     check_id: int
     folder_id: int
+
+
+class ClientDomainIn(BaseModel):
+    manager_id: int
+    domain: str

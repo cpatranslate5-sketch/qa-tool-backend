@@ -40,7 +40,9 @@ LANGS: list[tuple[str, str, list[str]]] = [
     ("es-es", "es-ES", ["es", "es-es"]),
     ("es-ar", "es-AR", ["es-ar"]),
     ("es-mx", "es-MX", ["es-mx"]),
+    ("fi", "fi-FI", ["fi", "fi-fi"]),
     ("fr", "fr-CI / fr-FR", ["fr", "fr-fr", "fr-ci"]),
+    ("fr-ca", "fr-CA", ["fr-ca"]),
     ("hi", "hi-IN", ["hi", "hi-in"]),
     ("hing", "hi-Latn-IN", ["hing", "hi-latn", "hi-latn-in", "hinglish"]),
     ("hy", "hy-AM", ["hy", "hy-am"]),
@@ -898,3 +900,34 @@ def meta() -> dict:
         "em_dash_modes": EM_DASH_MODES,
         "auto_default": AUTO_DEFAULT,
     }
+
+
+# ----------------------------------------------------------- other clients --
+# 2026-10-05 (Александр): more clients. Play Fortuna, Olymp, PD — betting &
+# gambling like 1win, no styleguide of their own: they follow 1win's rules
+# for now, but with NO tone requirement (the report only states which tone
+# is used). Айтыс — an advertising agency, general marketing: no styleguide.
+# «Остальное» — one-off jobs for other projects.
+OTHER_CLIENTS: list[dict] = [
+    {"name": "Play Fortuna", "domain": "betting", "copy_1win": True,
+     "projects": [("Play Fortuna", ["fi-fi", "pt-br", "pt-pt", "pl-pl", "es-es", "es-mx", "es-ar",
+                                    "fr-fr", "fr-ca", "kk-kz", "de-de"])]},
+    {"name": "PD", "domain": "betting", "copy_1win": True,
+     "projects": [("PD", ["kk-kz", "uz-uz", "az-az"])]},
+    {"name": "Olymp", "domain": "betting", "copy_1win": True,
+     "projects": [("Olymp", ["en", "az-az", "kk-kz", "ky-kg"])]},
+    {"name": "Айтыс", "domain": "marketing", "copy_1win": False,
+     "projects": [("Айтыс", ["kk-kz", "ky-kg", "uz-uz", "tg-tj", "ru-ru"])]},
+    {"name": "Остальное", "domain": "", "copy_1win": False,
+     "projects": [("Разовые задачи", sorted(set(_ALL_TOV) | {"en", "fi-fi", "fr-ca"}))]},
+]
+
+
+def without_tone(styleguide: dict | None) -> dict:
+    """A copy of a styleguide with every language's tone section removed."""
+    out = {}
+    for lang, secs in (styleguide or {}).items():
+        rest = {k: copy.deepcopy(v) for k, v in (secs or {}).items() if k != "tone"}
+        if rest:
+            out[lang] = rest
+    return out

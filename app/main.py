@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.auth import hash_code, verify_code
-from app.claude_client import domain_note_for_names, route_for_lang, run_ai_checks
+from app.claude_client import DOMAIN_LABELS, domain_note_for_names, route_for_lang, run_ai_checks
 from app.share_page import ALL_LANGS, numbered_findings, report_langs, pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
@@ -119,6 +119,11 @@ def on_startup():
         logger.exception("client/styleguide seeding failed")
         db.rollback()
     try:
+        _seed_other_clients(db)
+    except Exception:
+        logger.exception("other clients seeding failed")
+        db.rollback()
+    try:
         _backfill_learning(db)
     except Exception:
         logger.exception("learning backfill failed")
@@ -188,6 +193,42 @@ def _seed_clients(db: Session) -> None:
         client.seed_version = 5
     db.commit()
     _patch_vi_ranges(client, db)
+
+
+def _seed_other_clients(db: Session) -> None:
+    """2026-10-05 (Александр): 1win's subject is betting; and the clients
+    Play Fortuna, PD, Olymp, Айтыс and «Остальное» with their projects and
+    languages (sg_mod.OTHER_CLIENTS). A client is created only when no
+    client with that name exists — nothing already there is overwritten,
+    except that a project's missing languages are added."""
+    win = db.query(models.Client).filter(models.Client.name == "1win").first()
+    if win is not None and (win.seed_version or 0) < 6:
+        if not win.domain:
+            win.domain = "betting"
+        win.seed_version = 6
+        db.commit()
+    clients = {c.name.strip().lower(): c for c in db.query(models.Client).all()}
+    for spec in sg_mod.OTHER_CLIENTS:
+        if spec["name"].lower() in clients:
+            continue
+        sg = sg_mod.without_tone(win.styleguide) if (spec["copy_1win"] and win is not None) else {}
+        client = models.Client(name=spec["name"], styleguide=sg, domain=spec["domain"], seed_version=6)
+        db.add(client)
+        db.flush()
+        existing = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
+        for pname, codes in spec["projects"]:
+            project = existing.get(pname.lower())
+            if project is None:
+                project = models.Project(name=pname, created_by_name="Система")
+                db.add(project)
+                db.flush()
+            if project.client_id is None:
+                project.client_id = client.id
+            have = {e.lang_code for e in project.language_catalog}
+            for code in codes:
+                if code not in have:
+                    db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
+        db.commit()
 
 
 def _apply_tov_languages(db: Session) -> None:
@@ -415,6 +456,7 @@ _CONTEXT_COLUMNS_NOTE = (
 
 def _with_domain_note(
     extra_instructions: str, *names: str | None, project_description: str | None = None,
+    domain: str | None = None,
 ) -> str:
     """Builds the task's "Особые указания" block that goes into every AI
     prompt: the project's own admin-written description (see
@@ -428,7 +470,7 @@ def _with_domain_note(
             "ОПИСАНИЕ ПРОЕКТА (написано менеджером проекта — учитывай тематику, аудиторию и требования при "
             f"оценке каждой строки):\n{desc}"
         )
-    note = domain_note_for_names(*names)
+    note = domain_note_for_names(*names, domain=domain)
     if note:
         parts.append(note)
     parts.append(_CONTEXT_COLUMNS_NOTE)
@@ -631,10 +673,16 @@ def delete_project(project_id: int, payload: schemas.ProjectDeleteIn, db: Sessio
 # project inherits it and may override single sections per language. Anyone
 # can view; only the admin folder edits. Each edit is logged (with «Вернуть»).
 
+def _project_domain(project) -> str:
+    client = getattr(project, "client", None) if project is not None else None
+    return (client.domain or "") if client is not None else ""
+
+
 def _client_out(c: models.Client) -> dict:
     return {
         "id": c.id,
         "name": c.name,
+        "domain": c.domain or "",
         "projects": [{"id": p.id, "name": p.name} for p in sorted(c.projects, key=lambda p: p.name.lower())],
     }
 
@@ -656,6 +704,19 @@ def create_client(payload: schemas.ClientIn, db: Session = Depends(get_db)):
     db.add(client)
     db.commit()
     db.refresh(client)
+    return _client_out(client)
+
+
+@app.put("/clients/{client_id}/domain")
+def set_client_domain(client_id: int, payload: schemas.ClientDomainIn, db: Session = Depends(get_db)):
+    _require_admin(payload.manager_id, db)
+    client = db.get(models.Client, client_id)
+    if client is None:
+        raise HTTPException(404, "Заказчик не найден.")
+    if payload.domain not in DOMAIN_LABELS:
+        raise HTTPException(400, "Неизвестная тематика.")
+    client.domain = payload.domain
+    db.commit()
     return _client_out(client)
 
 
@@ -1068,6 +1129,7 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         project.name if project is not None else None,
         manager_obj.name if manager_obj is not None else None,
         project_description=project.description if project is not None else None,
+        domain=_project_domain(project),
     )
     ai_findings, cost_usd = await run_ai_checks(
         payload.source, payload.translation, payload.checks, extra_for_ai,
@@ -1522,6 +1584,7 @@ async def multi_check(
     manager_obj = _get_manager(manager_id, db)
     extra_instructions = _with_domain_note(
         extra_instructions, project_obj.name, manager_obj.name, project_description=project_obj.description,
+        domain=_project_domain(project_obj),
     )
     file_bytes = await file.read()
 

@@ -1732,8 +1732,25 @@ BETTING_DOMAIN_NOTE = (
 )
 
 
-def domain_note_for_names(*names: str | None) -> str:
-    """The subject-domain note for a check, from its project/folder names."""
+# 2026-10-05 (Александр): «Айтыс» — an advertising agency, general
+# marketing, nothing to do with iGaming.
+MARKETING_DOMAIN_NOTE = (
+    "ТЕМАТИКА: все тексты этой задачи — общий маркетинг и реклама (рекламные кампании, промо-тексты, "
+    "соцсети, рассылки, баннеры), НЕ беттинг и НЕ казино. Толкуй слова в их обычном значении. "
+    "Рекламная адаптация (свободный, живой перевод слогана, игра слов, перестройка фразы) — не ошибка, "
+    "если смысл и посыл сохранены. Главное: опечатки, грамматика, пунктуация, оформление, искажения смысла, "
+    "пропуски и единообразие."
+)
+
+DOMAIN_NOTES = {"betting": BETTING_DOMAIN_NOTE, "marketing": MARKETING_DOMAIN_NOTE}
+DOMAIN_LABELS = {"": "Не задана", "betting": "Беттинг и гемблинг", "marketing": "Общий маркетинг"}
+
+
+def domain_note_for_names(*names: str | None, domain: str | None = None) -> str:
+    """The subject-domain note for a check: the client's own domain when it
+    is set, otherwise guessed from the project/folder names."""
+    if domain:
+        return DOMAIN_NOTES.get(domain, "")
     joined = " ".join(n for n in names if n).lower()
     if any(k in joined for k in DOMAIN_KEYWORDS_BETTING):
         return BETTING_DOMAIN_NOTE

@@ -63,6 +63,9 @@ def _run_migrations():
         if "seed_version" not in cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE clients ADD COLUMN seed_version INTEGER NOT NULL DEFAULT 0"))
+        if "domain" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE clients ADD COLUMN domain VARCHAR(20) NOT NULL DEFAULT ''"))
 
     if "projects" in existing_tables:
         cols = {c["name"] for c in insp.get_columns("projects")}
