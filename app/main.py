@@ -1207,17 +1207,20 @@ def single_check_history(project_id: int, manager_id: int, db: Session = Depends
         models.SingleCheck.project_id == project_id,
         models.SingleCheck.manager_id == manager_id,
     ).order_by(models.SingleCheck.created_at.desc()).limit(50).all()
-    return [
-        schemas.SingleCheckHistoryOut(
-            id=r.id, source_lang=r.source_lang, target_lang=r.target_lang,
-            source=r.source, translation=r.translation,
-            checks_run=r.checks_run, findings=r.findings,
-            performed_by_name=r.performed_by_name,
-            created_at=r.created_at.isoformat(),
-            cost_usd=r.cost_usd,
-        )
-        for r in records
-    ]
+    out = []
+    for r in records:
+        try:
+            out.append(schemas.SingleCheckHistoryOut(
+                id=r.id, source_lang=r.source_lang or "", target_lang=r.target_lang or "",
+                source=r.source or "", translation=r.translation or "",
+                checks_run=r.checks_run or [], findings=r.findings or [],
+                performed_by_name=r.performed_by_name or "",
+                created_at=r.created_at.isoformat() if r.created_at else "",
+                cost_usd=r.cost_usd or 0.0,
+            ))
+        except Exception:
+            logger.exception("history: point check %s could not be listed", r.id)
+    return out
 
 
 @app.delete("/projects/{project_id}/history/{single_check_id}")
@@ -1771,7 +1774,12 @@ async def multi_check_history(
             # there's rarely more than one at a time — so the history list
             # can show a real "готово X из Y" without the manager having to
             # reopen that specific check's page to trigger a poll.
-            finalized, progress = await try_finalize_batch(r.batch_id, r.results["skeleton"])
+            # 2026-10-05: one broken record must never hide the whole history.
+            try:
+                finalized, progress = await try_finalize_batch(r.batch_id, (r.results or {})["skeleton"])
+            except Exception:
+                logger.exception("history: finalizing batch of check %s failed", r.id)
+                finalized, progress = None, None
             if finalized is not None:
                 # Same deferral as the live multi-check path above — the
                 # Sonnet-only second opinion runs in the background instead
@@ -1790,16 +1798,20 @@ async def multi_check_history(
                 db.refresh(r)
                 background_tasks.add_task(_run_second_opinion_background, r.id, finalized)
                 progress = None
-        out.append(schemas.MultiCheckHistoryOut(
-            id=r.id, filename=r.filename, source_lang=r.source_lang,
-            summary=r.summary, status=r.status, performed_by_name=r.performed_by_name,
-            created_at=r.created_at.isoformat(),
-            cost_usd=r.cost_usd,
-            progress=progress,
-            estimated_minutes=_estimate_batch_minutes(db, r.batch_volume_chars) if r.status == "processing" else None,
-            completed_at=r.completed_at.isoformat() if r.completed_at else None,
-            second_opinion_pending=bool((r.results or {}).get("second_opinion_pending", False)),
-        ))
+        try:
+            out.append(schemas.MultiCheckHistoryOut(
+                id=r.id, filename=r.filename or "", source_lang=r.source_lang or "",
+                summary=r.summary if isinstance(r.summary, dict) else {},
+                status=r.status or "completed", performed_by_name=r.performed_by_name or "",
+                created_at=r.created_at.isoformat() if r.created_at else "",
+                cost_usd=r.cost_usd or 0.0,
+                progress=progress,
+                estimated_minutes=_estimate_batch_minutes(db, r.batch_volume_chars) if r.status == "processing" else None,
+                completed_at=r.completed_at.isoformat() if r.completed_at else None,
+                second_opinion_pending=bool((r.results or {}).get("second_opinion_pending", False)),
+            ))
+        except Exception:
+            logger.exception("history: check %s could not be listed", r.id)
     return out
 
 
