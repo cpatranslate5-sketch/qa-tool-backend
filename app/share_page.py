@@ -63,6 +63,9 @@ _CSS = """
   .item.na { background: #fdeeee; border-color: #f0b4b4; }
   .field { font-size: 0.9rem; margin-top: 4px; }
   .links { margin-top: 10px; }
+  mark.loc { background: #fde68a; color: inherit; padding: 0 2px; border-radius: 3px; }
+  .loc-line { font-size: 0.85rem; color: #555; white-space: pre-wrap; margin-top: 6px; }
+  .field.txt { white-space: pre-wrap; }
   .links a { color: #4f46e5; word-break: break-all; display: block; }
   .comment { border-left: 3px solid #d98a1f; background: rgba(0,0,0,0.03); padding: 6px 10px; margin-top: 8px; font-size: 0.9rem; }
   .block-label { display: block; font-size: 0.85rem; margin-top: 10px; }
@@ -139,6 +142,73 @@ def _t(v) -> str:
     return "".join(out)
 
 
+# «Где именно ошибка» (2026-10-05): the finding's verbatim "fragment" (or,
+# for older findings, a «…» quote from its message) located in the text —
+# highlighted there, plus a «📍» line for long texts. Same logic as the
+# frontend's locate.ts.
+_QUOTE_RE = re.compile(r"«([^«»]{2,200})»|“([^“”]{2,200})”|\"([^\"]{2,200})\"")
+
+
+def _fragments(f: dict) -> list[str]:
+    out = []
+    frag = str(f.get("fragment") or "").strip()
+    if frag:
+        out.append(frag)
+    for m in _QUOTE_RE.finditer(str(f.get("message") or "")):
+        q = (m.group(1) or m.group(2) or m.group(3) or "").strip().strip("…").strip()
+        if len(q) >= 2 and q not in out:
+            out.append(q)
+    return out
+
+
+def locate(f: dict, source: str, translation: str):
+    """(field, start, end) of the finding's spot, or None."""
+    if f.get("type") in ("register_summary", "system"):
+        return None
+    for cand in _fragments(f):
+        for field, text in (("translation", translation or ""), ("source", source or "")):
+            i = text.find(cand)
+            if i < 0:
+                i = text.lower().find(cand.lower())
+            if i >= 0:
+                return field, i, i + len(cand)
+    return None
+
+
+def _is_long(text: str) -> bool:
+    text = text or ""
+    return len(text) > 160 or "\n" in text.strip()
+
+
+def _t_marked(text, span) -> str:
+    text = str(text or "")
+    if not span:
+        return _t(text)
+    a, b = span
+    return _t(text[:a]) + '<mark class="loc">' + _t(text[a:b]) + "</mark>" + _t(text[b:])
+
+
+def _loc_line(loc, source: str, translation: str) -> str:
+    if not loc:
+        return ""
+    field, a, b = loc
+    text = translation if field == "translation" else source
+    if not _is_long(text):
+        return ""
+    paras = [i for i, line in enumerate(text.split("\n")) if line.strip()]
+    line_no = text.count("\n", 0, a)
+    para = (paras.index(line_no) + 1) if line_no in paras else 1
+    ls = text.rfind("\n", 0, a) + 1
+    le = text.find("\n", b)
+    le = len(text) if le < 0 else le
+    fr, to = max(ls, a - 60), min(le, b + 60)
+    where = "Перевод" if field == "translation" else "Оригинал"
+    if len(paras) > 1:
+        where += f", абзац {para} из {len(paras)}"
+    return (f'<div class="field loc-line">📍 {where}: {"…" if fr > ls else ""}{_e(text[fr:a])}'
+            f'<mark class="loc">{_e(text[a:b])}</mark>{_e(text[b:to])}{"…" if to < le else ""}</div>')
+
+
 # Row numbers mean nothing to translators (Crowdin splits strings its own
 # way — Александр, 2026-10-01), so the translator page never shows them.
 _ALSO_ROWS_RE = re.compile(r"\s*\(также в строках:[^)]*\)\s*$")
@@ -175,7 +245,7 @@ def _links_html(raw: str) -> str:
             items.append(f'<a href="{_e(p)}" target="_blank" rel="noopener noreferrer">{_e(p)}</a>')
         else:
             items.append(f"<span>{_e(p)}</span>")
-    return '<div class="field links"><span class="label">Ссылки на Crowdin:</span>' + "".join(items) + "</div>"
+    return '<div class="field links"><span class="label">Ссылки:</span>' + "".join(items) + "</div>"
 
 
 def _page(title: str, body: str, script: str = "", nonce: str = "") -> str:
@@ -529,17 +599,24 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
                 )
             platform_html = ""
         else:
+            src, trn = str(row.get("source") or ""), str(row.get("translation") or "")
+            loc = locate(f, src, trn)
             body_html = (
-                f'<div class="field"><span class="label">Источник:</span> {_t(row.get("source"))}</div>'
-                f'<div class="field"><span class="label">Перевод:</span> {_t(row.get("translation"))}</div>'
+                f'<div class="field txt"><span class="label">Источник:</span> '
+                f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
+                f'<div class="field txt"><span class="label">Перевод:</span> '
+                f'{_t_marked(trn, loc[1:] if loc and loc[0] == "translation" else None)}</div>'
             )
-            platform_html = f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(_strip_rows(f.get("message")))}</div>'
+            platform_html = (
+                f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(_strip_rows(f.get("message")))}</div>'
+                + _loc_line(loc, src, trn)
+            )
         links_html = _links_html(entry.get("links", ""))
         if pending:
             # The QA head can add or fix the Crowdin link(s) at this stage.
             raw_links = "\n".join(p for p in re.split(r"\s+", entry.get("links") or "") if p)
             links_html = (
-                '<label class="label block-label">Ссылки на Crowdin:</label>'
+                '<label class="label block-label">Ссылки (необязательно, если нет Crowdin):</label>'
                 f'<textarea class="okk-links" placeholder="https://crowdin.com/… — каждая ссылка с новой строки">{_e(raw_links)}</textarea>'
             )
         okk_comment = (entry.get("okk_comment") or "").strip()

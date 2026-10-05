@@ -209,6 +209,11 @@ def _seed_other_clients(db: Session) -> None:
             win.domain = "betting"
         win.seed_version = 6
         db.commit()
+    if win is not None and (win.seed_version or 0) < 7:
+        # 2026-10-05: Crowdin is used only for 1win.
+        win.uses_crowdin = True
+        win.seed_version = 7
+        db.commit()
     clients = {c.name.strip().lower(): c for c in db.query(models.Client).all()}
     for spec in sg_mod.OTHER_CLIENTS:
         if spec["name"].lower() in clients:
@@ -675,6 +680,11 @@ def delete_project(project_id: int, payload: schemas.ProjectDeleteIn, db: Sessio
 # project inherits it and may override single sections per language. Anyone
 # can view; only the admin folder edits. Each edit is logged (with «Вернуть»).
 
+def _project_uses_crowdin(project) -> bool:
+    client = getattr(project, "client", None) if project is not None else None
+    return bool(client is not None and client.uses_crowdin)
+
+
 def _project_domain(project) -> str:
     client = getattr(project, "client", None) if project is not None else None
     return (client.domain or "") if client is not None else ""
@@ -685,6 +695,7 @@ def _client_out(c: models.Client) -> dict:
         "id": c.id,
         "name": c.name,
         "domain": c.domain or "",
+        "uses_crowdin": bool(c.uses_crowdin),
         "projects": [{"id": p.id, "name": p.name} for p in sorted(c.projects, key=lambda p: p.name.lower())],
     }
 
@@ -718,6 +729,17 @@ def set_client_domain(client_id: int, payload: schemas.ClientDomainIn, db: Sessi
     if payload.domain not in DOMAIN_LABELS:
         raise HTTPException(400, "Неизвестная тематика.")
     client.domain = payload.domain
+    db.commit()
+    return _client_out(client)
+
+
+@app.put("/clients/{client_id}/crowdin")
+def set_client_crowdin(client_id: int, payload: schemas.ClientCrowdinIn, db: Session = Depends(get_db)):
+    _require_admin(payload.manager_id, db)
+    client = db.get(models.Client, client_id)
+    if client is None:
+        raise HTTPException(404, "Заказчик не найден.")
+    client.uses_crowdin = bool(payload.uses_crowdin)
     db.commit()
     return _client_out(client)
 
@@ -1855,6 +1877,9 @@ async def multi_check_detail(
         "status": "completed",
         "filename": record.filename,
         "source_lang": record.source_lang,
+        # Crowdin links are required for the report only where the client
+        # works in Crowdin (2026-10-05: only 1win).
+        "uses_crowdin": _project_uses_crowdin(record.project),
         "summary": record.summary,
         "sheets": record.results.get("sheets", []),
         "cost_usd": record.cost_usd,

@@ -399,3 +399,8 @@ class AdminMoveCheckIn(BaseModel):
 class ClientDomainIn(BaseModel):
     manager_id: int
     domain: str
+
+
+class ClientCrowdinIn(BaseModel):
+    manager_id: int
+    uses_crowdin: bool

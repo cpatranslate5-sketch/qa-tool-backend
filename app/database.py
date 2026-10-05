@@ -66,6 +66,9 @@ def _run_migrations():
         if "domain" not in cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE clients ADD COLUMN domain VARCHAR(20) NOT NULL DEFAULT ''"))
+        if "uses_crowdin" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE clients ADD COLUMN uses_crowdin BOOLEAN NOT NULL DEFAULT FALSE"))
 
     if "projects" in existing_tables:
         cols = {c["name"] for c in insp.get_columns("projects")}

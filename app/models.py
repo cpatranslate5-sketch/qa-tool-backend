@@ -109,6 +109,9 @@ class Client(Base):
     # gambling), "marketing" (general advertising) or "" (not set) — picks
     # the «ТЕМАТИКА» note every AI prompt gets, see claude_client.
     domain: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    # Works in Crowdin (2026-10-05: only 1win) — then every kept finding
+    # needs a Crowdin link before the report can be generated.
+    uses_crowdin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     projects: Mapped[list["Project"]] = relationship(back_populates="client")
