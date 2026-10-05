@@ -371,9 +371,8 @@ class StyleguideRevertIn(BaseModel):
 class LearnIn(BaseModel):
     manager_id: int
     text: str
-    scope: str = "project"  # "project" | "projects" | "client" | "all"
+    scope: str = "project"  # "project" | "client" | "all"
     lang_scope: str = "lang"  # "lang" | "all"
-    project_ids: list[int] | None = None  # for scope "projects"
 
 
 class LearningStatusIn(BaseModel):
@@ -388,7 +387,6 @@ class LessonUpdateIn(BaseModel):
     lang_scope: str | None = None
     lang_key: str | None = None
     status: str | None = None  # "active" | "disabled" | "deleted"
-    project_ids: list[int] | None = None  # for scope "projects"
 
 
 class AdminMoveCheckIn(BaseModel):
@@ -406,9 +404,3 @@ class ClientDomainIn(BaseModel):
 class ClientCrowdinIn(BaseModel):
     manager_id: int
     uses_crowdin: bool
-
-
-class LearningReviewIn(BaseModel):
-    manager_id: int
-    force: bool = False  # «Разобрать заново»
-    admin_note: str | None = None  # «Моё пояснение» — saved, then a fresh review
