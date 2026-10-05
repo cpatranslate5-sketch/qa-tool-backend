@@ -66,6 +66,9 @@ _CSS = """
   mark.loc { background: #fde68a; color: inherit; padding: 0 2px; border-radius: 3px; }
   .loc-line { font-size: 0.85rem; color: #555; white-space: pre-wrap; margin-top: 6px; }
   .field.txt { white-space: pre-wrap; }
+  details.full-text { margin: 4px 0 6px; font-size: 0.85rem; }
+  details.full-text summary { cursor: pointer; color: #4f46e5; }
+  details.full-text .field { margin-top: 6px; }
   .links a { color: #4f46e5; word-break: break-all; display: block; }
   .comment { border-left: 3px solid #d98a1f; background: rgba(0,0,0,0.03); padding: 6px 10px; margin-top: 8px; font-size: 0.9rem; }
   .block-label { display: block; font-size: 0.85rem; margin-top: 10px; }
@@ -161,18 +164,111 @@ def _fragments(f: dict) -> list[str]:
     return out
 
 
+def _find(text: str, cand: str) -> int:
+    i = text.find(cand)
+    return i if i >= 0 else text.lower().find(cand.lower())
+
+
 def locate(f: dict, source: str, translation: str):
-    """(field, start, end) of the finding's spot, or None."""
+    """(field, start, end) of the finding's spot, or None. The translation
+    is searched first with every quote, only then the source."""
     if f.get("type") in ("register_summary", "system"):
         return None
-    for cand in _fragments(f):
-        for field, text in (("translation", translation or ""), ("source", source or "")):
-            i = text.find(cand)
-            if i < 0:
-                i = text.lower().find(cand.lower())
+    cands = _fragments(f)
+    for field, text in (("translation", translation or ""), ("source", source or "")):
+        for cand in cands:
+            i = _find(text, cand)
             if i >= 0:
                 return field, i, i + len(cand)
     return None
+
+
+def _para_spans(text: str) -> list[tuple[int, int]]:
+    spans, pos = [], 0
+    for line in text.split("\n"):
+        if line.strip():
+            spans.append((pos, pos + len(line)))
+        pos += len(line) + 1
+    return spans
+
+
+def _para_index(spans, pos: int) -> int:
+    for i, (a, b) in enumerate(spans):
+        if pos <= b:
+            return i
+    return max(0, len(spans) - 1)
+
+
+_SENT_END = re.compile(r"[.!?…。！？]\s")
+
+
+def _window(text: str, a: int, b: int, limit: int = 500) -> tuple[int, int]:
+    """A few sentences around [a, b) when a paragraph is very long."""
+    if len(text) <= limit:
+        return 0, len(text)
+    lo, hi = max(0, a - limit // 2), min(len(text), b + limit // 2)
+    m = None
+    for m in _SENT_END.finditer(text, 0, lo + 1):
+        pass
+    start = m.end() if m and m.end() <= a else lo
+    m2 = _SENT_END.search(text, b)
+    end = m2.start() + 1 if m2 and m2.start() + 1 <= hi + 100 else hi
+    return start, end
+
+
+def excerpt_html(f: dict, source: str, translation: str) -> str | None:
+    """For a long text: only the paragraph (or a few sentences) with the
+    error — in the source and the translation — and the full text folded
+    away (2026-10-05, Александр: «не весь текст, а только нужная часть»)."""
+    source, translation = source or "", translation or ""
+    if not (_is_long(source) or _is_long(translation)):
+        return None
+    loc = locate(f, source, translation)
+    if not loc:
+        return None
+    field, a, b = loc
+    texts = {"source": source, "translation": translation}
+    spans = {k: _para_spans(v) for k, v in texts.items()}
+    other = "source" if field == "translation" else "translation"
+    k = _para_index(spans[field], a)
+    n_f, n_o = len(spans[field]), len(spans[other])
+    if n_o == 0:
+        return None
+    k_o = k if n_f == n_o else min(n_o - 1, round(k * (n_o - 1) / max(1, n_f - 1)))
+    parts = {}
+    for name, idx in ((field, k), (other, k_o)):
+        ps, pe = spans[name][idx]
+        para = texts[name][ps:pe]
+        mark = None
+        if name == field:
+            mark = (a - ps, b - ps)
+        else:
+            for cand in _fragments(f):
+                i = _find(para, cand)
+                if i >= 0:
+                    mark = (i, i + len(cand))
+                    break
+        if mark:
+            ws, we = _window(para, *mark)
+            text = ("…" if ws > 0 else "") + _t_marked(para[ws:we], (mark[0] - ws, mark[1] - ws)) + ("…" if we < len(para) else "")
+        else:
+            ws, we = _window(para, 0, 0)
+            text = _t(para[ws:we]) + ("…" if we < len(para) else "")
+        parts[name] = (idx + 1, len(spans[name]), text)
+
+    def label(name, title):
+        i, n, _ = parts[name]
+        return f"{title} (абзац {i} из {n}):" if n > 1 else f"{title}:"
+
+    full_src = _t_marked(source, (a, b) if field == "source" else None)
+    full_trn = _t_marked(translation, (a, b) if field == "translation" else None)
+    return (
+        f'<div class="field txt"><span class="label">{label("source", "Источник")}</span> {parts["source"][2]}</div>'
+        f'<div class="field txt"><span class="label">{label("translation", "Перевод")}</span> {parts["translation"][2]}</div>'
+        '<details class="full-text"><summary>Показать весь текст</summary>'
+        f'<div class="field txt"><span class="label">Источник:</span> {full_src}</div>'
+        f'<div class="field txt"><span class="label">Перевод:</span> {full_trn}</div></details>'
+    )
 
 
 def _is_long(text: str) -> bool:
@@ -601,7 +697,8 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
         else:
             src, trn = str(row.get("source") or ""), str(row.get("translation") or "")
             loc = locate(f, src, trn)
-            body_html = (
+            short = excerpt_html(f, src, trn)
+            body_html = short or (
                 f'<div class="field txt"><span class="label">Источник:</span> '
                 f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
                 f'<div class="field txt"><span class="label">Перевод:</span> '
@@ -609,7 +706,7 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             )
             platform_html = (
                 f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(_strip_rows(f.get("message")))}</div>'
-                + _loc_line(loc, src, trn)
+                + ("" if short else _loc_line(loc, src, trn))
             )
         links_html = _links_html(entry.get("links", ""))
         if pending:
