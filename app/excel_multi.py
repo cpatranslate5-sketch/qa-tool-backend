@@ -2144,6 +2144,8 @@ def build_report_workbook(
         for lang, findings_list in sheet.get("languages", {}).items():
             for item in findings_list:
                 for f in item["findings"]:
+                    if f.get("deleted"):
+                        continue  # removed from the report by the manager
                     ws.append([
                         sheet["sheet_name"],
                         item["excel_row"],

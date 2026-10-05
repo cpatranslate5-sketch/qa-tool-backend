@@ -404,3 +404,11 @@ class ClientDomainIn(BaseModel):
 class ClientCrowdinIn(BaseModel):
     manager_id: int
     uses_crowdin: bool
+
+
+class FindingEditIn(BaseModel):
+    manager_id: int
+    code: str
+    key: str
+    action: str  # "edit" | "delete"
+    message: str | None = None

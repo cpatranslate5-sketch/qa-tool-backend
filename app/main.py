@@ -1,3 +1,4 @@
+import copy
 import base64
 import datetime
 import secrets
@@ -1974,6 +1975,59 @@ def _own_multi_check(project_id: int, multi_check_id: int, manager_id: int, db: 
     if record is None or record.project_id != project_id or record.manager_id != manager_id:
         raise HTTPException(404, "Проверка не найдена.")
     return record
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/finding")
+def edit_report_finding(project_id: int, multi_check_id: int, payload: schemas.FindingEditIn, db: Session = Depends(get_db)):
+    """Changes the platform's comment of one finding, or removes the finding
+    from the report — only with the folder's password (2026-10-05,
+    Александр). Removal is a mark, not a real delete, so the numbers and
+    keys of the other findings stay as they are."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    manager = _get_manager(payload.manager_id, db)
+    if not verify_code((payload.code or "").strip(), manager.code_hash):
+        raise HTTPException(401, "Неверный пароль папки.")
+    parts = (payload.key or "").split("|")
+    if len(parts) != 4:
+        raise HTTPException(400, "Неизвестное замечание.")
+    try:
+        sheet_idx, lang, excel_row, fi = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
+    except ValueError:
+        raise HTTPException(400, "Неизвестное замечание.")
+    results = copy.deepcopy(record.results or {})
+    sheets = results.get("sheets") or []
+    if not (0 <= sheet_idx < len(sheets)):
+        raise HTTPException(404, "Замечание не найдено.")
+    row = next((r for r in (sheets[sheet_idx].get("languages") or {}).get(lang) or [] if r.get("excel_row") == excel_row), None)
+    findings = (row or {}).get("findings") or []
+    if not (0 <= fi < len(findings)) or findings[fi].get("type") in ("register_summary", "system"):
+        raise HTTPException(404, "Замечание не найдено.")
+    f = findings[fi]
+    if payload.action == "edit":
+        text_ = (payload.message or "").strip()
+        if not text_:
+            raise HTTPException(400, "Комментарий не может быть пустым.")
+        if len(text_) > 3000:
+            raise HTTPException(400, "Комментарий слишком длинный.")
+        f.setdefault("original_message", f.get("message", ""))
+        f["message"] = text_
+        f["edited_by"] = manager.name
+    elif payload.action == "delete":
+        f["deleted"] = True
+        f["deleted_by"] = manager.name
+        summary = dict(record.summary or {})
+        if isinstance(summary.get("total_findings"), int) and summary["total_findings"] > 0:
+            summary["total_findings"] -= 1
+            record.summary = summary
+            results["summary"] = summary
+        review = dict(record.review or {})
+        review.pop(payload.key, None)
+        record.review = review
+    else:
+        raise HTTPException(400, "Неизвестное действие.")
+    record.results = results
+    db.commit()
+    return {"ok": True, "key": payload.key, "action": payload.action, "message": f.get("message", "")}
 
 
 @app.post("/projects/{project_id}/multi-check/{multi_check_id}/share")

@@ -362,7 +362,9 @@ def render_not_found() -> str:
 
 def _is_reviewable(excel_row, f: dict) -> bool:
     # Must match the frontend's isReviewable (reportHtml.ts).
-    return excel_row != 0 and f.get("type") not in ("register_summary", "system")
+    # A finding the manager removed from the report (2026-10-05) is gone
+    # everywhere — numbering, the translator page, counts.
+    return excel_row != 0 and f.get("type") not in ("register_summary", "system") and not f.get("deleted")
 
 
 def tone_key(lang: str) -> str:
