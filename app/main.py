@@ -2282,7 +2282,13 @@ def _backfill_learning(db: Session) -> None:
 
 
 def _scope_label(db: Session, lesson: models.Lesson) -> str:
-    if lesson.project_id:
+    if lesson.project_ids:
+        names = []
+        for pid in lesson.project_ids:
+            p = db.get(models.Project, pid)
+            names.append(f"«{p.name}»" if p else "(удалён)")
+        where = "проекты " + ", ".join(names)
+    elif lesson.project_id:
         p = db.get(models.Project, lesson.project_id)
         where = f"проект «{p.name}»" if p else "проект (удалён)"
     elif lesson.client_id:
@@ -2296,7 +2302,8 @@ def _scope_label(db: Session, lesson: models.Lesson) -> str:
 
 def _lesson_snapshot(lesson: models.Lesson) -> dict:
     return {
-        "text": lesson.text, "project_id": lesson.project_id, "client_id": lesson.client_id,
+        "text": lesson.text, "project_id": lesson.project_id, "project_ids": lesson.project_ids or None,
+        "client_id": lesson.client_id,
         "lang_key": lesson.lang_key, "status": lesson.status,
     }
 
@@ -2323,7 +2330,11 @@ def _lessons_for(db: Session, project: models.Project | None, lang_codes) -> tup
         for les in lessons:
             if les.lang_key and les.lang_key != lk:
                 continue
-            if les.project_id:
+            if les.project_ids:
+                if pid not in les.project_ids:
+                    continue
+                rank = 0
+            elif les.project_id:
                 if les.project_id != pid:
                     continue
                 rank = 0
@@ -2376,7 +2387,7 @@ def _item_out(db: Session, it: models.LearningItem) -> dict:
         "lang_label": sg_mod.LANG_LABEL.get(it.lang_key, it.lang_code), "excel_row": it.excel_row,
         "context": it.context, "finding_type": it.finding_type, "finding_message": it.finding_message,
         "source": it.source, "translation": it.translation, "translator_comment": it.translator_comment,
-        "okk_note": it.okk_note, "ai_review": it.ai_review or None, "lesson_id": it.lesson_id, "resolved_by_name": it.resolved_by_name,
+        "okk_note": it.okk_note, "ai_review": it.ai_review or None, "admin_note": it.admin_note or "", "lesson_id": it.lesson_id, "resolved_by_name": it.resolved_by_name,
         "created_at": it.created_at.isoformat() if it.created_at else None,
         "resolved_at": it.resolved_at.isoformat() if it.resolved_at else None,
     }
@@ -2385,7 +2396,8 @@ def _item_out(db: Session, it: models.LearningItem) -> dict:
 def _lesson_out(db: Session, les: models.Lesson) -> dict:
     hist = db.query(models.LessonHistory).filter(models.LessonHistory.lesson_id == les.id).order_by(models.LessonHistory.id.desc()).all()
     return {
-        "id": les.id, "text": les.text, "project_id": les.project_id, "client_id": les.client_id,
+        "id": les.id, "text": les.text, "project_id": les.project_id, "project_ids": les.project_ids or None,
+        "client_id": les.client_id,
         "lang_key": les.lang_key, "lang_label": sg_mod.LANG_LABEL.get(les.lang_key, les.lang_key) if les.lang_key else "",
         "scope_label": _scope_label(db, les), "example": les.example or {}, "status": les.status,
         "used_count": les.used_count or 0, "created_by_name": les.created_by_name,
@@ -2399,9 +2411,22 @@ def _lesson_out(db: Session, les: models.Lesson) -> dict:
     }
 
 
-def _apply_scope(db: Session, lesson: models.Lesson, scope: str, lang_scope: str, project_id, client_id, lang_key: str) -> None:
-    if scope not in ("project", "client", "all") or lang_scope not in ("lang", "all"):
+def _apply_scope(
+    db: Session, lesson: models.Lesson, scope: str, lang_scope: str, project_id, client_id, lang_key: str,
+    project_ids: list[int] | None = None,
+) -> None:
+    if scope not in ("project", "projects", "client", "all") or lang_scope not in ("lang", "all"):
         raise HTTPException(400, "Неверная область действия.")
+    ids: list[int] = []
+    if scope == "projects":
+        for pid in project_ids or []:
+            if pid not in ids and db.get(models.Project, pid) is not None:
+                ids.append(pid)
+        if not ids:
+            raise HTTPException(400, "Отметьте хотя бы один проект.")
+        if len(ids) == 1:
+            scope, project_id = "project", ids[0]
+    lesson.project_ids = ids if scope == "projects" else None
     if scope == "project" and not project_id:
         raise HTTPException(400, "У этого замечания нет проекта.")
     if scope == "client" and not client_id:
@@ -2448,7 +2473,7 @@ def learning_item_learn(item_id: int, payload: schemas.LearnIn, db: Session = De
         example={"finding_message": it.finding_message, "source": it.source, "translation": it.translation,
                  "project_name": it.project_name, "lang_code": it.lang_code, "item_id": it.id},
     )
-    _apply_scope(db, lesson, payload.scope, payload.lang_scope, it.project_id, it.client_id, it.lang_key)
+    _apply_scope(db, lesson, payload.scope, payload.lang_scope, it.project_id, it.client_id, it.lang_key, payload.project_ids)
     db.add(lesson)
     _log_lesson(db, lesson, "created", manager.name)
     it.status = "learned"
@@ -2493,7 +2518,7 @@ def learning_lesson_update(lesson_id: int, payload: schemas.LessonUpdateIn, db: 
         if not payload.text.strip():
             raise HTTPException(400, "Текст урока пустой.")
         les.text = payload.text.strip()[:2000]
-    if payload.scope is not None or payload.lang_scope is not None or payload.lang_key is not None:
+    if payload.scope is not None or payload.lang_scope is not None or payload.lang_key is not None or payload.project_ids is not None:
         ex = les.example or {}
         item = db.get(models.LearningItem, ex.get("item_id")) if ex.get("item_id") else None
         project_id = les.project_id or (item.project_id if item else None)
@@ -2502,9 +2527,10 @@ def learning_lesson_update(lesson_id: int, payload: schemas.LessonUpdateIn, db: 
             p = db.get(models.Project, project_id)
             client_id = p.client_id if p else None
         lang_key = (payload.lang_key if payload.lang_key is not None else les.lang_key) or (item.lang_key if item else "")
-        scope = payload.scope or ("project" if les.project_id else "client" if les.client_id else "all")
+        scope = payload.scope or ("projects" if les.project_ids else "project" if les.project_id else "client" if les.client_id else "all")
         lang_scope = payload.lang_scope or ("lang" if les.lang_key else "all")
-        _apply_scope(db, les, scope, lang_scope, project_id, client_id, lang_key)
+        _apply_scope(db, les, scope, lang_scope, project_id, client_id, lang_key,
+                     payload.project_ids if payload.project_ids is not None else les.project_ids)
     if payload.status is not None:
         if payload.status not in ("active", "disabled", "deleted"):
             raise HTTPException(400, "Неверный статус.")
@@ -2542,6 +2568,8 @@ _REVIEW_PROMPT = """Ты — опытный редактор-носитель и
 - Суди по самому тексту, а не по уверенности сторон. Переводчик может ошибаться (защищать свою ошибку), а платформа часто бывает слишком строгой: живой, рекламный, «не учебниковый» язык, кальки и заимствования, принятые у носителей и в тематике проекта, — НЕ ошибка.
 - Учитывай тематику проекта, стайлгайд заказчика и уже действующие уроки.
 - Если комментария нет — оцени замечание сам.
+- Если есть пояснение руководителя ОКК — это проверенные факты (например, как раздел или кнопка названы на сайте заказчика): доверяй им полностью, они важнее комментария переводчика и твоих предположений.
+- Названия из интерфейса сайта, разделов, кнопок, игр и акций, а также термины глоссария — фиксированные. Никогда не предлагай вариантов, которые меняют само название (артикль, падеж, число, синоним, другое написание); исправлять можно только то, что вокруг него.
 
 {project_block}
 Строка:
@@ -2551,7 +2579,7 @@ _REVIEW_PROMPT = """Ты — опытный редактор-носитель и
 - Тип замечания: {finding_type}
 - Замечание платформы: {finding}
 - {who_comment}: {comment}
-
+{admin_line}
 {lessons_block}
 Ответь ТОЛЬКО JSON-объектом без пояснений вокруг:
 {{
@@ -2606,6 +2634,7 @@ def _review_prompt(db: Session, it: models.LearningItem) -> str:
         source=(it.source or "")[:4000], translation=(it.translation or "")[:4000],
         finding_type=it.finding_type or "—", finding=it.finding_message or "",
         lessons_block=lessons_block,
+        admin_line=(f"- Пояснение руководителя ОКК (проверенные факты): {it.admin_note.strip()}\n" if (it.admin_note or "").strip() else ""),
     )
 
 
@@ -2643,6 +2672,9 @@ async def learning_item_review(item_id: int, payload: schemas.LearningReviewIn, 
     it = db.get(models.LearningItem, item_id)
     if it is None:
         raise HTTPException(404, "Не найдено.")
+    if payload.admin_note is not None:
+        it.admin_note = payload.admin_note.strip()[:3000]
+        db.commit()
     if it.ai_review and not payload.force:
         return {"item": _item_out(db, it)}
     route = route_for_lang(it.lang_code or it.lang_key)
