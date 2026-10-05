@@ -2030,6 +2030,65 @@ def edit_report_finding(project_id: int, multi_check_id: int, payload: schemas.F
     return {"ok": True, "key": payload.key, "action": payload.action, "message": f.get("message", "")}
 
 
+MANUAL_ROW_BASE = 100000  # rows the manager adds himself (no Excel row)
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/finding-add")
+def add_report_finding(project_id: int, multi_check_id: int, payload: schemas.FindingAddIn, db: Session = Depends(get_db)):
+    """The manager's own remark for the translator (2026-10-05, Александр) —
+    to an existing row of the report, or as a separate block of a language
+    (optionally with the source / translation it is about). Folder password
+    required. Added already marked ✓ (it is meant for the translator)."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    manager = _get_manager(payload.manager_id, db)
+    if not verify_code((payload.code or "").strip(), manager.code_hash):
+        raise HTTPException(401, "Неверный пароль папки.")
+    message = (payload.message or "").strip()
+    if not message:
+        raise HTTPException(400, "Напишите комментарий.")
+    if len(message) > 3000:
+        raise HTTPException(400, "Комментарий слишком длинный.")
+    severity = payload.severity if payload.severity in ("low", "medium", "high") else "medium"
+    results = copy.deepcopy(record.results or {})
+    sheets = results.get("sheets") or []
+    if not (0 <= payload.sheet_idx < len(sheets)):
+        raise HTTPException(404, "Лист не найден.")
+    sheet = sheets[payload.sheet_idx]
+    lang = payload.lang
+    if lang not in (sheet.get("languages_checked") or []):
+        raise HTTPException(400, "Такого языка нет в этом отчёте.")
+    rows = sheet.setdefault("languages", {}).setdefault(lang, [])
+    finding = {"type": "manual", "severity": severity, "message": message, "added_by": manager.name}
+    if payload.excel_row is not None:
+        row = next((r for r in rows if r.get("excel_row") == payload.excel_row and payload.excel_row != 0), None)
+        if row is None:
+            raise HTTPException(404, "Строка не найдена.")
+    else:
+        used = [r.get("excel_row") or 0 for r in rows]
+        excel_row = max([MANUAL_ROW_BASE] + [x for x in used if x >= MANUAL_ROW_BASE]) + 1
+        row = {
+            "excel_row": excel_row,
+            "context": "Замечание менеджера",
+            "source": (payload.source or "").strip()[:5000],
+            "translation": (payload.translation or "").strip()[:5000],
+            "findings": [],
+        }
+        rows.append(row)
+    row.setdefault("findings", []).append(finding)
+    key = f"{payload.sheet_idx}|{lang}|{row['excel_row']}|{len(row['findings']) - 1}"
+    summary = dict(record.summary or {})
+    if isinstance(summary.get("total_findings"), int):
+        summary["total_findings"] += 1
+        results["summary"] = summary
+        record.summary = summary
+    record.results = results
+    review = dict(record.review or {})
+    review[key] = {"decision": "accept", "links": "", "note": ""}
+    record.review = review
+    db.commit()
+    return {"ok": True, "key": key, "row": row, "finding": finding}
+
+
 @app.post("/projects/{project_id}/multi-check/{multi_check_id}/share")
 def create_share_link(project_id: int, multi_check_id: int, payload: schemas.ShareLinkIn, db: Session = Depends(get_db)):
     """Returns this language's active translator link, creating it if there

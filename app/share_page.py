@@ -700,14 +700,23 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             src, trn = str(row.get("source") or ""), str(row.get("translation") or "")
             loc = locate(f, src, trn)
             short = excerpt_html(f, src, trn)
-            body_html = short or (
+            full_pair = (
+                f'<div class="field txt"><span class="label">Источник:</span> '
+                f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
+                f'<div class="field txt"><span class="label">Перевод:</span> '
+                f'{_t_marked(trn, loc[1:] if loc and loc[0] == "translation" else None)}</div>'
+            )
+            if not short and (_is_long(src) or _is_long(trn)) and not loc:
+                # Long text, place not found: fold it instead of a wall of text.
+                short = f'<details class="full-text"><summary>Показать текст строки</summary>{full_pair}</details>'
+            body_html = "" if not (src.strip() or trn.strip()) else short or (
                 f'<div class="field txt"><span class="label">Источник:</span> '
                 f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
                 f'<div class="field txt"><span class="label">Перевод:</span> '
                 f'{_t_marked(trn, loc[1:] if loc and loc[0] == "translation" else None)}</div>'
             )
             platform_html = (
-                f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(_strip_rows(f.get("message")))}</div>'
+                f'<div class="comment"><span class="label">{"Комментарий менеджера" if f.get("type") == "manual" else "Комментарий платформы"}:</span> {_t(_strip_rows(f.get("message")))}</div>'
                 + ("" if short else _loc_line(loc, src, trn))
             )
         links_html = _links_html(entry.get("links", ""))

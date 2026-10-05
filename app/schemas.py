@@ -412,3 +412,15 @@ class FindingEditIn(BaseModel):
     key: str
     action: str  # "edit" | "delete"
     message: str | None = None
+
+
+class FindingAddIn(BaseModel):
+    manager_id: int
+    code: str
+    sheet_idx: int = 0
+    lang: str
+    excel_row: int | None = None  # None = a separate block of the language
+    message: str
+    severity: str = "medium"
+    source: str | None = None
+    translation: str | None = None
