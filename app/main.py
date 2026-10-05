@@ -216,10 +216,21 @@ def _seed_other_clients(db: Session) -> None:
         db.commit()
     clients = {c.name.strip().lower(): c for c in db.query(models.Client).all()}
     for spec in sg_mod.OTHER_CLIENTS:
-        if spec["name"].lower() in clients:
+        existing_client = clients.get(spec["name"].lower())
+        if existing_client is not None and spec["copy_1win"] and (existing_client.seed_version or 0) < 7:
+            # 2026-10-05: 1win's button rules don't apply to the other clients
+            # — removed from their copies.
+            for lang in list((existing_client.styleguide or {}).keys()):
+                for sec in sg_mod.BUTTON_SECTIONS:
+                    if sec not in (existing_client.styleguide.get(lang) or {}):
+                        continue
+                    existing_client.styleguide, _ = _apply_section(existing_client.styleguide, lang, sec, None)
+            existing_client.seed_version = 7
+            db.commit()
+        if existing_client is not None:
             continue
         sg = sg_mod.without_tone(win.styleguide) if (spec["copy_1win"] and win is not None) else {}
-        client = models.Client(name=spec["name"], styleguide=sg, domain=spec["domain"], seed_version=6)
+        client = models.Client(name=spec["name"], styleguide=sg, domain=spec["domain"], seed_version=7)
         db.add(client)
         db.flush()
         existing = {p.name.strip().lower(): p for p in db.query(models.Project).all()}

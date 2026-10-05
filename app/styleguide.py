@@ -923,11 +923,17 @@ OTHER_CLIENTS: list[dict] = [
 ]
 
 
+# 2026-10-05 (Александр): 1win's button rules are not carried over either.
+BUTTON_SECTIONS = ("cta_buttons", "service_buttons")
+NOT_COPIED_SECTIONS = ("tone",) + BUTTON_SECTIONS
+
+
 def without_tone(styleguide: dict | None) -> dict:
-    """A copy of a styleguide with every language's tone section removed."""
+    """A copy of 1win's styleguide for another client: without the tone of
+    address and without the button rules."""
     out = {}
     for lang, secs in (styleguide or {}).items():
-        rest = {k: copy.deepcopy(v) for k, v in (secs or {}).items() if k != "tone"}
+        rest = {k: copy.deepcopy(v) for k, v in (secs or {}).items() if k not in NOT_COPIED_SECTIONS}
         if rest:
             out[lang] = rest
     return out
