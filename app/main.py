@@ -1,3 +1,4 @@
+import base64
 import datetime
 import secrets
 import logging
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app import models, schemas
 from app.auth import hash_code, verify_code
+from app import doc_convert
 from app.claude_client import DOMAIN_LABELS, domain_note_for_names, route_for_lang, run_ai_checks
 from app.share_page import ALL_LANGS, numbered_findings, report_langs, pending_keys, sent_keys, render_not_found, render_shared_report, share_page_headers
 from app.config import settings
@@ -1389,6 +1391,32 @@ DEFAULT_MULTI_CHECKS = [
     "numbers", "placeholders", "max_length", "register", "typo",
     "untranslatable", "completeness", "punctuation", "term_consistency",
 ]
+
+
+@app.post("/projects/{project_id}/convert")
+async def convert_document(
+    project_id: int,
+    original: UploadFile = File(...),
+    translation: UploadFile | None = File(None),
+    source_lang: str = Form(""),
+    target_lang: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    """Word / PowerPoint / JSON → the Excel table the file check reads (see
+    app.doc_convert). Returns the table (base64) — the browser then runs the
+    usual Excel flow on it — plus what was found and any warnings."""
+    _get_project(project_id, db)
+    files = [(original.filename or "", await original.read())]
+    if translation is not None and (translation.filename or ""):
+        files.append((translation.filename or "", await translation.read()))
+    try:
+        xlsx, info = doc_convert.convert(files, source_lang, target_lang, _load_alias_map(db))
+    except doc_convert.ConvertError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        logger.exception("document conversion failed")
+        raise HTTPException(400, "Не удалось прочитать документ — возможно, он повреждён или в нестандартном формате.")
+    return {"xlsx_b64": base64.b64encode(xlsx).decode("ascii"), "info": info}
 
 
 @app.post("/projects/{project_id}/multi-check/detect-languages")
