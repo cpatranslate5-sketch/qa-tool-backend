@@ -1987,10 +1987,11 @@ def create_share_link(project_id: int, multi_check_id: int, payload: schemas.Sha
         raise HTTPException(400, "Такого языка нет в этом отчёте.")
     existing = next((sl for sl in record.share_links if sl.lang == lang and not sl.revoked), None)
     if existing is None:
-        # Every ✓ / ? finding must carry a Crowdin link first (2026-10-01).
+        # Every ✓ / ? finding must carry a Crowdin link first (2026-10-01) —
+        # only where the client works in Crowdin (2026-10-05: only 1win).
         review = record.review or {}
         missing = 0
-        for l in (report_langs(record.results or {}) if lang == ALL_LANGS else [lang]):
+        for l in ([] if not _project_uses_crowdin(record.project) else (report_langs(record.results or {}) if lang == ALL_LANGS else [lang])):
             for _, key, row, _f in numbered_findings(l, record.results or {}):
                 e = review.get(key) or {}
                 if row is not None and e.get("decision") in ("accept", "question") and not (e.get("links") or "").strip():
