@@ -404,3 +404,8 @@ class ClientDomainIn(BaseModel):
 class ClientCrowdinIn(BaseModel):
     manager_id: int
     uses_crowdin: bool
+
+
+class LearningReviewIn(BaseModel):
+    manager_id: int
+    force: bool = False  # «Разобрать заново»

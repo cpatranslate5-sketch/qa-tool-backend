@@ -2376,7 +2376,7 @@ def _item_out(db: Session, it: models.LearningItem) -> dict:
         "lang_label": sg_mod.LANG_LABEL.get(it.lang_key, it.lang_code), "excel_row": it.excel_row,
         "context": it.context, "finding_type": it.finding_type, "finding_message": it.finding_message,
         "source": it.source, "translation": it.translation, "translator_comment": it.translator_comment,
-        "okk_note": it.okk_note, "lesson_id": it.lesson_id, "resolved_by_name": it.resolved_by_name,
+        "okk_note": it.okk_note, "ai_review": it.ai_review or None, "lesson_id": it.lesson_id, "resolved_by_name": it.resolved_by_name,
         "created_at": it.created_at.isoformat() if it.created_at else None,
         "resolved_at": it.resolved_at.isoformat() if it.resolved_at else None,
     }
@@ -2517,6 +2517,149 @@ def learning_lesson_update(lesson_id: int, payload: schemas.LessonUpdateIn, db: 
         _log_lesson(db, les, action, manager.name)
     db.commit()
     return _lesson_out(db, les)
+
+
+
+# ------------------------------------------------------ «Разбор комментариев» ---
+# 2026-10-05, Александр: before a translator's «Не актуально» becomes a lesson,
+# the language's own model (the one that checks this language) gives a second
+# opinion: is the translator right or is the finding valid after all, how sure
+# it is, a plain-Russian explanation for the head of QA (who may not know the
+# language), a draft lesson worded for the platform, and — when the finding
+# stands — a short reply for the translator. Advice only: the admin still
+# decides and edits; nothing is learned without «Запомнить».
+
+REVIEW_VERDICTS = ("translator_right", "partly", "translator_wrong", "unclear")
+REVIEW_SCOPES = ("project", "client", "all")
+
+_REVIEW_PROMPT = """Ты — опытный редактор-носитель и руководитель контроля качества переводов. Ты отлично знаешь целевой язык, его живую разговорную и рекламную норму.
+
+{lang_line}
+
+Платформа автоматической проверки перевода сделала замечание к строке. {who} отклонил это замечание («Не актуально»). Твоя задача — НЕЗАВИСИМО разобраться, кто прав, и подготовить «урок» для платформы, чтобы она больше не делала ошибочных замечаний такого рода.
+
+Важно:
+- Суди по самому тексту, а не по уверенности сторон. Переводчик может ошибаться (защищать свою ошибку), а платформа часто бывает слишком строгой: живой, рекламный, «не учебниковый» язык, кальки и заимствования, принятые у носителей и в тематике проекта, — НЕ ошибка.
+- Учитывай тематику проекта, стайлгайд заказчика и уже действующие уроки.
+- Если комментария нет — оцени замечание сам.
+
+{project_block}
+Строка:
+- Контекст: {context}
+- Исходный текст: {source}
+- Перевод: {translation}
+- Тип замечания: {finding_type}
+- Замечание платформы: {finding}
+- {who_comment}: {comment}
+
+{lessons_block}
+Ответь ТОЛЬКО JSON-объектом без пояснений вокруг:
+{{
+  "verdict": "translator_right" | "partly" | "translator_wrong" | "unclear",
+  "confidence": число 0–100 (насколько ты уверен в вердикте),
+  "reasoning": "2–5 предложений по-русски простым языком для руководителя ОКК, который может не знать этот язык: в чём суть, кто прав и почему. Ключевые слова на целевом языке приводи с переводом на русский в скобках.",
+  "lesson": "Урок для платформы (1–3 предложения по-русски), ТОЛЬКО если платформа ошиблась полностью или частично; иначе пустая строка. Урок — обобщённое правило, а не пересказ одной строки: какое слово/конструкция/явление целевого языка (приведи его), почему это НЕ ошибка и в каких случаях это всё-таки ошибка (граница правила). Начни с названия языка по-русски и двоеточия (например, «Узбекский: »). Если такой урок уже есть среди действующих — пустая строка, а в reasoning укажи номер похожего урока.",
+  "suggested_scope": "project" (правило касается только терминологии/требований этого проекта) | "client" (требования этого заказчика) | "all" (общее правило языка),
+  "translator_reply": "Если замечание верно полностью или частично — короткий вежливый ответ переводчику по-русски (1–3 предложения): почему замечание в силе и как исправить. Иначе пустая строка."
+}}"""
+
+
+def _review_prompt(db: Session, it: models.LearningItem) -> str:
+    from app import claude_client as cc
+    project = db.get(models.Project, it.project_id) if it.project_id else None
+    client = db.get(models.Client, it.client_id) if it.client_id else None
+    proj_parts = []
+    if project is not None:
+        proj_parts.append(f"Проект: {project.name}" + (f" (заказчик: {client.name})" if client else ""))
+        if (project.description or "").strip():
+            proj_parts.append("Описание проекта:\n" + project.description.strip())
+    note = domain_note_for_names(it.project_name, client.name if client else None,
+                                 domain=getattr(client, "domain", None) if client else None)
+    if note:
+        proj_parts.append(note)
+    sg = _project_styleguide(project)
+    if sg:
+        sg_text = sg_mod.prompt_text(sg_mod.rules_for_code(sg, it.lang_code))
+        if sg_text.strip():
+            proj_parts.append("Стайлгайд заказчика для этого языка:\n" + sg_text.strip())
+    project_block = ("\n\n".join(proj_parts) + "\n") if proj_parts else ""
+
+    lessons = (
+        db.query(models.Lesson).filter(models.Lesson.status == "active")
+        .filter((models.Lesson.lang_key == "") | (models.Lesson.lang_key == it.lang_key))
+        .order_by(models.Lesson.id.desc()).limit(30).all()
+    )
+    lessons_block = ""
+    if lessons:
+        lessons_block = "Уже действующие уроки платформы для этого языка:\n" + "\n".join(
+            f"- №{les.id}: {les.text.strip()[:400]}" for les in lessons
+        ) + "\n"
+
+    if it.origin == "okk":
+        who, who_comment, comment = "Руководитель ОКК", "Причина руководителя ОКК", it.okk_note
+    else:
+        who, who_comment, comment = "Переводчик", "Комментарий переводчика", it.translator_comment
+    return _REVIEW_PROMPT.format(
+        lang_line=cc._target_lang_line(it.lang_code or it.lang_key).strip(), who=who, who_comment=who_comment,
+        comment=(comment or "").strip() or "(комментария нет)",
+        project_block=project_block, context=(it.context or "—")[:1500],
+        source=(it.source or "")[:4000], translation=(it.translation or "")[:4000],
+        finding_type=it.finding_type or "—", finding=it.finding_message or "",
+        lessons_block=lessons_block,
+    )
+
+
+def _parse_review(text_block: str | None) -> dict:
+    import json as _json
+    import re as _re
+    raw = (text_block or "").strip()
+    m = _re.search(r"\{.*\}", raw, _re.S)
+    if not m:
+        raise ValueError("no JSON object in the answer")
+    data = _json.loads(m.group(0))
+    verdict = str(data.get("verdict") or "unclear").strip()
+    if verdict not in REVIEW_VERDICTS:
+        verdict = "unclear"
+    try:
+        conf = max(0, min(100, int(round(float(data.get("confidence") or 0)))))
+    except (TypeError, ValueError):
+        conf = 0
+    scope = str(data.get("suggested_scope") or "all").strip()
+    if scope not in REVIEW_SCOPES:
+        scope = "all"
+    return {
+        "verdict": verdict, "confidence": conf,
+        "reasoning": str(data.get("reasoning") or "").strip()[:3000],
+        "lesson": str(data.get("lesson") or "").strip()[:2000],
+        "suggested_scope": scope,
+        "translator_reply": str(data.get("translator_reply") or "").strip()[:2000],
+    }
+
+
+@app.post("/learning/items/{item_id}/review")
+async def learning_item_review(item_id: int, payload: schemas.LearningReviewIn, db: Session = Depends(get_db)):
+    from app import claude_client as cc
+    _require_admin(payload.manager_id, db)
+    it = db.get(models.LearningItem, item_id)
+    if it is None:
+        raise HTTPException(404, "Не найдено.")
+    if it.ai_review and not payload.force:
+        return {"item": _item_out(db, it)}
+    route = route_for_lang(it.lang_code or it.lang_key)
+    prompt = _review_prompt(db, it)
+    try:
+        text_block, cost, _stop = await cc._call_route(route, prompt)
+        review = _parse_review(text_block)
+    except Exception as exc:  # noqa: BLE001 — shown to the admin, nothing saved
+        logger.exception("learning review failed for item %s", item_id)
+        raise HTTPException(502, f"Модель {route.label} не смогла разобрать замечание ({type(exc).__name__}). Попробуйте ещё раз.")
+    review.update({
+        "model": route.label, "cost_usd": round(float(cost or 0), 4),
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+    it.ai_review = review
+    db.commit()
+    return {"item": _item_out(db, it)}
 
 
 # ------------------------------------------------------------ «Сохранённое» ---

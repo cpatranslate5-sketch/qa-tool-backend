@@ -360,6 +360,13 @@ def _run_migrations():
             if "tone_uploaded_at" in cols:
                 conn.execute(text("ALTER TABLE projects DROP COLUMN tone_uploaded_at"))
 
+    # 2026-10-05: «Разбор комментариев» — the AI's opinion on a learning item.
+    if "learning_items" in existing_tables:
+        cols = {c["name"] for c in insp.get_columns("learning_items")}
+        if "ai_review" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE learning_items ADD COLUMN ai_review JSON"))
+
 
 def _ensure_admin_exists():
     from app import models

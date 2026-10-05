@@ -164,6 +164,9 @@ class LearningItem(Base):
     translation: Mapped[str] = mapped_column(Text, default="")
     translator_comment: Mapped[str] = mapped_column(Text, default="")
     okk_note: Mapped[str] = mapped_column(Text, default="")
+    # «Разбор комментариев» (2026-10-05): the language's own model's opinion —
+    # who is right, why, a draft lesson. Advice only; nothing is learned from it.
+    ai_review: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     lesson_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     resolved_by_name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
