@@ -1977,17 +1977,11 @@ def _own_multi_check(project_id: int, multi_check_id: int, manager_id: int, db: 
     return record
 
 
-@app.post("/projects/{project_id}/multi-check/{multi_check_id}/finding")
-def edit_report_finding(project_id: int, multi_check_id: int, payload: schemas.FindingEditIn, db: Session = Depends(get_db)):
-    """Changes the platform's comment of one finding, or removes the finding
-    from the report — only with the folder's password (2026-10-05,
-    Александр). Removal is a mark, not a real delete, so the numbers and
-    keys of the other findings stay as they are."""
-    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
-    manager = _get_manager(payload.manager_id, db)
-    if not verify_code((payload.code or "").strip(), manager.code_hash):
-        raise HTTPException(401, "Неверный пароль папки.")
-    parts = (payload.key or "").split("|")
+def _edit_finding(record: models.MultiCheck, key: str, action: str, message: str | None, by_name: str) -> dict:
+    """✏️ / 🗑 of one finding (2026-10-05): a new platform comment, or the
+    finding marked removed — a mark, not a real delete, so the numbers and
+    keys of the other findings stay as they are. Caller commits."""
+    parts = (key or "").split("|")
     if len(parts) != 4:
         raise HTTPException(400, "Неизвестное замечание.")
     try:
@@ -2003,29 +1997,43 @@ def edit_report_finding(project_id: int, multi_check_id: int, payload: schemas.F
     if not (0 <= fi < len(findings)) or findings[fi].get("type") in ("register_summary", "system"):
         raise HTTPException(404, "Замечание не найдено.")
     f = findings[fi]
-    if payload.action == "edit":
-        text_ = (payload.message or "").strip()
+    if action == "edit":
+        text_ = (message or "").strip()
         if not text_:
             raise HTTPException(400, "Комментарий не может быть пустым.")
         if len(text_) > 3000:
             raise HTTPException(400, "Комментарий слишком длинный.")
         f.setdefault("original_message", f.get("message", ""))
         f["message"] = text_
-        f["edited_by"] = manager.name
-    elif payload.action == "delete":
+        f["edited_by"] = by_name
+    elif action == "delete":
         f["deleted"] = True
-        f["deleted_by"] = manager.name
+        f["deleted_by"] = by_name
         summary = dict(record.summary or {})
         if isinstance(summary.get("total_findings"), int) and summary["total_findings"] > 0:
             summary["total_findings"] -= 1
             record.summary = summary
             results["summary"] = summary
         review = dict(record.review or {})
-        review.pop(payload.key, None)
+        review.pop(key, None)
         record.review = review
     else:
         raise HTTPException(400, "Неизвестное действие.")
     record.results = results
+    return f
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/finding")
+def edit_report_finding(project_id: int, multi_check_id: int, payload: schemas.FindingEditIn, db: Session = Depends(get_db)):
+    """Changes the platform's comment of one finding, or removes the finding
+    from the report — only with the folder's password (2026-10-05,
+    Александр). Removal is a mark, not a real delete, so the numbers and
+    keys of the other findings stay as they are."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    manager = _get_manager(payload.manager_id, db)
+    if not verify_code((payload.code or "").strip(), manager.code_hash):
+        raise HTTPException(401, "Неверный пароль папки.")
+    f = _edit_finding(record, payload.key, payload.action, payload.message, manager.name)
     db.commit()
     return {"ok": True, "key": payload.key, "action": payload.action, "message": f.get("message", "")}
 
@@ -2220,6 +2228,32 @@ def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Dep
     mc.review = review  # reassign so SQLAlchemy notices the JSON change
     db.commit()
     return {"ok": True}
+
+
+@app.post("/share/{token}/finding", include_in_schema=False)
+def shared_report_edit_finding(token: str, payload: schemas.ShareFindingEditIn, db: Session = Depends(get_db)):
+    """✏️ / 🗑 on the translator's page (2026-10-05, Александр): change the
+    comment of a finding or remove it — with the password of the folder the
+    check belongs to (or of an admin folder)."""
+    link = _active_share_link(token, db)
+    mc = link.multi_check
+    key = (payload.key or "").strip()
+    klang = _key_lang(link, key)
+    if not any(k == key and row is not None for _, k, row, _f in numbered_findings(klang, mc.results or {})):
+        raise HTTPException(404, "Замечание не найдено.")
+    code = (payload.code or "").strip()
+    owner = db.get(models.Manager, mc.manager_id) if mc.manager_id else None
+    who = None
+    if owner is not None and verify_code(code, owner.code_hash):
+        who = owner
+    else:
+        who = next((m for m in db.query(models.Manager).filter(models.Manager.is_admin.is_(True)).all()
+                    if verify_code(code, m.code_hash)), None)
+    if who is None:
+        raise HTTPException(401, "Неверный пароль папки.")
+    f = _edit_finding(mc, key, payload.action, payload.message, who.name)
+    db.commit()
+    return {"ok": True, "key": key, "action": payload.action, "message": f.get("message", "")}
 
 
 @app.post("/share/{token}/save-case", include_in_schema=False)

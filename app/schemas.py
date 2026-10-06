@@ -424,3 +424,10 @@ class FindingAddIn(BaseModel):
     severity: str = "medium"
     source: str | None = None
     translation: str | None = None
+
+
+class ShareFindingEditIn(BaseModel):
+    code: str
+    key: str
+    action: str  # "edit" | "delete"
+    message: str | None = None
