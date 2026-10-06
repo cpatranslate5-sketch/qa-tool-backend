@@ -597,6 +597,28 @@ def _term_regex(term: str, lang: str) -> re.Pattern:
     return re.compile(rf"(?<!\w){esc}(?!\w)")
 
 
+
+# 2026-10-06 (Александр): a dash/hyphen/bullet that OPENS a line and is
+# followed by a space is a list marker («Разыгрываются:\n- iPhone\n- PS5»),
+# not punctuation — no dash/hyphen/spacing rule applies to it. Same for the
+# «---» runs of a Markdown table's separator row.
+_LIST_MARKERS = "-–—•*·▪●◦"
+
+
+def is_list_marker(text: str, pos: int) -> bool:
+    if pos < 0 or pos >= len(text) or text[pos] not in _LIST_MARKERS:
+        return False
+    nxt = text[pos + 1] if pos + 1 < len(text) else ""
+    if text[pos] == "-" and (nxt == "-" or (pos > 0 and text[pos - 1] == "-")):
+        return True  # «---» (Markdown table separator)
+    if nxt and not nxt.isspace():
+        return False
+    i = pos - 1
+    while i >= 0 and text[i] in " \t\u00a0":
+        i -= 1
+    return i < 0 or text[i] in "\n\r"
+
+
 def check_row(source: str, translation: str, rules: dict | None, lang: str) -> list[dict]:
     """Algorithmic styleguide checks of one translation."""
     if not rules or not (translation or "").strip():
@@ -623,6 +645,8 @@ def check_row(source: str, translation: str, rules: dict | None, lang: str) -> l
     # Em dash
     mode = a.get("em_dash") or "any"
     for m in re.finditer("—", t):
+        if is_list_marker(t, m.start()):
+            continue
         before = t[m.start() - 1] if m.start() > 0 else ""
         after = t[m.end()] if m.end() < len(t) else ""
         if mode == "forbidden":
@@ -634,12 +658,15 @@ def check_row(source: str, translation: str, rules: dict | None, lang: str) -> l
         if mode == "unspaced" and ((before and before.isspace()) or (after and after.isspace())):
             add(f"Длинное тире с пробелами: «{_snip(t, m.start(), m.end())}» — по стайлгайду без пробелов.")
 
-    if a.get("en_dash_forbidden") and "–" in t:
-        i = t.index("–")
-        add(f"Короткое тире «–» запрещено стайлгайдом: «{_snip(t, i, i + 1)}».")
+    if a.get("en_dash_forbidden"):
+        i = next((m.start() for m in re.finditer("–", t) if not is_list_marker(t, m.start())), -1)
+        if i >= 0:
+            add(f"Короткое тире «–» запрещено стайлгайдом: «{_snip(t, i, i + 1)}».")
 
     if a.get("hyphen_forbidden"):
         for m in re.finditer(r"-", t):
+            if is_list_marker(t, m.start()):
+                continue
             b = t[m.start() - 1] if m.start() > 0 else ""
             c = t[m.end()] if m.end() < len(t) else ""
             if b.isdigit() and c.isdigit():

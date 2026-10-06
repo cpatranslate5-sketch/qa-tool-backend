@@ -471,6 +471,13 @@ _CONTEXT_COLUMNS_NOTE = (
     "оставлены как в исходнике, это НЕ ошибка и не неполный перевод."
 )
 
+# 2026-10-06 (Александр): bulleted lists inside a cell.
+_LIST_MARKERS_NOTE = (
+    "СПИСКИ: дефис, тире или точка-маркер («-», «–», «—», «•», «*») в начале строки, за которым идёт пробел, — это "
+    "маркер пункта списка, а не знак препинания. Не делай к нему замечаний (дефис вместо тире, пробелы вокруг, "
+    "длина тире и т. п.). Строки таблиц вида «|---|---|» — тоже разметка, не ошибка."
+)
+
 
 def _with_domain_note(
     extra_instructions: str, *names: str | None, project_description: str | None = None,
@@ -492,6 +499,7 @@ def _with_domain_note(
     if note:
         parts.append(note)
     parts.append(_CONTEXT_COLUMNS_NOTE)
+    parts.append(_LIST_MARKERS_NOTE)
     extra = (extra_instructions or "").strip()
     if extra:
         parts.append(extra)

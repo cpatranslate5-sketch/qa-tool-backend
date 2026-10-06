@@ -1027,7 +1027,11 @@ _COLON_RE = re.compile(r"[:：]")
 
 
 def check_hyphen_for_dash(translation: str) -> list[dict]:
-    hyphen_positions = [m.start() for m in re.finditer(r"(?<=\s)-(?=\s)", translation)]
+    from app.styleguide import is_list_marker  # 2026-10-06: bullets at a line start
+    hyphen_positions = [
+        m.start() for m in re.finditer(r"(?<=\s)-(?=\s)", translation)
+        if not is_list_marker(translation, m.start())
+    ]
     if not hyphen_positions:
         return []
 
