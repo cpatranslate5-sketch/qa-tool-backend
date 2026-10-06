@@ -9,4 +9,3 @@ openpyxl
 python-multipart
 python-docx
 python-pptx
-num2words

@@ -1254,7 +1254,6 @@ async def _check_language_for_sheet(
         for f in findings:
             f.setdefault("confidence", 100)
         findings += ai_findings_by_idx.get(idx, [])
-        findings = merge_repeated_in_row(findings)
         if findings:
             out.append({
                 "excel_row": row["excel_row"],
@@ -1323,48 +1322,6 @@ async def _check_language_for_sheet(
         if block is not None:
             out.append(block)
     return out, cost_usd
-
-
-_QUOTED_RE = re.compile(r"«[^«»]*»|“[^“”]*”")
-_MERGEABLE_TYPES = {"style_rule", "styleguide", "punctuation"}
-
-
-def merge_repeated_in_row(findings: list[dict]) -> list[dict]:
-    """One finding per repeated mechanical problem in one row (2026-10-05,
-    Александр: «выдаётся каждая запятая»): findings of the same type whose
-    messages differ only in the quoted place are merged into the first one,
-    with the other places listed."""
-    groups: dict[tuple, list[int]] = {}
-    for i, f in enumerate(findings):
-        # Only mechanical problems (punctuation, typography, styleguide) —
-        # different typos or grammar slips stay separate findings.
-        if f.get("type") not in _MERGEABLE_TYPES:
-            continue
-        msg = str(f.get("message") or "")
-        if not _QUOTED_RE.search(msg):
-            continue
-        key = (f.get("type"), _QUOTED_RE.sub("«»", msg).strip().lower())
-        groups.setdefault(key, []).append(i)
-    drop: set[int] = set()
-    sev_rank = {"low": 0, "medium": 1, "high": 2}
-    for idxs in groups.values():
-        if len(idxs) < 2:
-            continue
-        first = dict(findings[idxs[0]])
-        places = []
-        for i in idxs[1:]:
-            m = _QUOTED_RE.search(str(findings[i].get("message") or ""))
-            if m and m.group(0) not in places:
-                places.append(m.group(0))
-            if sev_rank.get(findings[i].get("severity"), 0) > sev_rank.get(first.get("severity"), 0):
-                first["severity"] = findings[i].get("severity")
-            if (findings[i].get("confidence") or 0) > (first.get("confidence") or 0):
-                first["confidence"] = findings[i].get("confidence")
-        shown = ", ".join(places[:10]) + (" и др." if len(places) > 10 else "")
-        first["message"] = f"{str(first.get('message') or '').rstrip()} То же ещё в {len(places)} мест(ах): {shown}."
-        findings[idxs[0]] = first
-        drop.update(idxs[1:])
-    return [f for i, f in enumerate(findings) if i not in drop]
 
 
 async def run_multi_check(
@@ -1865,9 +1822,7 @@ async def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[s
 
             findings_list = []
             for idx, row in enumerate(lang_skel["rows"]):
-                findings = merge_repeated_in_row(
-                    list(row["findings"]) + ai_grouped.get(idx, []) + term_grouped.get(idx, [])
-                )
+                findings = list(row["findings"]) + ai_grouped.get(idx, []) + term_grouped.get(idx, [])
                 if findings:
                     findings_list.append({
                         "excel_row": row["excel_row"],
@@ -2144,8 +2099,6 @@ def build_report_workbook(
         for lang, findings_list in sheet.get("languages", {}).items():
             for item in findings_list:
                 for f in item["findings"]:
-                    if f.get("deleted"):
-                        continue  # removed from the report by the manager
                     ws.append([
                         sheet["sheet_name"],
                         item["excel_row"],

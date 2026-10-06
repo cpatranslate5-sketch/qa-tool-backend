@@ -66,15 +66,6 @@ _CSS = """
   mark.loc { background: #fde68a; color: inherit; padding: 0 2px; border-radius: 3px; }
   .loc-line { font-size: 0.85rem; color: #555; white-space: pre-wrap; margin-top: 6px; }
   .field.txt { white-space: pre-wrap; }
-  .mgr-btn { border: 1px solid #e3e5ee; background: #fff; border-radius: 6px; cursor: pointer; padding: 2px 6px; font-size: 0.8rem; opacity: 0.6; margin-left: 4px; }
-  .mgr-btn:hover { opacity: 1; }
-  .mgr-box { margin: 8px 0; padding: 8px; border: 1px dashed #b4b9d6; border-radius: 8px; background: #fafbff; }
-  .mgr-box textarea { width: 100%; min-height: 60px; font: inherit; }
-  .mgr-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
-  .mgr-row input { padding: 4px 6px; border: 1px solid #ccd; border-radius: 6px; }
-  .mgr-b { padding: 5px 12px; border-radius: 6px; border: 1px solid #ccd; background: #fff; cursor: pointer; font: inherit; font-size: 0.9rem; }
-  .mgr-ok { background: #4f46e5; color: #fff; border-color: #4f46e5; }
-  .mgr-row .msg { color: #b42318; font-size: 0.85rem; }
   details.full-text { margin: 4px 0 6px; font-size: 0.85rem; }
   details.full-text summary { cursor: pointer; color: #4f46e5; }
   details.full-text .field { margin-top: 6px; }
@@ -371,9 +362,7 @@ def render_not_found() -> str:
 
 def _is_reviewable(excel_row, f: dict) -> bool:
     # Must match the frontend's isReviewable (reportHtml.ts).
-    # A finding the manager removed from the report (2026-10-05) is gone
-    # everywhere — numbering, the translator page, counts.
-    return excel_row != 0 and f.get("type") not in ("register_summary", "system") and not f.get("deleted")
+    return excel_row != 0 and f.get("type") not in ("register_summary", "system")
 
 
 def tone_key(lang: str) -> str:
@@ -458,68 +447,6 @@ _SCRIPT = """
     }).catch(function () { if (st) st.textContent = "⚠ Не сохранилось — проверьте интернет"; });
   }
   function key(item) { return item.getAttribute("data-key"); }
-  // ✏️ / 🗑 for the manager (2026-10-05): change the comment or remove the
-  // finding — the folder password is checked by the server.
-  document.addEventListener("click", function (ev) {
-    var t = ev.target.closest && ev.target.closest(".mgr-btn");
-    if (!t) return;
-    var item = t.closest(".item");
-    var old = item.querySelector(".mgr-box");
-    if (old) { old.remove(); return; }
-    var isEdit = t.classList.contains("mgr-edit");
-    var comment = item.querySelector(".comment");
-    var box = document.createElement("div");
-    box.className = "mgr-box";
-    if (isEdit) {
-      var lbl = document.createElement("div"); lbl.className = "label"; lbl.textContent = "Новый комментарий:";
-      var ta = document.createElement("textarea"); ta.className = "mgr-text";
-      var lab = comment && comment.querySelector(".label");
-      ta.value = comment ? comment.textContent.replace(lab ? lab.textContent : "", "").trim() : "";
-      box.appendChild(lbl); box.appendChild(ta);
-    } else {
-      var w = document.createElement("div"); w.className = "red";
-      w.textContent = "Удалить это замечание? Оно пропадёт и из отчёта менеджера.";
-      box.appendChild(w);
-    }
-    var row = document.createElement("div"); row.className = "mgr-row";
-    var pw = document.createElement("input"); pw.type = "password"; pw.placeholder = "Пароль папки"; pw.autocomplete = "current-password";
-    var ok = document.createElement("button"); ok.type = "button"; ok.className = "mgr-b mgr-ok"; ok.textContent = isEdit ? "Сохранить" : "Удалить";
-    var no = document.createElement("button"); no.type = "button"; no.className = "mgr-b"; no.textContent = "Отмена";
-    var msg = document.createElement("span"); msg.className = "msg";
-    row.appendChild(pw); row.appendChild(ok); row.appendChild(no); row.appendChild(msg);
-    box.appendChild(row);
-    (comment || item.querySelector(".num")).insertAdjacentElement("afterend", box);
-    (isEdit ? box.querySelector("textarea") : pw).focus();
-    no.addEventListener("click", function () { box.remove(); });
-    ok.addEventListener("click", function () {
-      var text = isEdit ? box.querySelector("textarea").value.trim() : null;
-      if (!pw.value) { msg.textContent = "Введите пароль папки."; return; }
-      if (isEdit && !text) { msg.textContent = "Комментарий не может быть пустым."; return; }
-      ok.disabled = true; msg.textContent = "";
-      fetch(base + "/finding", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: pw.value, key: key(item), action: isEdit ? "edit" : "delete", message: text })
-      }).then(function (r) {
-        return r.json().catch(function () { return {}; }).then(function (b) {
-          if (!r.ok) throw new Error(b.detail || "Не удалось сохранить.");
-          return b;
-        });
-      }).then(function (b) {
-        if (isEdit) {
-          if (comment) {
-            var lab2 = comment.querySelector(".label");
-            comment.textContent = "";
-            if (lab2) { comment.appendChild(lab2); comment.appendChild(document.createTextNode(" ")); }
-            comment.appendChild(document.createTextNode(b.message));
-          }
-          box.remove();
-        } else {
-          item.remove();
-        }
-      }).catch(function (e) { ok.disabled = false; msg.textContent = e.message; });
-    });
-  });
   function okkBody(item, action) {
     var c = item.querySelector(".okk-comment");
     var l = item.querySelector(".okk-links");
@@ -771,23 +698,14 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             src, trn = str(row.get("source") or ""), str(row.get("translation") or "")
             loc = locate(f, src, trn)
             short = excerpt_html(f, src, trn)
-            full_pair = (
-                f'<div class="field txt"><span class="label">Источник:</span> '
-                f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
-                f'<div class="field txt"><span class="label">Перевод:</span> '
-                f'{_t_marked(trn, loc[1:] if loc and loc[0] == "translation" else None)}</div>'
-            )
-            if not short and (_is_long(src) or _is_long(trn)) and not loc:
-                # Long text, place not found: fold it instead of a wall of text.
-                short = f'<details class="full-text"><summary>Показать текст строки</summary>{full_pair}</details>'
-            body_html = "" if not (src.strip() or trn.strip()) else short or (
+            body_html = short or (
                 f'<div class="field txt"><span class="label">Источник:</span> '
                 f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
                 f'<div class="field txt"><span class="label">Перевод:</span> '
                 f'{_t_marked(trn, loc[1:] if loc and loc[0] == "translation" else None)}</div>'
             )
             platform_html = (
-                f'<div class="comment"><span class="label">{"Комментарий менеджера" if f.get("type") == "manual" else "Комментарий платформы"}:</span> {_t(_strip_rows(f.get("message")))}</div>'
+                f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(_strip_rows(f.get("message")))}</div>'
                 + ("" if short else _loc_line(loc, src, trn))
             )
         links_html = _links_html(entry.get("links", ""))
@@ -843,9 +761,6 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             f'<div class="{" ".join(classes)}" data-key="{_e(key)}">'
             '<div class="corner">'
             + ('<button type="button" class="save-btn" title="Сохранить в свою папку («Сохранённое»)">💾</button>' if row is not None else "")
-            + ('<button type="button" class="mgr-btn mgr-edit" title="Для менеджера: изменить комментарий (нужен пароль папки)">✏️</button>'
-               '<button type="button" class="mgr-btn mgr-del" title="Для менеджера: удалить замечание (нужен пароль папки)">🗑</button>'
-               if row is not None else "")
             + f"{check_html}</div>"
             f'<div class="num">№{num}{conf_html}</div>'
             f"{body_html}{note_html}{platform_html}{tail}"
