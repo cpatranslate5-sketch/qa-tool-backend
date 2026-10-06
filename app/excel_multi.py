@@ -1113,7 +1113,52 @@ def _rows_and_items(sheet: dict, lang: str, source_lang: str) -> tuple[list[dict
             continue
         relevant_rows.append(row)
         ai_items.append({"context": row["context"], "source": src, "translation": tgt})
+    _add_split_phrase_context(ai_items)
     return relevant_rows, ai_items
+
+
+# 2026-10-06 (Александр): one sentence is often split over several rows
+# («Опубликуйте первый видеоролик в течение» / «3-х дней после подключения
+# канала» / «к офферу»). In SOV languages (ko, ja, tr, hi…) the translator
+# rightly moves parts of the meaning to another row, so each row checked on
+# its own looked like a distortion. Such rows now carry the whole phrase
+# (source and translation) in their context for the AI.
+_PHRASE_END_RE = re.compile(r"[.!?…:;。！？؟।」』”»\")\]]\s*$")
+_SPLIT_MAX_ROWS = 6
+_SPLIT_MAX_CHARS = 700
+
+
+def _continues(cur: str, nxt: str) -> bool:
+    cur, nxt = (cur or "").strip(), (nxt or "").strip()
+    if not cur or not nxt or _PHRASE_END_RE.search(cur):
+        return False
+    first = nxt[0]
+    return first.isdigit() or (first.isalpha() and first.islower())
+
+
+def _add_split_phrase_context(items: list[dict]) -> None:
+    i, n = 0, len(items)
+    while i < n:
+        j = i
+        while (j + 1 < n and j - i + 1 < _SPLIT_MAX_ROWS
+               and _continues(items[j]["source"], items[j + 1]["source"])):
+            j += 1
+        if j > i:
+            group = items[i:j + 1]
+            whole_src = " ".join(it["source"].strip() for it in group)
+            whole_trn = " ".join((it["translation"] or "").strip() for it in group)
+            if len(whole_src) + len(whole_trn) <= _SPLIT_MAX_CHARS * 2:
+                for k, it in enumerate(group, start=1):
+                    note = (
+                        f"ВНИМАНИЕ: эта строка — часть {k} из {len(group)} одной фразы, разбитой на несколько строк. "
+                        f"Фраза целиком — исходник: «{whole_src}»; перевод: «{whole_trn}». Оценивай перевод этой строки "
+                        "в составе всей фразы: из-за другого порядка слов часть смысла могла законно перейти в "
+                        "соседнюю строку (это не искажение и не пропуск). Сообщай только о проблемах, которые видны "
+                        "при чтении фразы целиком."
+                    )
+                    ctx = (it.get("context") or "").strip()
+                    it["context"] = f"{ctx}\n{note}" if ctx else note
+        i = j + 1
 
 
 def _shared_cache_prefixes(
