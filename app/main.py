@@ -471,6 +471,13 @@ _CONTEXT_COLUMNS_NOTE = (
     "оставлены как в исходнике, это НЕ ошибка и не неполный перевод."
 )
 
+# 2026-10-06 (Александр): «круглосуточно» ↔ «24/7» ↔ «24 часа».
+_ROUND_CLOCK_NOTE = (
+    "КРУГЛОСУТОЧНО: «24/7», «7/24», «24x7», «24/7/365», «24 часа» (в значении «круглосуточно»), «non-stop», "
+    "«круглосуточно» и их аналоги в любом языке (например, «24시간 연중무휴», «7/24», «24 saat») взаимозаменяемы — "
+    "это не ошибка и не пропуск чисел."
+)
+
 # 2026-10-06 (Александр): bulleted lists inside a cell.
 _LIST_MARKERS_NOTE = (
     "СПИСКИ: дефис, тире или точка-маркер («-», «–», «—», «•», «*») в начале строки, за которым идёт пробел, — это "
@@ -500,6 +507,7 @@ def _with_domain_note(
         parts.append(note)
     parts.append(_CONTEXT_COLUMNS_NOTE)
     parts.append(_LIST_MARKERS_NOTE)
+    parts.append(_ROUND_CLOCK_NOTE)
     extra = (extra_instructions or "").strip()
     if extra:
         parts.append(extra)

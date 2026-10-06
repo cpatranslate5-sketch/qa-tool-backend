@@ -325,9 +325,28 @@ def _extract_placeholders(text: str) -> list[str]:
     return PLACEHOLDER_RE.findall(text)
 
 
+# «Круглосуточно» (2026-10-06, Александр): «24/7», «7/24», «24x7», «24/7/365»
+# and «24 часа / 24 hours / 24시간 / 24 saat…» all mean «round the clock», and
+# a translator may swap one for another or for a word («круглосуточно»,
+# «non-stop»). They are left out of the number comparison on both sides;
+# any OTHER number (e.g. «48 часов» instead of «24 часа») is still compared.
+_HOUR_WORDS = (
+    r"h\b|hrs?\b|hours?|ч\b|ч\.|час|saat|soat|сағат|саат|соат|соат|ساع|ساعت|گھنٹ|घंट|घण्ट|ঘণ্ট|ঘন্ট|तास|గంట|"
+    r"ชั่วโมง|시간|時間|小时|小時|giờ|jam\b|hora|heure|stunde|std\b|ore\b|godzin|ώρ|годин|oras\b|saa\b|órá|uur|timmar|tunti"
+)
+_ROUND_CLOCK_RE = re.compile(
+    r"(?<![\d.,])(?:24\s*[/x×х]\s*7(?:\s*[/x×х]\s*365)?|7\s*/\s*24|24\s*-?\s*(?:" + _HOUR_WORDS + r"))",
+    re.IGNORECASE,
+)
+
+
+def _without_round_clock(text: str) -> str:
+    return _ROUND_CLOCK_RE.sub(" ", text or "")
+
+
 def check_numbers(source: str, translation: str) -> list[dict]:
-    src_flat = _flatten_number_matches(source)
-    tr_flat = _flatten_number_matches(translation)
+    src_flat = _flatten_number_matches(_without_round_clock(source))
+    tr_flat = _flatten_number_matches(_without_round_clock(translation))
     findings = []
     if sorted(src_flat) != sorted(tr_flat):
         # Point at the SPECIFIC number(s) that actually differ, not a dump
