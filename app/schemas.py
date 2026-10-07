@@ -371,8 +371,10 @@ class StyleguideRevertIn(BaseModel):
 class LearnIn(BaseModel):
     manager_id: int
     text: str
-    scope: str = "project"  # "project" | "client" | "all"
-    lang_scope: str = "lang"  # "lang" | "all"
+    scope: str = "project"  # "project" | "projects" | "client" | "all"
+    lang_scope: str = "lang"  # "lang" | "langs" | "all"
+    project_ids: list[int] | None = None  # for scope "projects"
+    lang_keys: list[str] | None = None  # for lang_scope "langs"
 
 
 class LearningStatusIn(BaseModel):
@@ -387,6 +389,8 @@ class LessonUpdateIn(BaseModel):
     lang_scope: str | None = None
     lang_key: str | None = None
     status: str | None = None  # "active" | "disabled" | "deleted"
+    project_ids: list[int] | None = None  # for scope "projects"
+    lang_keys: list[str] | None = None  # for lang_scope "langs"
 
 
 class AdminMoveCheckIn(BaseModel):
@@ -406,28 +410,7 @@ class ClientCrowdinIn(BaseModel):
     uses_crowdin: bool
 
 
-class FindingEditIn(BaseModel):
+class LearningReviewIn(BaseModel):
     manager_id: int
-    code: str
-    key: str
-    action: str  # "edit" | "delete"
-    message: str | None = None
-
-
-class FindingAddIn(BaseModel):
-    manager_id: int
-    code: str
-    sheet_idx: int = 0
-    lang: str
-    excel_row: int | None = None  # None = a separate block of the language
-    message: str
-    severity: str = "medium"
-    source: str | None = None
-    translation: str | None = None
-
-
-class ShareFindingEditIn(BaseModel):
-    code: str
-    key: str
-    action: str  # "edit" | "delete"
-    message: str | None = None
+    force: bool = False  # «Разобрать заново»
+    admin_note: str | None = None  # «Моё пояснение» — saved, then a fresh review
