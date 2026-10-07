@@ -1113,7 +1113,52 @@ def _rows_and_items(sheet: dict, lang: str, source_lang: str) -> tuple[list[dict
             continue
         relevant_rows.append(row)
         ai_items.append({"context": row["context"], "source": src, "translation": tgt})
+    _add_split_phrase_context(ai_items)
     return relevant_rows, ai_items
+
+
+# 2026-10-06 (Александр): one sentence is often split over several rows
+# («Опубликуйте первый видеоролик в течение» / «3-х дней после подключения
+# канала» / «к офферу»). In SOV languages (ko, ja, tr, hi…) the translator
+# rightly moves parts of the meaning to another row, so each row checked on
+# its own looked like a distortion. Such rows now carry the whole phrase
+# (source and translation) in their context for the AI.
+_PHRASE_END_RE = re.compile(r"[.!?…:;。！？؟।」』”»\")\]]\s*$")
+_SPLIT_MAX_ROWS = 6
+_SPLIT_MAX_CHARS = 700
+
+
+def _continues(cur: str, nxt: str) -> bool:
+    cur, nxt = (cur or "").strip(), (nxt or "").strip()
+    if not cur or not nxt or _PHRASE_END_RE.search(cur):
+        return False
+    first = nxt[0]
+    return first.isdigit() or (first.isalpha() and first.islower())
+
+
+def _add_split_phrase_context(items: list[dict]) -> None:
+    i, n = 0, len(items)
+    while i < n:
+        j = i
+        while (j + 1 < n and j - i + 1 < _SPLIT_MAX_ROWS
+               and _continues(items[j]["source"], items[j + 1]["source"])):
+            j += 1
+        if j > i:
+            group = items[i:j + 1]
+            whole_src = " ".join(it["source"].strip() for it in group)
+            whole_trn = " ".join((it["translation"] or "").strip() for it in group)
+            if len(whole_src) + len(whole_trn) <= _SPLIT_MAX_CHARS * 2:
+                for k, it in enumerate(group, start=1):
+                    note = (
+                        f"ВНИМАНИЕ: эта строка — часть {k} из {len(group)} одной фразы, разбитой на несколько строк. "
+                        f"Фраза целиком — исходник: «{whole_src}»; перевод: «{whole_trn}». Оценивай перевод этой строки "
+                        "в составе всей фразы: из-за другого порядка слов часть смысла могла законно перейти в "
+                        "соседнюю строку (это не искажение и не пропуск). Сообщай только о проблемах, которые видны "
+                        "при чтении фразы целиком."
+                    )
+                    ctx = (it.get("context") or "").strip()
+                    it["context"] = f"{ctx}\n{note}" if ctx else note
+        i = j + 1
 
 
 def _shared_cache_prefixes(
@@ -1245,7 +1290,8 @@ async def _check_language_for_sheet(
     for idx, row in enumerate(relevant_rows):
         src = row["values"].get(source_lang, "")
         tgt = row["values"].get(lang, "")
-        findings = run_rule_checks(src, tgt, checks, max_length=row["max_length"], lang_code=lang)
+        findings = run_rule_checks(src, tgt, checks, max_length=row["max_length"], lang_code=lang,
+                                   tolerate_latin_i=sg_mod.tolerates_latin_i(rules))
         if rules:
             findings += sg_mod.check_row(src, tgt, rules, sg_key)
             findings += doc_style.get(row["excel_row"], [])
@@ -1254,7 +1300,6 @@ async def _check_language_for_sheet(
         for f in findings:
             f.setdefault("confidence", 100)
         findings += ai_findings_by_idx.get(idx, [])
-        findings = merge_repeated_in_row(findings)
         if findings:
             out.append({
                 "excel_row": row["excel_row"],
@@ -1323,48 +1368,6 @@ async def _check_language_for_sheet(
         if block is not None:
             out.append(block)
     return out, cost_usd
-
-
-_QUOTED_RE = re.compile(r"«[^«»]*»|“[^“”]*”")
-_MERGEABLE_TYPES = {"style_rule", "styleguide", "punctuation"}
-
-
-def merge_repeated_in_row(findings: list[dict]) -> list[dict]:
-    """One finding per repeated mechanical problem in one row (2026-10-05,
-    Александр: «выдаётся каждая запятая»): findings of the same type whose
-    messages differ only in the quoted place are merged into the first one,
-    with the other places listed."""
-    groups: dict[tuple, list[int]] = {}
-    for i, f in enumerate(findings):
-        # Only mechanical problems (punctuation, typography, styleguide) —
-        # different typos or grammar slips stay separate findings.
-        if f.get("type") not in _MERGEABLE_TYPES:
-            continue
-        msg = str(f.get("message") or "")
-        if not _QUOTED_RE.search(msg):
-            continue
-        key = (f.get("type"), _QUOTED_RE.sub("«»", msg).strip().lower())
-        groups.setdefault(key, []).append(i)
-    drop: set[int] = set()
-    sev_rank = {"low": 0, "medium": 1, "high": 2}
-    for idxs in groups.values():
-        if len(idxs) < 2:
-            continue
-        first = dict(findings[idxs[0]])
-        places = []
-        for i in idxs[1:]:
-            m = _QUOTED_RE.search(str(findings[i].get("message") or ""))
-            if m and m.group(0) not in places:
-                places.append(m.group(0))
-            if sev_rank.get(findings[i].get("severity"), 0) > sev_rank.get(first.get("severity"), 0):
-                first["severity"] = findings[i].get("severity")
-            if (findings[i].get("confidence") or 0) > (first.get("confidence") or 0):
-                first["confidence"] = findings[i].get("confidence")
-        shown = ", ".join(places[:10]) + (" и др." if len(places) > 10 else "")
-        first["message"] = f"{str(first.get('message') or '').rstrip()} То же ещё в {len(places)} мест(ах): {shown}."
-        findings[idxs[0]] = first
-        drop.update(idxs[1:])
-    return [f for i, f in enumerate(findings) if i not in drop]
 
 
 async def run_multi_check(
@@ -1865,9 +1868,7 @@ async def finalize_batch_results(skeleton: dict, ai_results_by_custom_id: dict[s
 
             findings_list = []
             for idx, row in enumerate(lang_skel["rows"]):
-                findings = merge_repeated_in_row(
-                    list(row["findings"]) + ai_grouped.get(idx, []) + term_grouped.get(idx, [])
-                )
+                findings = list(row["findings"]) + ai_grouped.get(idx, []) + term_grouped.get(idx, [])
                 if findings:
                     findings_list.append({
                         "excel_row": row["excel_row"],
@@ -2144,8 +2145,6 @@ def build_report_workbook(
         for lang, findings_list in sheet.get("languages", {}).items():
             for item in findings_list:
                 for f in item["findings"]:
-                    if f.get("deleted"):
-                        continue  # removed from the report by the manager
                     ws.append([
                         sheet["sheet_name"],
                         item["excel_row"],

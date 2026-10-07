@@ -675,13 +675,14 @@ _LATIN_LETTER_RE = re.compile(r"[a-zA-Z]")
 _LETTER_RUN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ]+")
 
 
-# 2026-10-06 (Александр): in Kazakh a Latin «i» in place of the Kazakh
-# «і» (they look identical) is accepted — the old keyboard habit. Any OTHER
-# look-alike Latin letter inside a Kazakh word is still flagged.
-_KK_TOLERATED_LATIN = set("iI")
+# 2026-10-07 (Александр): a project may accept a Latin «i» in place of a
+# look-alike Cyrillic «і» (Kazakh, Ukrainian…) — only when that language's
+# styleguide says so (see styleguide.tolerates_latin_i). Any OTHER look-alike
+# Latin letter inside a Cyrillic word is still flagged.
+_TOLERATED_LATIN_I = set("iI")
 
 
-def check_mixed_script(translation: str, lang_code: str = "") -> list[dict]:
+def check_mixed_script(translation: str, tolerate_latin_i: bool = False) -> list[dict]:
     """Catches an invisible-to-the-eye typo: a word that LOOKS like it's
     written in one alphabet but actually mixes in a look-alike letter from
     the other (Cyrillic "с" typed where a Latin "c" belongs, or vice versa)
@@ -696,12 +697,10 @@ def check_mixed_script(translation: str, lang_code: str = "") -> list[dict]:
     below, the same way check_numbers is silently folded in whenever
     "Оформление" is ticked (see CHECK_OPTIONS/buildChecksToSend on the
     frontend)."""
-    kk = (lang_code or "").split("-")[0].lower() in ("kk", "kz")
-
     def _mixed(word: str) -> bool:
         if not (_CYRILLIC_LETTER_RE.search(word) and _LATIN_LETTER_RE.search(word)):
             return False
-        if kk and set(_LATIN_LETTER_RE.findall(word)) <= _KK_TOLERATED_LATIN:
+        if tolerate_latin_i and set(_LATIN_LETTER_RE.findall(word)) <= _TOLERATED_LATIN_I:
             return False
         return True
 
@@ -1139,7 +1138,8 @@ def _double_space_locations(translation: str) -> list[tuple[str, str]]:
 
 
 def check_punctuation(
-    source: str, translation: str, lang_code: str = "", checks: list[str] | None = None
+    source: str, translation: str, lang_code: str = "", checks: list[str] | None = None,
+    tolerate_latin_i: bool = False,
 ) -> list[dict]:
     findings = []
     lang_base = lang_code.split("-")[0].lower() if lang_code else ""
@@ -1199,7 +1199,7 @@ def check_punctuation(
         findings += check_em_dash_spacing(translation)
         findings += check_hyphen_for_dash(translation)
 
-    findings += check_mixed_script(translation, lang_code)
+    findings += check_mixed_script(translation, tolerate_latin_i)
 
     return findings
 
@@ -1265,6 +1265,7 @@ def run_rule_checks(
     checks: list[str],
     max_length: int | None = None,
     lang_code: str = "",
+    tolerate_latin_i: bool = False,
 ) -> list[dict]:
     findings = []
     if not translation.strip():
@@ -1277,7 +1278,7 @@ def run_rule_checks(
     if "max_length" in checks:
         findings += check_max_length(translation, max_length)
     if "punctuation" in checks:
-        findings += check_punctuation(source, translation, lang_code, checks)
+        findings += check_punctuation(source, translation, lang_code, checks, tolerate_latin_i=tolerate_latin_i)
     if "sms_charset" in checks:
         findings += check_sms_charset(translation)
     # Emoji checks are free and important — always on (2026-10-01).
