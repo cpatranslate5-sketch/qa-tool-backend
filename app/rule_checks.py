@@ -325,47 +325,39 @@ def _extract_placeholders(text: str) -> list[str]:
     return PLACEHOLDER_RE.findall(text)
 
 
-def _words_cover(missing: list[str], other_text: str, lang: str, protected: set[str] | None = None,
-                 months: bool = False) -> list[str]:
-    """Numbers still missing after accepting those written as words on the
-    other side (2026-10-06, Александр: «один = 1» is fine). A number from a
-    date written in digits (protected) is never accepted as a word."""
-    from app.number_words import has_number_word, month_in_words
-    left = []
-    for tok in missing:
-        if protected is not None and tok in protected:
-            left.append(tok)
-            continue
-        ok = False
-        if tok.isdigit():
-            n = int(tok)
-            ok = has_number_word(other_text, n, lang) or (months and 1 <= n <= 12 and month_in_words(other_text, n))
-        if not ok:
-            left.append(tok)
-    return left
+# «Круглосуточно» (2026-10-06, Александр): «24/7», «7/24», «24x7», «24/7/365»
+# and «24 часа / 24 hours / 24시간 / 24 saat…» all mean «round the clock», and
+# a translator may swap one for another or for a word («круглосуточно»,
+# «non-stop»). They are left out of the number comparison on both sides;
+# any OTHER number (e.g. «48 часов» instead of «24 часа») is still compared.
+_HOUR_WORDS = (
+    r"h\b|hrs?\b|hours?|ч\b|ч\.|час|saat|soat|сағат|саат|соат|соат|ساع|ساعت|گھنٹ|घंट|घण्ट|ঘণ্ট|ঘন্ট|तास|గంట|"
+    r"ชั่วโมง|시간|時間|小时|小時|giờ|jam\b|hora|heure|stunde|std\b|ore\b|godzin|ώρ|годин|oras\b|saa\b|órá|uur|timmar|tunti"
+)
+_ROUND_CLOCK_RE = re.compile(
+    r"(?<![\d.,])(?:24\s*[/x×х]\s*7(?:\s*[/x×х]\s*365)?|7\s*/\s*24|24\s*-?\s*(?:" + _HOUR_WORDS + r"))",
+    re.IGNORECASE,
+)
 
 
-def check_numbers(source: str, translation: str, tgt_lang: str = "", src_lang: str = "") -> list[dict]:
-    src_flat = _flatten_number_matches(source)
-    tr_flat = _flatten_number_matches(translation)
+def _without_round_clock(text: str) -> str:
+    return _ROUND_CLOCK_RE.sub(" ", text or "")
+
+
+def check_numbers(source: str, translation: str) -> list[dict]:
+    src_flat = _flatten_number_matches(_without_round_clock(source))
+    tr_flat = _flatten_number_matches(_without_round_clock(translation))
     findings = []
     if sorted(src_flat) != sorted(tr_flat):
-        from app.number_words import date_numbers, guess_source_lang, lang_base
-        src_counter = Counter(src_flat)
-        tr_counter = Counter(tr_flat)
-        missing = sorted((src_counter - tr_counter).elements())
-        extra = sorted((tr_counter - src_counter).elements())
-        # A number written as a word on the other side is fine; a date in
-        # digits must stay in digits; a date in words may become digits.
-        missing = _words_cover(missing, translation, lang_base(tgt_lang), protected=set(date_numbers(source)))
-        extra = _words_cover(extra, source, lang_base(src_lang) or guess_source_lang(source), months=True)
-        if not missing and not extra:
-            return findings
         # Point at the SPECIFIC number(s) that actually differ, not a dump
         # of every number in the text — a long promo paragraph can easily
         # have 20-30 numbers where only one is actually wrong, and the raw
         # full lists made that one real difference hard to spot by eye
         # (Александр kept asking "why is it showing me this" at a glance).
+        src_counter = Counter(src_flat)
+        tr_counter = Counter(tr_flat)
+        missing = sorted((src_counter - tr_counter).elements())
+        extra = sorted((tr_counter - src_counter).elements())
         parts = []
         if missing:
             parts.append(f"есть в исходнике, нет в переводе: {missing}")
@@ -683,7 +675,13 @@ _LATIN_LETTER_RE = re.compile(r"[a-zA-Z]")
 _LETTER_RUN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ]+")
 
 
-def check_mixed_script(translation: str) -> list[dict]:
+# 2026-10-06 (Александр): in Kazakh a Latin «i» in place of the Kazakh
+# «і» (they look identical) is accepted — the old keyboard habit. Any OTHER
+# look-alike Latin letter inside a Kazakh word is still flagged.
+_KK_TOLERATED_LATIN = set("iI")
+
+
+def check_mixed_script(translation: str, lang_code: str = "") -> list[dict]:
     """Catches an invisible-to-the-eye typo: a word that LOOKS like it's
     written in one alphabet but actually mixes in a look-alike letter from
     the other (Cyrillic "с" typed where a Latin "c" belongs, or vice versa)
@@ -698,10 +696,16 @@ def check_mixed_script(translation: str) -> list[dict]:
     below, the same way check_numbers is silently folded in whenever
     "Оформление" is ticked (see CHECK_OPTIONS/buildChecksToSend on the
     frontend)."""
-    suspects = sorted({
-        m.group(0) for m in _LETTER_RUN_RE.finditer(translation)
-        if _CYRILLIC_LETTER_RE.search(m.group(0)) and _LATIN_LETTER_RE.search(m.group(0))
-    })
+    kk = (lang_code or "").split("-")[0].lower() in ("kk", "kz")
+
+    def _mixed(word: str) -> bool:
+        if not (_CYRILLIC_LETTER_RE.search(word) and _LATIN_LETTER_RE.search(word)):
+            return False
+        if kk and set(_LATIN_LETTER_RE.findall(word)) <= _KK_TOLERATED_LATIN:
+            return False
+        return True
+
+    suspects = sorted({m.group(0) for m in _LETTER_RUN_RE.finditer(translation) if _mixed(m.group(0))})
     if not suspects:
         return []
     shown = ", ".join(f"«{w}»" for w in suspects[:10])
@@ -1054,7 +1058,11 @@ _COLON_RE = re.compile(r"[:：]")
 
 
 def check_hyphen_for_dash(translation: str) -> list[dict]:
-    hyphen_positions = [m.start() for m in re.finditer(r"(?<=\s)-(?=\s)", translation)]
+    from app.styleguide import is_list_marker  # 2026-10-06: bullets at a line start
+    hyphen_positions = [
+        m.start() for m in re.finditer(r"(?<=\s)-(?=\s)", translation)
+        if not is_list_marker(translation, m.start())
+    ]
     if not hyphen_positions:
         return []
 
@@ -1191,7 +1199,7 @@ def check_punctuation(
         findings += check_em_dash_spacing(translation)
         findings += check_hyphen_for_dash(translation)
 
-    findings += check_mixed_script(translation)
+    findings += check_mixed_script(translation, lang_code)
 
     return findings
 
@@ -1262,7 +1270,7 @@ def run_rule_checks(
     if not translation.strip():
         return check_missing(source, translation)
     if "numbers" in checks:
-        findings += check_numbers(source, translation, tgt_lang=lang_code)
+        findings += check_numbers(source, translation)
     if "placeholders" in checks:
         findings += check_placeholders(source, translation)
         findings += check_letter_placeholders(source, translation)
