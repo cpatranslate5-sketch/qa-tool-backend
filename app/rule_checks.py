@@ -1220,7 +1220,7 @@ def check_hyphen_for_dash(translation: str) -> list[dict]:
     }, translation, found_pos)]
 
 
-def _double_space_locations(translation: str) -> list[tuple[str, str]]:
+def _double_space_locations(translation: str) -> list[tuple[str, str, int]]:
     """Returns (word_before, word_after) for every run of 2+ spaces in
     translation, skipping a run that's purely trailing (nothing but more
     whitespace follows it to the end of the string) — added 2026-09-26,
@@ -1234,11 +1234,22 @@ def _double_space_locations(translation: str) -> list[tuple[str, str]]:
     for m in re.finditer(r" {2,}", translation):
         if m.start() >= trimmed_end:
             continue
+        # Layout, not typos (2026-10-08): indentation at the start of a
+        # line, spaces at the end of a line, and the padding inside a
+        # Markdown table row («| Limit       | 2 oyunçu |»).
+        ls = translation.rfind("\n", 0, m.start()) + 1
+        le = translation.find("\n", m.end())
+        le = len(translation) if le < 0 else le
+        line = translation[ls:le]
+        if not translation[ls:m.start()].strip() or not translation[m.end():le].strip():
+            continue
+        if line.strip().startswith("|") or line.count("|") >= 2:
+            continue
         before_match = re.search(r"(\S+)\s*$", translation[: m.start()])
         after_match = re.search(r"^\s*(\S+)", translation[m.end() :])
         before_word = before_match.group(1) if before_match else "начала сегмента"
         after_word = after_match.group(1) if after_match else "конца сегмента"
-        hints.append((before_word, after_word))
+        hints.append((before_word, after_word, m.start()))
     return hints
 
 
@@ -1292,12 +1303,16 @@ def check_punctuation(
         # just leftover formatting noise), so it isn't worth a finding at
         # all here.
         if double_space_hints:
-            where = "; ".join(f"между «{a}» и «{b}»" for a, b in double_space_hints)
-            findings.append({
+            where = "; ".join(f"между «{a}» и «{b}»" for a, b, _ in double_space_hints[:5])
+            more = f" и ещё {len(double_space_hints) - 5}" if len(double_space_hints) > 5 else ""
+            finding = {
                 "type": "punctuation",
                 "severity": "low",
-                "message": f"В переводе есть двойной пробел — {where}.",
-            })
+                "message": f"В переводе есть двойной пробел ({len(double_space_hints)}) — {where}{more}.",
+            }
+            if "\n" in translation.strip() or len(translation) > 160:
+                finding = _with_places(finding, translation, [p for _, _, p in double_space_hints])
+            findings.append(finding)
 
     if "sms_charset" not in checks:
         findings += check_em_dash_spacing(translation)
