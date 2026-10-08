@@ -979,11 +979,54 @@ def _real_last_char(text: str) -> str:
     return t[-1] if t else ""
 
 
+def _places(text: str, positions: list[int], width: int = 25, limit: int = 5) -> tuple[str, str]:
+    """« Где: …» for mechanical findings in long texts (2026-10-08,
+    Александр: «очень тяжело искать»): the words around each position (with
+    the paragraph number when the text has several) — and the first one as
+    the finding's "fragment", so the report shows that very paragraph."""
+    if not positions:
+        return "", ""
+    lines_start = [0] + [m.end() for m in re.finditer(r"\n", text)]
+    nonempty = [i for i, st in enumerate(lines_start)
+                if text[st:(lines_start[i + 1] - 1 if i + 1 < len(lines_start) else len(text))].strip()]
+    multi = len(nonempty) > 1
+    shown, first = [], ""
+    for pos in positions[:limit]:
+        ls = text.rfind("\n", 0, pos) + 1
+        le = text.find("\n", pos)
+        le = len(text) if le < 0 else le
+        a, b = max(ls, pos - width), min(le, pos + width)
+        while a > ls and not text[a - 1].isspace() and pos - a < width + 15:
+            a -= 1
+        while b < le and not text[b].isspace() and b - pos < width + 15:
+            b += 1
+        snip = text[a:b].strip()
+        if not first:
+            first = snip
+        if multi:
+            line_no = bisect.bisect_right(lines_start, pos) - 1
+            para = nonempty.index(line_no) + 1 if line_no in nonempty else line_no + 1
+            shown.append(f"абзац {para}: «{snip}»")
+        else:
+            shown.append(f"«{snip}»")
+    more = f" и ещё {len(positions) - limit}" if len(positions) > limit else ""
+    return " Где: " + "; ".join(shown) + more + ".", first
+
+
+def _with_places(finding: dict, text: str, positions: list[int]) -> dict:
+    where, first = _places(text, positions)
+    if where:
+        finding["message"] = finding["message"].rstrip() + where
+        finding["fragment"] = first
+    return finding
+
+
 # "Оформление": length long dash "—" requires spaces on both sides
 # (Александр's ask, 2026-09-22) — anything glued straight onto a
 # neighboring word looks like a typo, not intentional typography.
 def check_em_dash_spacing(translation: str) -> list[dict]:
     bad_count = 0
+    bad_pos: list[int] = []
     for i, ch in enumerate(translation):
         if ch != "—":
             continue
@@ -991,16 +1034,17 @@ def check_em_dash_spacing(translation: str) -> list[dict]:
         after_ok = i == len(translation) - 1 or translation[i + 1].isspace()
         if not before_ok or not after_ok:
             bad_count += 1
+            bad_pos.append(i)
     if not bad_count:
         return []
-    return [{
+    return [_with_places({
         "type": "punctuation",
         "severity": "low",
         "message": (
             f"В переводе длинное тире «—» стоит без пробела с одной из сторон ({bad_count} раз(а)) — "
             "вокруг «—» должны быть пробелы с обеих сторон."
         ),
-    }]
+    }, translation, bad_pos)]
 
 
 # A plain hyphen "-" surrounded by SPACES on both sides is almost always a
@@ -1136,6 +1180,7 @@ def check_hyphen_for_dash(translation: str) -> list[dict]:
     first_nonws_pos = first_nonws.start() if first_nonws else len(translation)
 
     count = 0
+    found_pos: list[int] = []
     # A hyphen that opens the cell with NO leading space at all ("- First
     # item...") never matches the (?<=\s) lookbehind above in the first
     # place — it isn't preceded by anything, let alone whitespace — so it
@@ -1162,16 +1207,17 @@ def check_hyphen_for_dash(translation: str) -> list[dict]:
             list_mode = True
             continue  # this hyphen is inside a colon-introduced enumeration — a list marker, not a dash typo
         count += 1
+        found_pos.append(pos)
     if not count:
         return []
-    return [{
+    return [_with_places({
         "type": "punctuation",
         "severity": "low",
         "message": (
             f"В переводе короткий дефис «-» стоит отдельным словом, окружённым пробелами ({count} раз(а)) — "
             "похоже, здесь по смыслу должно быть длинное тире «—», а не дефис."
         ),
-    }]
+    }, translation, found_pos)]
 
 
 def _double_space_locations(translation: str) -> list[tuple[str, str]]:
