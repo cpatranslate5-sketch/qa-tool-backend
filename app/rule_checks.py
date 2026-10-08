@@ -345,6 +345,64 @@ def _words_cover(missing: list[str], other_text: str, lang: str, protected: set[
     return left
 
 
+def _reconcile_split(missing: list[str], extra: list[str]) -> tuple[list[str], list[str]]:
+    """A dotted number read as one value on one side («4.1» next to a price)
+    and as its parts on the other («4», «1» — a section number) is the same
+    text, not a mismatch (2026-10-08, Александр's «4.1 / 4» case)."""
+    def fold(a: list[str], b: list[str]) -> tuple[list[str], list[str]]:
+        a, rest = list(a), Counter(b)
+        for tok in list(a):
+            if "." not in tok and "," not in tok:
+                continue
+            parts = Counter(_normalize_number(p) for p in re.split(r"[.,]", tok) if p)
+            if parts and all(rest[k] >= v for k, v in parts.items()):
+                a.remove(tok)
+                rest -= parts
+        return a, sorted(rest.elements())
+    missing, extra = fold(missing, extra)
+    extra, missing = fold(extra, missing)
+    return sorted(missing), sorted(extra)
+
+
+def _number_place(source: str, translation: str, missing: list[str], extra: list[str]) -> tuple[str, str]:
+    """(«абзац N», verbatim snippet) of the first paragraph whose numbers
+    differ — so a mismatch in a long text can be found at once."""
+    def lines(t):
+        return [l for l in t.split("\n") if l.strip()]
+    s_lines, t_lines = lines(source), lines(translation)
+    want_s, want_t = set(missing), set(extra)
+
+    def snippet(line: str, wanted: set[str]) -> str:
+        for m in NUMBER_RE.finditer(line):
+            if set(_decompose_grouped(m.group(0))) & wanted or _normalize_number(m.group(0)) in wanted:
+                a, b = max(0, m.start() - 25), min(len(line), m.end() + 25)
+                while a > 0 and not line[a - 1].isspace() and m.start() - a < 40:
+                    a -= 1
+                while b < len(line) and not line[b].isspace() and b - m.end() < 40:
+                    b += 1
+                return line[a:b].strip()
+        return line.strip()[:60]
+
+    if len(s_lines) == len(t_lines):
+        for i, (sl, tl) in enumerate(zip(s_lines, t_lines)):
+            fs, ft = Counter(_flatten_number_matches(sl)), Counter(_flatten_number_matches(tl))
+            if fs != ft:
+                ms, mt = sorted((fs - ft).elements()), sorted((ft - fs).elements())
+                ms, mt = _reconcile_split(ms, mt)
+                if not ms and not mt:
+                    continue
+                if set(mt) & want_t or not (set(ms) & want_s):
+                    return f"абзац {i + 1}", snippet(tl, set(mt) or want_t)
+                return f"абзац {i + 1}", snippet(sl, set(ms) or want_s)
+    for i, sl in enumerate(s_lines):
+        if set(_flatten_number_matches(sl)) & want_s:
+            return f"абзац {i + 1} оригинала", snippet(sl, want_s)
+    for i, tl in enumerate(t_lines):
+        if set(_flatten_number_matches(tl)) & want_t:
+            return f"абзац {i + 1} перевода", snippet(tl, want_t)
+    return "", ""
+
+
 def check_numbers(source: str, translation: str, tgt_lang: str = "", src_lang: str = "") -> list[dict]:
     src_flat = _flatten_number_matches(source)
     tr_flat = _flatten_number_matches(translation)
@@ -355,6 +413,7 @@ def check_numbers(source: str, translation: str, tgt_lang: str = "", src_lang: s
         tr_counter = Counter(tr_flat)
         missing = sorted((src_counter - tr_counter).elements())
         extra = sorted((tr_counter - src_counter).elements())
+        missing, extra = _reconcile_split(missing, extra)
         # A number written as a word on the other side is fine; a date in
         # digits must stay in digits; a date in words may become digits.
         missing = _words_cover(missing, translation, lang_base(tgt_lang), protected=set(date_numbers(source)))
@@ -371,11 +430,18 @@ def check_numbers(source: str, translation: str, tgt_lang: str = "", src_lang: s
             parts.append(f"есть в исходнике, нет в переводе: {missing}")
         if extra:
             parts.append(f"есть в переводе, нет в исходнике: {extra}")
-        findings.append({
+        finding = {
             "type": "numbers",
             "severity": "high",
             "message": "Числа в исходнике и переводе не совпадают — " + "; ".join(parts) + ".",
-        })
+        }
+        # Where: for a long text, the paragraph and the exact place (2026-10-08).
+        if "\n" in source.strip() or len(source) > 160:
+            where, snip = _number_place(source, translation, missing, extra)
+            if where:
+                finding["message"] += f" Место: {where} — «{snip}»."
+                finding["fragment"] = snip
+        findings.append(finding)
     return findings
 
 
