@@ -1,3 +1,4 @@
+import copy
 import base64
 import datetime
 import secrets
@@ -17,6 +18,7 @@ from app.share_page import ALL_LANGS, numbered_findings, report_langs, pending_k
 from app.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.excel_multi import (
+    merge_repeated_in_row,
     BATCH_THRESHOLD_CHARS,
     _label_to_code,
     _normalize_lang_label,
@@ -230,7 +232,7 @@ def _seed_other_clients(db: Session) -> None:
         if existing_client is not None:
             continue
         sg = sg_mod.without_tone(win.styleguide) if (spec["copy_1win"] and win is not None) else {}
-        client = models.Client(name=spec["name"], styleguide=sg, domain=spec["domain"], seed_version=7)
+        client = models.Client(name=spec["name"], styleguide=sg_mod.add_default_rules(sg), domain=spec["domain"], seed_version=8)
         db.add(client)
         db.flush()
         existing = {p.name.strip().lower(): p for p in db.query(models.Project).all()}
@@ -247,6 +249,12 @@ def _seed_other_clients(db: Session) -> None:
                 if code not in have:
                     db.add(models.LanguageCatalogEntry(project_id=project.id, lang_code=code))
         db.commit()
+    # 2026-10-07: default rules for en / ru / hy in every client (once).
+    for cl in db.query(models.Client).all():
+        if (cl.seed_version or 0) < 8:
+            cl.styleguide = sg_mod.add_default_rules(cl.styleguide)
+            cl.seed_version = 8
+    db.commit()
 
 
 def _apply_tov_languages(db: Session) -> None:
@@ -463,26 +471,15 @@ async def _run_live_check_background(
 
 # Context now carries labelled columns of the client's file (2026-10-04).
 _CONTEXT_COLUMNS_NOTE = (
+    "Числа можно писать цифрами или словами в любую сторону («1 баннер» = «one banner», «пять ставок» = "
+    "«5 bets») — это не ошибка. Исключение: дата, написанная цифрами, должна остаться цифрами (словами её не "
+    "расшифровывают); дату, написанную словами, передать цифрами можно.\n"
     "Контекст строки может содержать «ключ:» — технический ключ строки (по нему видно, кнопка это, заголовок, "
     "условие и т. п.) и «пометка:» — указание заказчика именно к этой строке. Пометка важнее общих правил: "
     "например, если в ней сказано не переводить фразу или оставить её на английском, такой перевод — не ошибка.\n"
     "Служебные метки структуры текста в исходнике — «Тема:», «Заголовок:», «Подзаголовок:», «Кнопка:», «CTA:», "
     "«Текст:», «Основной пост:», «Скрытый пост:», «Текст ТГ», «Текст Email» и т. п. — переводить не нужно: если они "
     "оставлены как в исходнике, это НЕ ошибка и не неполный перевод."
-)
-
-# 2026-10-06 (Александр): «круглосуточно» ↔ «24/7» ↔ «24 часа».
-_ROUND_CLOCK_NOTE = (
-    "КРУГЛОСУТОЧНО: «24/7», «7/24», «24x7», «24/7/365», «24 часа» (в значении «круглосуточно»), «non-stop», "
-    "«круглосуточно» и их аналоги в любом языке (например, «24시간 연중무휴», «7/24», «24 saat») взаимозаменяемы — "
-    "это не ошибка и не пропуск чисел."
-)
-
-# 2026-10-06 (Александр): bulleted lists inside a cell.
-_LIST_MARKERS_NOTE = (
-    "СПИСКИ: дефис, тире или точка-маркер («-», «–», «—», «•», «*») в начале строки, за которым идёт пробел, — это "
-    "маркер пункта списка, а не знак препинания. Не делай к нему замечаний (дефис вместо тире, пробелы вокруг, "
-    "длина тире и т. п.). Строки таблиц вида «|---|---|» — тоже разметка, не ошибка."
 )
 
 
@@ -506,8 +503,6 @@ def _with_domain_note(
     if note:
         parts.append(note)
     parts.append(_CONTEXT_COLUMNS_NOTE)
-    parts.append(_LIST_MARKERS_NOTE)
-    parts.append(_ROUND_CLOCK_NOTE)
     extra = (extra_instructions or "").strip()
     if extra:
         parts.append(extra)
@@ -740,7 +735,7 @@ def create_client(payload: schemas.ClientIn, db: Session = Depends(get_db)):
         raise HTTPException(400, "Введите название заказчика.")
     if any(c.name.strip().lower() == name.lower() for c in db.query(models.Client).all()):
         raise HTTPException(409, "Заказчик с таким названием уже есть.")
-    client = models.Client(name=name, styleguide={})
+    client = models.Client(name=name, styleguide=sg_mod.add_default_rules({}), seed_version=8)
     db.add(client)
     db.commit()
     db.refresh(client)
@@ -1161,11 +1156,11 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
     if payload.project_id:
         project = _get_project(payload.project_id, db)
 
-    rules = sg_mod.rules_for_code(_project_styleguide(project), payload.target_lang)
     findings = run_rule_checks(
         payload.source, payload.translation, payload.checks,
-        lang_code=payload.target_lang, tolerate_latin_i=sg_mod.tolerates_latin_i(rules),
+        lang_code=payload.target_lang,
     )
+    rules = sg_mod.rules_for_code(_project_styleguide(project), payload.target_lang)
     if rules:
         findings += sg_mod.check_row(
             payload.source, payload.translation, rules, sg_mod.lang_key_for(payload.target_lang) or "",
@@ -1188,6 +1183,7 @@ async def check(payload: schemas.CheckIn, db: Session = Depends(get_db)):
         single_lessons.get(sg_mod.feedback_lang_key(payload.target_lang), ""),
     )
     findings += ai_findings
+    findings = merge_repeated_in_row(findings)
 
     single_check_id = None
     if project is not None:
@@ -1990,6 +1986,126 @@ def _own_multi_check(project_id: int, multi_check_id: int, manager_id: int, db: 
     return record
 
 
+def _edit_finding(record: models.MultiCheck, key: str, action: str, message: str | None, by_name: str) -> dict:
+    """✏️ / 🗑 of one finding (2026-10-05): a new platform comment, or the
+    finding marked removed — a mark, not a real delete, so the numbers and
+    keys of the other findings stay as they are. Caller commits."""
+    parts = (key or "").split("|")
+    if len(parts) != 4:
+        raise HTTPException(400, "Неизвестное замечание.")
+    try:
+        sheet_idx, lang, excel_row, fi = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
+    except ValueError:
+        raise HTTPException(400, "Неизвестное замечание.")
+    results = copy.deepcopy(record.results or {})
+    sheets = results.get("sheets") or []
+    if not (0 <= sheet_idx < len(sheets)):
+        raise HTTPException(404, "Замечание не найдено.")
+    row = next((r for r in (sheets[sheet_idx].get("languages") or {}).get(lang) or [] if r.get("excel_row") == excel_row), None)
+    findings = (row or {}).get("findings") or []
+    if not (0 <= fi < len(findings)) or findings[fi].get("type") in ("register_summary", "system"):
+        raise HTTPException(404, "Замечание не найдено.")
+    f = findings[fi]
+    if action == "edit":
+        text_ = (message or "").strip()
+        if not text_:
+            raise HTTPException(400, "Комментарий не может быть пустым.")
+        if len(text_) > 3000:
+            raise HTTPException(400, "Комментарий слишком длинный.")
+        f.setdefault("original_message", f.get("message", ""))
+        f["message"] = text_
+        f["edited_by"] = by_name
+    elif action == "delete":
+        f["deleted"] = True
+        f["deleted_by"] = by_name
+        summary = dict(record.summary or {})
+        if isinstance(summary.get("total_findings"), int) and summary["total_findings"] > 0:
+            summary["total_findings"] -= 1
+            record.summary = summary
+            results["summary"] = summary
+        review = dict(record.review or {})
+        review.pop(key, None)
+        record.review = review
+    else:
+        raise HTTPException(400, "Неизвестное действие.")
+    record.results = results
+    return f
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/finding")
+def edit_report_finding(project_id: int, multi_check_id: int, payload: schemas.FindingEditIn, db: Session = Depends(get_db)):
+    """Changes the platform's comment of one finding, or removes the finding
+    from the report — only with the folder's password (2026-10-05,
+    Александр). Removal is a mark, not a real delete, so the numbers and
+    keys of the other findings stay as they are."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    manager = _get_manager(payload.manager_id, db)
+    if not verify_code((payload.code or "").strip(), manager.code_hash):
+        raise HTTPException(401, "Неверный пароль папки.")
+    f = _edit_finding(record, payload.key, payload.action, payload.message, manager.name)
+    db.commit()
+    return {"ok": True, "key": payload.key, "action": payload.action, "message": f.get("message", "")}
+
+
+MANUAL_ROW_BASE = 100000  # rows the manager adds himself (no Excel row)
+
+
+@app.post("/projects/{project_id}/multi-check/{multi_check_id}/finding-add")
+def add_report_finding(project_id: int, multi_check_id: int, payload: schemas.FindingAddIn, db: Session = Depends(get_db)):
+    """The manager's own remark for the translator (2026-10-05, Александр) —
+    to an existing row of the report, or as a separate block of a language
+    (optionally with the source / translation it is about). Folder password
+    required. Added already marked ✓ (it is meant for the translator)."""
+    record = _own_multi_check(project_id, multi_check_id, payload.manager_id, db)
+    manager = _get_manager(payload.manager_id, db)
+    if not verify_code((payload.code or "").strip(), manager.code_hash):
+        raise HTTPException(401, "Неверный пароль папки.")
+    message = (payload.message or "").strip()
+    if not message:
+        raise HTTPException(400, "Напишите комментарий.")
+    if len(message) > 3000:
+        raise HTTPException(400, "Комментарий слишком длинный.")
+    severity = payload.severity if payload.severity in ("low", "medium", "high") else "medium"
+    results = copy.deepcopy(record.results or {})
+    sheets = results.get("sheets") or []
+    if not (0 <= payload.sheet_idx < len(sheets)):
+        raise HTTPException(404, "Лист не найден.")
+    sheet = sheets[payload.sheet_idx]
+    lang = payload.lang
+    if lang not in (sheet.get("languages_checked") or []):
+        raise HTTPException(400, "Такого языка нет в этом отчёте.")
+    rows = sheet.setdefault("languages", {}).setdefault(lang, [])
+    finding = {"type": "manual", "severity": severity, "message": message, "added_by": manager.name}
+    if payload.excel_row is not None:
+        row = next((r for r in rows if r.get("excel_row") == payload.excel_row and payload.excel_row != 0), None)
+        if row is None:
+            raise HTTPException(404, "Строка не найдена.")
+    else:
+        used = [r.get("excel_row") or 0 for r in rows]
+        excel_row = max([MANUAL_ROW_BASE] + [x for x in used if x >= MANUAL_ROW_BASE]) + 1
+        row = {
+            "excel_row": excel_row,
+            "context": "Замечание менеджера",
+            "source": (payload.source or "").strip()[:5000],
+            "translation": (payload.translation or "").strip()[:5000],
+            "findings": [],
+        }
+        rows.append(row)
+    row.setdefault("findings", []).append(finding)
+    key = f"{payload.sheet_idx}|{lang}|{row['excel_row']}|{len(row['findings']) - 1}"
+    summary = dict(record.summary or {})
+    if isinstance(summary.get("total_findings"), int):
+        summary["total_findings"] += 1
+        results["summary"] = summary
+        record.summary = summary
+    record.results = results
+    review = dict(record.review or {})
+    review[key] = {"decision": "accept", "links": "", "note": ""}
+    record.review = review
+    db.commit()
+    return {"ok": True, "key": key, "row": row, "finding": finding}
+
+
 @app.post("/projects/{project_id}/multi-check/{multi_check_id}/share")
 def create_share_link(project_id: int, multi_check_id: int, payload: schemas.ShareLinkIn, db: Session = Depends(get_db)):
     """Returns this language's active translator link, creating it if there
@@ -2121,6 +2237,42 @@ def shared_report_okk(token: str, payload: schemas.ShareOkkIn, db: Session = Dep
     mc.review = review  # reassign so SQLAlchemy notices the JSON change
     db.commit()
     return {"ok": True}
+
+
+@app.post("/share/{token}/finding", include_in_schema=False)
+def shared_report_edit_finding(token: str, payload: schemas.ShareFindingEditIn, db: Session = Depends(get_db)):
+    """✏️ / 🗑 on the translator's page (2026-10-05, Александр): change the
+    comment of a finding or remove it — with the password of the folder the
+    check belongs to (or of an admin folder)."""
+    link = _active_share_link(token, db)
+    mc = link.multi_check
+    key = (payload.key or "").strip()
+    klang = _key_lang(link, key)
+    if not any(k == key and row is not None for _, k, row, _f in numbered_findings(klang, mc.results or {})):
+        raise HTTPException(404, "Замечание не найдено.")
+    code = (payload.code or "").strip()
+    owner = db.get(models.Manager, mc.manager_id) if mc.manager_id else None
+    who = None
+    if owner is not None and verify_code(code, owner.code_hash):
+        who = owner
+    else:
+        who = next((m for m in db.query(models.Manager).filter(models.Manager.is_admin.is_(True)).all()
+                    if verify_code(code, m.code_hash)), None)
+    if who is None:
+        raise HTTPException(401, "Неверный пароль папки.")
+    if payload.action == "okk_comment":
+        # The comment for the translator (what the head of QA wrote), not
+        # the platform's own comment (2026-10-06, Александр).
+        review = dict(mc.review or {})
+        entry = dict(review.get(key) or {})
+        entry["okk_comment"] = (payload.message or "").strip()[:4000]
+        review[key] = entry
+        mc.review = review
+        db.commit()
+        return {"ok": True, "key": key, "action": payload.action, "okk_comment": entry["okk_comment"]}
+    f = _edit_finding(mc, key, payload.action, payload.message, who.name)
+    db.commit()
+    return {"ok": True, "key": key, "action": payload.action, "message": f.get("message", "")}
 
 
 @app.post("/share/{token}/save-case", include_in_schema=False)
@@ -2298,13 +2450,7 @@ def _backfill_learning(db: Session) -> None:
 
 
 def _scope_label(db: Session, lesson: models.Lesson) -> str:
-    if lesson.project_ids:
-        names = []
-        for pid in lesson.project_ids:
-            p = db.get(models.Project, pid)
-            names.append(f"«{p.name}»" if p else "(удалён)")
-        where = "проекты " + ", ".join(names)
-    elif lesson.project_id:
+    if lesson.project_id:
         p = db.get(models.Project, lesson.project_id)
         where = f"проект «{p.name}»" if p else "проект (удалён)"
     elif lesson.client_id:
@@ -2312,18 +2458,14 @@ def _scope_label(db: Session, lesson: models.Lesson) -> str:
         where = f"все проекты заказчика «{c.name}»" if c else "заказчик (удалён)"
     else:
         where = "все проекты"
-    if lesson.lang_keys:
-        lang = ", ".join(sg_mod.LANG_LABEL.get(k, k) for k in lesson.lang_keys)
-    else:
-        lang = sg_mod.LANG_LABEL.get(lesson.lang_key, lesson.lang_key) if lesson.lang_key else "все языки"
+    lang = sg_mod.LANG_LABEL.get(lesson.lang_key, lesson.lang_key) if lesson.lang_key else "все языки"
     return f"{where} · {lang}"
 
 
 def _lesson_snapshot(lesson: models.Lesson) -> dict:
     return {
-        "text": lesson.text, "project_id": lesson.project_id, "project_ids": lesson.project_ids or None,
-        "client_id": lesson.client_id,
-        "lang_key": lesson.lang_key, "lang_keys": lesson.lang_keys or None, "status": lesson.status,
+        "text": lesson.text, "project_id": lesson.project_id, "client_id": lesson.client_id,
+        "lang_key": lesson.lang_key, "status": lesson.status,
     }
 
 
@@ -2347,16 +2489,9 @@ def _lessons_for(db: Session, project: models.Project | None, lang_codes) -> tup
             continue
         ranked = []
         for les in lessons:
-            if les.lang_keys:
-                if lk not in les.lang_keys:
-                    continue
-            elif les.lang_key and les.lang_key != lk:
+            if les.lang_key and les.lang_key != lk:
                 continue
-            if les.project_ids:
-                if pid not in les.project_ids:
-                    continue
-                rank = 0
-            elif les.project_id:
+            if les.project_id:
                 if les.project_id != pid:
                     continue
                 rank = 0
@@ -2366,7 +2501,7 @@ def _lessons_for(db: Session, project: models.Project | None, lang_codes) -> tup
                 rank = 2
             else:
                 rank = 4
-            if not les.lang_key and not les.lang_keys:
+            if not les.lang_key:
                 rank += 1
             ranked.append((rank, les))
         ranked.sort(key=lambda x: x[0])
@@ -2409,7 +2544,7 @@ def _item_out(db: Session, it: models.LearningItem) -> dict:
         "lang_label": sg_mod.LANG_LABEL.get(it.lang_key, it.lang_code), "excel_row": it.excel_row,
         "context": it.context, "finding_type": it.finding_type, "finding_message": it.finding_message,
         "source": it.source, "translation": it.translation, "translator_comment": it.translator_comment,
-        "okk_note": it.okk_note, "ai_review": it.ai_review or None, "admin_note": it.admin_note or "", "lesson_id": it.lesson_id, "resolved_by_name": it.resolved_by_name,
+        "okk_note": it.okk_note, "lesson_id": it.lesson_id, "resolved_by_name": it.resolved_by_name,
         "created_at": it.created_at.isoformat() if it.created_at else None,
         "resolved_at": it.resolved_at.isoformat() if it.resolved_at else None,
     }
@@ -2418,10 +2553,8 @@ def _item_out(db: Session, it: models.LearningItem) -> dict:
 def _lesson_out(db: Session, les: models.Lesson) -> dict:
     hist = db.query(models.LessonHistory).filter(models.LessonHistory.lesson_id == les.id).order_by(models.LessonHistory.id.desc()).all()
     return {
-        "id": les.id, "text": les.text, "project_id": les.project_id, "project_ids": les.project_ids or None,
-        "client_id": les.client_id,
-        "lang_key": les.lang_key, "lang_keys": les.lang_keys or None,
-        "lang_label": sg_mod.LANG_LABEL.get(les.lang_key, les.lang_key) if les.lang_key else "",
+        "id": les.id, "text": les.text, "project_id": les.project_id, "client_id": les.client_id,
+        "lang_key": les.lang_key, "lang_label": sg_mod.LANG_LABEL.get(les.lang_key, les.lang_key) if les.lang_key else "",
         "scope_label": _scope_label(db, les), "example": les.example or {}, "status": les.status,
         "used_count": les.used_count or 0, "created_by_name": les.created_by_name,
         "created_at": les.created_at.isoformat() if les.created_at else None,
@@ -2434,39 +2567,15 @@ def _lesson_out(db: Session, les: models.Lesson) -> dict:
     }
 
 
-def _apply_scope(
-    db: Session, lesson: models.Lesson, scope: str, lang_scope: str, project_id, client_id, lang_key: str,
-    project_ids: list[int] | None = None, lang_keys: list[str] | None = None,
-) -> None:
-    if scope not in ("project", "projects", "client", "all") or lang_scope not in ("lang", "langs", "all"):
+def _apply_scope(db: Session, lesson: models.Lesson, scope: str, lang_scope: str, project_id, client_id, lang_key: str) -> None:
+    if scope not in ("project", "client", "all") or lang_scope not in ("lang", "all"):
         raise HTTPException(400, "Неверная область действия.")
-    ids: list[int] = []
-    if scope == "projects":
-        for pid in project_ids or []:
-            if pid not in ids and db.get(models.Project, pid) is not None:
-                ids.append(pid)
-        if not ids:
-            raise HTTPException(400, "Отметьте хотя бы один проект.")
-        if len(ids) == 1:
-            scope, project_id = "project", ids[0]
-    lesson.project_ids = ids if scope == "projects" else None
     if scope == "project" and not project_id:
         raise HTTPException(400, "У этого замечания нет проекта.")
     if scope == "client" and not client_id:
         raise HTTPException(400, "Проект не привязан к заказчику.")
     lesson.project_id = project_id if scope == "project" else None
     lesson.client_id = client_id if scope == "client" else None
-    keys: list[str] = []
-    if lang_scope == "langs":
-        for k in lang_keys or []:
-            k = sg_mod.feedback_lang_key(str(k))
-            if k and k not in keys:
-                keys.append(k)
-        if not keys:
-            raise HTTPException(400, "Отметьте хотя бы один язык.")
-        if len(keys) == 1:
-            lang_scope, lang_key = "lang", keys[0]
-    lesson.lang_keys = keys if lang_scope == "langs" else None
     lesson.lang_key = lang_key if lang_scope == "lang" else ""
 
 
@@ -2507,7 +2616,7 @@ def learning_item_learn(item_id: int, payload: schemas.LearnIn, db: Session = De
         example={"finding_message": it.finding_message, "source": it.source, "translation": it.translation,
                  "project_name": it.project_name, "lang_code": it.lang_code, "item_id": it.id},
     )
-    _apply_scope(db, lesson, payload.scope, payload.lang_scope, it.project_id, it.client_id, it.lang_key, payload.project_ids, payload.lang_keys)
+    _apply_scope(db, lesson, payload.scope, payload.lang_scope, it.project_id, it.client_id, it.lang_key)
     db.add(lesson)
     _log_lesson(db, lesson, "created", manager.name)
     it.status = "learned"
@@ -2552,7 +2661,7 @@ def learning_lesson_update(lesson_id: int, payload: schemas.LessonUpdateIn, db: 
         if not payload.text.strip():
             raise HTTPException(400, "Текст урока пустой.")
         les.text = payload.text.strip()[:2000]
-    if payload.scope is not None or payload.lang_scope is not None or payload.lang_key is not None or payload.project_ids is not None or payload.lang_keys is not None:
+    if payload.scope is not None or payload.lang_scope is not None or payload.lang_key is not None:
         ex = les.example or {}
         item = db.get(models.LearningItem, ex.get("item_id")) if ex.get("item_id") else None
         project_id = les.project_id or (item.project_id if item else None)
@@ -2560,13 +2669,10 @@ def learning_lesson_update(lesson_id: int, payload: schemas.LessonUpdateIn, db: 
         if project_id and not client_id:
             p = db.get(models.Project, project_id)
             client_id = p.client_id if p else None
-        lang_key = ((payload.lang_key if payload.lang_key is not None else les.lang_key) or (item.lang_key if item else "")
-                    or ((les.lang_keys or [""])[0]))
-        scope = payload.scope or ("projects" if les.project_ids else "project" if les.project_id else "client" if les.client_id else "all")
-        lang_scope = payload.lang_scope or ("langs" if les.lang_keys else "lang" if les.lang_key else "all")
-        _apply_scope(db, les, scope, lang_scope, project_id, client_id, lang_key,
-                     payload.project_ids if payload.project_ids is not None else les.project_ids,
-                     payload.lang_keys if payload.lang_keys is not None else les.lang_keys)
+        lang_key = (payload.lang_key if payload.lang_key is not None else les.lang_key) or (item.lang_key if item else "")
+        scope = payload.scope or ("project" if les.project_id else "client" if les.client_id else "all")
+        lang_scope = payload.lang_scope or ("lang" if les.lang_key else "all")
+        _apply_scope(db, les, scope, lang_scope, project_id, client_id, lang_key)
     if payload.status is not None:
         if payload.status not in ("active", "disabled", "deleted"):
             raise HTTPException(400, "Неверный статус.")
@@ -2579,156 +2685,6 @@ def learning_lesson_update(lesson_id: int, payload: schemas.LessonUpdateIn, db: 
         _log_lesson(db, les, action, manager.name)
     db.commit()
     return _lesson_out(db, les)
-
-
-
-# ------------------------------------------------------ «Разбор комментариев» ---
-# 2026-10-05, Александр: before a translator's «Не актуально» becomes a lesson,
-# the language's own model (the one that checks this language) gives a second
-# opinion: is the translator right or is the finding valid after all, how sure
-# it is, a plain-Russian explanation for the head of QA (who may not know the
-# language), a draft lesson worded for the platform, and — when the finding
-# stands — a short reply for the translator. Advice only: the admin still
-# decides and edits; nothing is learned without «Запомнить».
-
-REVIEW_VERDICTS = ("translator_right", "partly", "translator_wrong", "unclear")
-REVIEW_SCOPES = ("project", "client", "all")
-
-_REVIEW_PROMPT = """Ты — опытный редактор-носитель и руководитель контроля качества переводов. Ты отлично знаешь целевой язык, его живую разговорную и рекламную норму.
-
-{lang_line}
-
-Платформа автоматической проверки перевода сделала замечание к строке. {who} отклонил это замечание («Не актуально»). Твоя задача — НЕЗАВИСИМО разобраться, кто прав, и подготовить «урок» для платформы, чтобы она больше не делала ошибочных замечаний такого рода.
-
-Важно:
-- Суди по самому тексту, а не по уверенности сторон. Переводчик может ошибаться (защищать свою ошибку), а платформа часто бывает слишком строгой: живой, рекламный, «не учебниковый» язык, кальки и заимствования, принятые у носителей и в тематике проекта, — НЕ ошибка.
-- Учитывай тематику проекта, стайлгайд заказчика и уже действующие уроки.
-- Если комментария нет — оцени замечание сам.
-- Если есть пояснение руководителя ОКК — это проверенные факты (например, как раздел или кнопка названы на сайте заказчика): доверяй им полностью, они важнее комментария переводчика и твоих предположений.
-- Названия из интерфейса сайта, разделов, кнопок, игр и акций, а также термины глоссария — фиксированные. Никогда не предлагай вариантов, которые меняют само название (артикль, падеж, число, синоним, другое написание); исправлять можно только то, что вокруг него.
-
-{project_block}
-Строка:
-- Контекст: {context}
-- Исходный текст: {source}
-- Перевод: {translation}
-- Тип замечания: {finding_type}
-- Замечание платформы: {finding}
-- {who_comment}: {comment}
-{admin_line}
-{lessons_block}
-Ответь ТОЛЬКО JSON-объектом без пояснений вокруг:
-{{
-  "verdict": "translator_right" | "partly" | "translator_wrong" | "unclear",
-  "confidence": число 0–100 (насколько ты уверен в вердикте),
-  "reasoning": "2–5 предложений по-русски простым языком для руководителя ОКК, который может не знать этот язык: в чём суть, кто прав и почему. Ключевые слова на целевом языке приводи с переводом на русский в скобках.",
-  "lesson": "Урок для платформы (1–3 предложения по-русски), ТОЛЬКО если платформа ошиблась полностью или частично; иначе пустая строка. Урок — обобщённое правило, а не пересказ одной строки: какое слово/конструкция/явление целевого языка (приведи его), почему это НЕ ошибка и в каких случаях это всё-таки ошибка (граница правила). Начни с названия языка по-русски и двоеточия (например, «Узбекский: »). Если такой урок уже есть среди действующих — пустая строка, а в reasoning укажи номер похожего урока.",
-  "suggested_scope": "project" (правило касается только терминологии/требований этого проекта) | "client" (требования этого заказчика) | "all" (общее правило языка),
-  "translator_reply": "Если замечание верно полностью или частично — короткий вежливый ответ переводчику по-русски (1–3 предложения): почему замечание в силе и как исправить. Иначе пустая строка."
-}}"""
-
-
-def _review_prompt(db: Session, it: models.LearningItem) -> str:
-    from app import claude_client as cc
-    project = db.get(models.Project, it.project_id) if it.project_id else None
-    client = db.get(models.Client, it.client_id) if it.client_id else None
-    proj_parts = []
-    if project is not None:
-        proj_parts.append(f"Проект: {project.name}" + (f" (заказчик: {client.name})" if client else ""))
-        if (project.description or "").strip():
-            proj_parts.append("Описание проекта:\n" + project.description.strip())
-    note = domain_note_for_names(it.project_name, client.name if client else None,
-                                 domain=getattr(client, "domain", None) if client else None)
-    if note:
-        proj_parts.append(note)
-    sg = _project_styleguide(project)
-    if sg:
-        sg_text = sg_mod.prompt_text(sg_mod.rules_for_code(sg, it.lang_code))
-        if sg_text.strip():
-            proj_parts.append("Стайлгайд заказчика для этого языка:\n" + sg_text.strip())
-    project_block = ("\n\n".join(proj_parts) + "\n") if proj_parts else ""
-
-    lessons = (
-        db.query(models.Lesson).filter(models.Lesson.status == "active")
-        .filter((models.Lesson.lang_key == "") | (models.Lesson.lang_key == it.lang_key))
-        .order_by(models.Lesson.id.desc()).limit(60).all()
-    )
-    lessons = [l for l in lessons if not l.lang_keys or it.lang_key in l.lang_keys][:30]
-    lessons_block = ""
-    if lessons:
-        lessons_block = "Уже действующие уроки платформы для этого языка:\n" + "\n".join(
-            f"- №{les.id}: {les.text.strip()[:400]}" for les in lessons
-        ) + "\n"
-
-    if it.origin == "okk":
-        who, who_comment, comment = "Руководитель ОКК", "Причина руководителя ОКК", it.okk_note
-    else:
-        who, who_comment, comment = "Переводчик", "Комментарий переводчика", it.translator_comment
-    return _REVIEW_PROMPT.format(
-        lang_line=cc._target_lang_line(it.lang_code or it.lang_key).strip(), who=who, who_comment=who_comment,
-        comment=(comment or "").strip() or "(комментария нет)",
-        project_block=project_block, context=(it.context or "—")[:1500],
-        source=(it.source or "")[:4000], translation=(it.translation or "")[:4000],
-        finding_type=it.finding_type or "—", finding=it.finding_message or "",
-        lessons_block=lessons_block,
-        admin_line=(f"- Пояснение руководителя ОКК (проверенные факты): {it.admin_note.strip()}\n" if (it.admin_note or "").strip() else ""),
-    )
-
-
-def _parse_review(text_block: str | None) -> dict:
-    import json as _json
-    import re as _re
-    raw = (text_block or "").strip()
-    m = _re.search(r"\{.*\}", raw, _re.S)
-    if not m:
-        raise ValueError("no JSON object in the answer")
-    data = _json.loads(m.group(0))
-    verdict = str(data.get("verdict") or "unclear").strip()
-    if verdict not in REVIEW_VERDICTS:
-        verdict = "unclear"
-    try:
-        conf = max(0, min(100, int(round(float(data.get("confidence") or 0)))))
-    except (TypeError, ValueError):
-        conf = 0
-    scope = str(data.get("suggested_scope") or "all").strip()
-    if scope not in REVIEW_SCOPES:
-        scope = "all"
-    return {
-        "verdict": verdict, "confidence": conf,
-        "reasoning": str(data.get("reasoning") or "").strip()[:3000],
-        "lesson": str(data.get("lesson") or "").strip()[:2000],
-        "suggested_scope": scope,
-        "translator_reply": str(data.get("translator_reply") or "").strip()[:2000],
-    }
-
-
-@app.post("/learning/items/{item_id}/review")
-async def learning_item_review(item_id: int, payload: schemas.LearningReviewIn, db: Session = Depends(get_db)):
-    from app import claude_client as cc
-    _require_admin(payload.manager_id, db)
-    it = db.get(models.LearningItem, item_id)
-    if it is None:
-        raise HTTPException(404, "Не найдено.")
-    if payload.admin_note is not None:
-        it.admin_note = payload.admin_note.strip()[:3000]
-        db.commit()
-    if it.ai_review and not payload.force:
-        return {"item": _item_out(db, it)}
-    route = route_for_lang(it.lang_code or it.lang_key)
-    prompt = _review_prompt(db, it)
-    try:
-        text_block, cost, _stop = await cc._call_route(route, prompt)
-        review = _parse_review(text_block)
-    except Exception as exc:  # noqa: BLE001 — shown to the admin, nothing saved
-        logger.exception("learning review failed for item %s", item_id)
-        raise HTTPException(502, f"Модель {route.label} не смогла разобрать замечание ({type(exc).__name__}). Попробуйте ещё раз.")
-    review.update({
-        "model": route.label, "cost_usd": round(float(cost or 0), 4),
-        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    })
-    it.ai_review = review
-    db.commit()
-    return {"item": _item_out(db, it)}
 
 
 # ------------------------------------------------------------ «Сохранённое» ---

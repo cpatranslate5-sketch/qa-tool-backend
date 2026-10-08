@@ -164,11 +164,6 @@ class LearningItem(Base):
     translation: Mapped[str] = mapped_column(Text, default="")
     translator_comment: Mapped[str] = mapped_column(Text, default="")
     okk_note: Mapped[str] = mapped_column(Text, default="")
-    # «Разбор комментариев» (2026-10-05): the language's own model's opinion —
-    # who is right, why, a draft lesson. Advice only; nothing is learned from it.
-    ai_review: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    # The admin's own explanation (facts the model must trust), 2026-10-05.
-    admin_note: Mapped[str] = mapped_column(Text, default="", server_default="")
     lesson_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     resolved_by_name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -191,11 +186,6 @@ class Lesson(Base):
     project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     client_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     lang_key: Mapped[str] = mapped_column(String(40), default="", index=True)
-    # 2026-10-05: several chosen projects (e.g. «1win» + «1win SMM»); when set,
-    # project_id/client_id are empty and the lesson applies to these only.
-    project_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
-    # 2026-10-06: several chosen languages; when set, lang_key is empty.
-    lang_keys: Mapped[list | None] = mapped_column(JSON, nullable=True)
     example: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # finding/source/translation it came from
     status: Mapped[str] = mapped_column(String(20), default="active", index=True)
     used_count: Mapped[int] = mapped_column(Integer, default=0)

@@ -66,6 +66,15 @@ _CSS = """
   mark.loc { background: #fde68a; color: inherit; padding: 0 2px; border-radius: 3px; }
   .loc-line { font-size: 0.85rem; color: #555; white-space: pre-wrap; margin-top: 6px; }
   .field.txt { white-space: pre-wrap; }
+  .mgr-btn { border: 1px solid #e3e5ee; background: #fff; border-radius: 6px; cursor: pointer; padding: 2px 6px; font-size: 0.8rem; opacity: 0.6; margin-left: 4px; }
+  .mgr-btn:hover { opacity: 1; }
+  .mgr-box { margin: 8px 0; padding: 8px; border: 1px dashed #b4b9d6; border-radius: 8px; background: #fafbff; }
+  .mgr-box textarea { width: 100%; min-height: 60px; font: inherit; }
+  .mgr-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  .mgr-row input { padding: 4px 6px; border: 1px solid #ccd; border-radius: 6px; }
+  .mgr-b { padding: 5px 12px; border-radius: 6px; border: 1px solid #ccd; background: #fff; cursor: pointer; font: inherit; font-size: 0.9rem; }
+  .mgr-ok { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+  .mgr-row .msg { color: #b42318; font-size: 0.85rem; }
   details.full-text { margin: 4px 0 6px; font-size: 0.85rem; }
   details.full-text summary { cursor: pointer; color: #4f46e5; }
   details.full-text .field { margin-top: 6px; }
@@ -149,46 +158,7 @@ def _t(v) -> str:
 # for older findings, a «…» quote from its message) located in the text —
 # highlighted there, plus a «📍» line for long texts. Same logic as the
 # frontend's locate.ts.
-_QUOTE_RE = re.compile(r"«([^«»]{2,200})»|“([^“”]{2,200})”|„([^„“”]{2,200})[“”]|\"([^\"]{2,200})\"")
-
-# 2026-10-06 (Александр): the spot used to be found only by an exact quote,
-# so a curly apostrophe, a non-breaking space or «…» inside the model's quote
-# meant «not found» — no highlight and no folding. Now both texts are
-# compared loosely (spaces, quotes/apostrophes, ё/е, case, &nbsp;) and a
-# quote with «…» inside is also tried piece by piece. Same logic as the
-# frontend's locate.ts.
-_CHAR_FOLD = {
-    " ": " ", " ": " ", " ": " ", " ": " ", " ": " ", " ": " ", " ": " ",
-    "’": "'", "‘": "'", "ʼ": "'", "ʻ": "'", "`": "'", "´": "'",
-    "“": '"', "”": '"', "„": '"', "«": '"', "»": '"',
-    "–": "-", "—": "-", "‑": "-",
-    "ё": "е", "Ё": "е",
-}
-
-
-def _fold(text: str) -> tuple[str, list[int], list[int]]:
-    """Loosely normalized text + where each of its characters starts/ends
-    in the original."""
-    out, starts, ends = [], [], []
-    i, n, prev_space = 0, len(text), False
-    while i < n:
-        if text.startswith("&nbsp;", i):
-            ch, step = " ", 6
-        else:
-            ch, step = text[i], 1
-        c = _CHAR_FOLD.get(ch, ch).lower()
-        if c.isspace():
-            c = " "
-        if c == " " and prev_space:
-            ends[-1] = i + step
-            i += step
-            continue
-        prev_space = c == " "
-        out.append(c)
-        starts.append(i)
-        ends.append(i + step)
-        i += step
-    return "".join(out), starts, ends
+_QUOTE_RE = re.compile(r"«([^«»]{2,200})»|“([^“”]{2,200})”|\"([^\"]{2,200})\"")
 
 
 def _fragments(f: dict) -> list[str]:
@@ -197,63 +167,28 @@ def _fragments(f: dict) -> list[str]:
     if frag:
         out.append(frag)
     for m in _QUOTE_RE.finditer(str(f.get("message") or "")):
-        q = (m.group(1) or m.group(2) or m.group(3) or m.group(4) or "").strip().strip("…").strip()
+        q = (m.group(1) or m.group(2) or m.group(3) or "").strip().strip("…").strip()
         if len(q) >= 2 and q not in out:
             out.append(q)
-    # Quotes with «…» / «...» inside: try each piece too.
-    for q in list(out):
-        for piece in re.split(r"…|\.\.\.", q):
-            piece = piece.strip(" ,;:—–-")
-            if len(piece) >= 4 and piece not in out:
-                out.append(piece)
     return out
-
-
-def _find_span(text: str, cand: str) -> tuple[int, int] | None:
-    if not text or not cand:
-        return None
-    i = text.find(cand)
-    if i >= 0:
-        return i, i + len(cand)
-    ft, starts, ends = _fold(text)
-    fc = _fold(cand)[0].strip()
-    if len(fc) < 2:
-        return None
-    j = ft.find(fc)
-    if j < 0:
-        return None
-    return starts[j], ends[j + len(fc) - 1]
 
 
 def _find(text: str, cand: str) -> int:
-    sp = _find_span(text, cand)
-    return sp[0] if sp else -1
-
-
-def locate_fields(f: dict, source: str, translation: str) -> dict:
-    """{"source": (a, b) | None, "translation": (a, b) | None} — each text
-    searched on its own, so the spot is marked in both when it is quoted
-    from both."""
-    out = {"source": None, "translation": None}
-    if f.get("type") in ("register_summary", "system"):
-        return out
-    cands = _fragments(f)
-    for field, text in (("translation", translation or ""), ("source", source or "")):
-        for cand in cands:
-            sp = _find_span(text, cand)
-            if sp:
-                out[field] = sp
-                break
-    return out
+    i = text.find(cand)
+    return i if i >= 0 else text.lower().find(cand.lower())
 
 
 def locate(f: dict, source: str, translation: str):
-    """(field, start, end) of the finding's main spot (translation first),
-    or None."""
-    spans = locate_fields(f, source, translation)
-    for field in ("translation", "source"):
-        if spans[field]:
-            return (field,) + spans[field]
+    """(field, start, end) of the finding's spot, or None. The translation
+    is searched first with every quote, only then the source."""
+    if f.get("type") in ("register_summary", "system"):
+        return None
+    cands = _fragments(f)
+    for field, text in (("translation", translation or ""), ("source", source or "")):
+        for cand in cands:
+            i = _find(text, cand)
+            if i >= 0:
+                return field, i, i + len(cand)
     return None
 
 
@@ -293,35 +228,35 @@ def _window(text: str, a: int, b: int, limit: int = 500) -> tuple[int, int]:
 def excerpt_html(f: dict, source: str, translation: str) -> str | None:
     """For a long text: only the paragraph (or a few sentences) with the
     error — in the source and the translation — and the full text folded
-    away (2026-10-05, Александр: «не весь текст, а только нужная часть»).
-    2026-10-06: a long text is ALWAYS folded; when the spot can't be found
-    the beginning is shown with a note."""
+    away (2026-10-05, Александр: «не весь текст, а только нужная часть»)."""
     source, translation = source or "", translation or ""
     if not (_is_long(source) or _is_long(translation)):
         return None
+    loc = locate(f, source, translation)
+    if not loc:
+        return None
+    field, a, b = loc
     texts = {"source": source, "translation": translation}
     spans = {k: _para_spans(v) for k, v in texts.items()}
-    found = locate_fields(f, source, translation)
-    main = "translation" if found["translation"] else "source" if found["source"] else None
+    other = "source" if field == "translation" else "translation"
+    k = _para_index(spans[field], a)
+    n_f, n_o = len(spans[field]), len(spans[other])
+    if n_o == 0:
+        return None
+    k_o = k if n_f == n_o else min(n_o - 1, round(k * (n_o - 1) / max(1, n_f - 1)))
     parts = {}
-    for name in ("source", "translation"):
-        if not spans[name]:
-            parts[name] = (1, 1, _t(texts[name]))
-            continue
-        other = "source" if name == "translation" else "translation"
-        if found[name]:
-            idx = _para_index(spans[name], found[name][0])
-        elif main and found[main] and spans[main]:
-            k = _para_index(spans[main], found[main][0])
-            n_m, n_o = len(spans[main]), len(spans[name])
-            idx = k if n_m == n_o else min(n_o - 1, round(k * (n_o - 1) / max(1, n_m - 1)))
-        else:
-            idx = 0
+    for name, idx in ((field, k), (other, k_o)):
         ps, pe = spans[name][idx]
         para = texts[name][ps:pe]
         mark = None
-        if found[name] and ps <= found[name][0] and found[name][1] <= pe:
-            mark = (found[name][0] - ps, found[name][1] - ps)
+        if name == field:
+            mark = (a - ps, b - ps)
+        else:
+            for cand in _fragments(f):
+                i = _find(para, cand)
+                if i >= 0:
+                    mark = (i, i + len(cand))
+                    break
         if mark:
             ws, we = _window(para, *mark)
             text = ("…" if ws > 0 else "") + _t_marked(para[ws:we], (mark[0] - ws, mark[1] - ws)) + ("…" if we < len(para) else "")
@@ -334,14 +269,10 @@ def excerpt_html(f: dict, source: str, translation: str) -> str | None:
         i, n, _ = parts[name]
         return f"{title} (абзац {i} из {n}):" if n > 1 else f"{title}:"
 
-    note = "" if main else (
-        '<div class="field loc-line">📍 Точное место не определено автоматически — откройте весь текст.</div>'
-    )
-    full_src = _t_marked(source, found["source"])
-    full_trn = _t_marked(translation, found["translation"])
+    full_src = _t_marked(source, (a, b) if field == "source" else None)
+    full_trn = _t_marked(translation, (a, b) if field == "translation" else None)
     return (
-        note
-        + f'<div class="field txt"><span class="label">{label("source", "Источник")}</span> {parts["source"][2]}</div>'
+        f'<div class="field txt"><span class="label">{label("source", "Источник")}</span> {parts["source"][2]}</div>'
         f'<div class="field txt"><span class="label">{label("translation", "Перевод")}</span> {parts["translation"][2]}</div>'
         '<details class="full-text"><summary>Показать весь текст</summary>'
         f'<div class="field txt"><span class="label">Источник:</span> {full_src}</div>'
@@ -440,7 +371,9 @@ def render_not_found() -> str:
 
 def _is_reviewable(excel_row, f: dict) -> bool:
     # Must match the frontend's isReviewable (reportHtml.ts).
-    return excel_row != 0 and f.get("type") not in ("register_summary", "system")
+    # A finding the manager removed from the report (2026-10-05) is gone
+    # everywhere — numbering, the translator page, counts.
+    return excel_row != 0 and f.get("type") not in ("register_summary", "system") and not f.get("deleted")
 
 
 def tone_key(lang: str) -> str:
@@ -525,6 +458,73 @@ _SCRIPT = """
     }).catch(function () { if (st) st.textContent = "⚠ Не сохранилось — проверьте интернет"; });
   }
   function key(item) { return item.getAttribute("data-key"); }
+  // ✏️ / 🗑 for the manager (2026-10-05): change the comment or remove the
+  // finding — the folder password is checked by the server.
+  document.addEventListener("click", function (ev) {
+    var t = ev.target.closest && ev.target.closest(".mgr-btn");
+    if (!t) return;
+    var item = t.closest(".item");
+    var old = item.querySelector(".mgr-box");
+    if (old) { old.remove(); return; }
+    var isEdit = t.classList.contains("mgr-edit");
+    var comment = item.querySelector(".comment");
+    var okkField = item.querySelector(".okk-field");
+    var box = document.createElement("div");
+    box.className = "mgr-box";
+    if (isEdit) {
+      var lbl = document.createElement("div"); lbl.className = "label"; lbl.textContent = "Комментарий для переводчика:";
+      var ta = document.createElement("textarea"); ta.className = "mgr-text";
+      ta.placeholder = "Пусто — комментарий будет убран";
+      ta.value = okkField ? okkField.querySelector(".okk-c").textContent : "";
+      box.appendChild(lbl); box.appendChild(ta);
+    } else {
+      var w = document.createElement("div"); w.className = "red";
+      w.textContent = "Удалить это замечание? Оно пропадёт и из отчёта менеджера.";
+      box.appendChild(w);
+    }
+    var row = document.createElement("div"); row.className = "mgr-row";
+    var pw = document.createElement("input"); pw.type = "password"; pw.placeholder = "Пароль папки"; pw.autocomplete = "current-password";
+    var ok = document.createElement("button"); ok.type = "button"; ok.className = "mgr-b mgr-ok"; ok.textContent = isEdit ? "Сохранить" : "Удалить";
+    var no = document.createElement("button"); no.type = "button"; no.className = "mgr-b"; no.textContent = "Отмена";
+    var msg = document.createElement("span"); msg.className = "msg";
+    row.appendChild(pw); row.appendChild(ok); row.appendChild(no); row.appendChild(msg);
+    box.appendChild(row);
+    (okkField || comment || item.querySelector(".num")).insertAdjacentElement("afterend", box);
+    (isEdit ? box.querySelector("textarea") : pw).focus();
+    no.addEventListener("click", function () { box.remove(); });
+    ok.addEventListener("click", function () {
+      var text = isEdit ? box.querySelector("textarea").value.trim() : null;
+      if (!pw.value) { msg.textContent = "Введите пароль папки."; return; }
+
+      ok.disabled = true; msg.textContent = "";
+      fetch(base + "/finding", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: pw.value, key: key(item), action: isEdit ? "okk_comment" : "delete", message: text })
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (b) {
+          if (!r.ok) throw new Error(b.detail || "Не удалось сохранить.");
+          return b;
+        });
+      }).then(function (b) {
+        if (isEdit) {
+          var c2 = b.okk_comment || "";
+          if (!c2 && okkField) { okkField.remove(); okkField = null; }
+          else if (c2 && okkField) { okkField.querySelector(".okk-c").textContent = c2; }
+          else if (c2) {
+            okkField = document.createElement("div"); okkField.className = "field okk-field";
+            var l3 = document.createElement("span"); l3.className = "label"; l3.textContent = "Комментарий для переводчика:";
+            var v3 = document.createElement("span"); v3.className = "red okk-c"; v3.textContent = c2;
+            okkField.appendChild(l3); okkField.appendChild(document.createTextNode(" ")); okkField.appendChild(v3);
+            (comment || item.querySelector(".num")).insertAdjacentElement("afterend", okkField);
+          }
+          box.remove();
+        } else {
+          item.remove();
+        }
+      }).catch(function (e) { ok.disabled = false; msg.textContent = e.message; });
+    });
+  });
   function okkBody(item, action) {
     var c = item.querySelector(".okk-comment");
     var l = item.querySelector(".okk-links");
@@ -775,16 +775,24 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
         else:
             src, trn = str(row.get("source") or ""), str(row.get("translation") or "")
             loc = locate(f, src, trn)
-            spots = locate_fields(f, src, trn)
             short = excerpt_html(f, src, trn)
-            body_html = short or (
+            full_pair = (
                 f'<div class="field txt"><span class="label">Источник:</span> '
-                f'{_t_marked(src, spots["source"])}</div>'
+                f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
                 f'<div class="field txt"><span class="label">Перевод:</span> '
-                f'{_t_marked(trn, spots["translation"])}</div>'
+                f'{_t_marked(trn, loc[1:] if loc and loc[0] == "translation" else None)}</div>'
+            )
+            if not short and (_is_long(src) or _is_long(trn)) and not loc:
+                # Long text, place not found: fold it instead of a wall of text.
+                short = f'<details class="full-text"><summary>Показать текст строки</summary>{full_pair}</details>'
+            body_html = "" if not (src.strip() or trn.strip()) else short or (
+                f'<div class="field txt"><span class="label">Источник:</span> '
+                f'{_t_marked(src, loc[1:] if loc and loc[0] == "source" else None)}</div>'
+                f'<div class="field txt"><span class="label">Перевод:</span> '
+                f'{_t_marked(trn, loc[1:] if loc and loc[0] == "translation" else None)}</div>'
             )
             platform_html = (
-                f'<div class="comment"><span class="label">Комментарий платформы:</span> {_t(_strip_rows(f.get("message")))}</div>'
+                f'<div class="comment"><span class="label">{"Комментарий менеджера" if f.get("type") == "manual" else "Комментарий платформы"}:</span> {_t(_strip_rows(f.get("message")))}</div>'
                 + ("" if short else _loc_line(loc, src, trn))
             )
         links_html = _links_html(entry.get("links", ""))
@@ -819,7 +827,7 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             # Stage 2 — translator.
             note_html = ""
             okk_html = (
-                f'<div class="field"><span class="label">Комментарий для переводчика:</span> <span class="red">{_e(okk_comment)}</span></div>'
+                f'<div class="field okk-field"><span class="label">Комментарий для переводчика:</span> <span class="red okk-c">{_e(okk_comment)}</span></div>'
             ) if okk_comment else ""
             platform_html += okk_html
             tail = (
@@ -840,6 +848,10 @@ def _lang_items(lang: str, results: dict, review: dict, translator_review: dict)
             f'<div class="{" ".join(classes)}" data-key="{_e(key)}">'
             '<div class="corner">'
             + ('<button type="button" class="save-btn" title="Сохранить в свою папку («Сохранённое»)">💾</button>' if row is not None else "")
+            + ('<button type="button" class="mgr-btn mgr-edit" title="Для менеджера: изменить комментарий для переводчика (нужен пароль папки)">✏️</button>'
+               if row is not None and not pending else "")
+            + ('<button type="button" class="mgr-btn mgr-del" title="Для менеджера: удалить замечание (нужен пароль папки)">🗑</button>'
+               if row is not None else "")
             + f"{check_html}</div>"
             f'<div class="num">№{num}{conf_html}</div>'
             f"{body_html}{note_html}{platform_html}{tail}"
