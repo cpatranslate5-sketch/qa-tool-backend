@@ -325,124 +325,107 @@ def _extract_placeholders(text: str) -> list[str]:
     return PLACEHOLDER_RE.findall(text)
 
 
-def _words_cover(missing: list[str], other_text: str, lang: str, protected: set[str] | None = None,
-                 months: bool = False) -> list[str]:
-    """Numbers still missing after accepting those written as words on the
-    other side (2026-10-06, Александр: «один = 1» is fine). A number from a
-    date written in digits (protected) is never accepted as a word."""
-    from app.number_words import has_number_word, month_in_words
-    left = []
-    for tok in missing:
-        if protected is not None and tok in protected:
-            left.append(tok)
-            continue
-        ok = False
-        if tok.isdigit():
-            n = int(tok)
-            ok = has_number_word(other_text, n, lang) or (months and 1 <= n <= 12 and month_in_words(other_text, n))
-        if not ok:
-            left.append(tok)
-    return left
+# «Круглосуточно» (2026-10-06, Александр): «24/7», «7/24», «24x7», «24/7/365»
+# and «24 часа / 24 hours / 24시간 / 24 saat…» all mean «round the clock», and
+# a translator may swap one for another or for a word («круглосуточно»,
+# «non-stop»). They are left out of the number comparison on both sides;
+# any OTHER number (e.g. «48 часов» instead of «24 часа») is still compared.
+_HOUR_WORDS = (
+    r"h\b|hrs?\b|hours?|ч\b|ч\.|час|saat|soat|сағат|саат|соат|соат|ساع|ساعت|گھنٹ|घंट|घण्ट|ঘণ্ট|ঘন্ট|तास|గంట|"
+    r"ชั่วโมง|시간|時間|小时|小時|giờ|jam\b|hora|heure|stunde|std\b|ore\b|godzin|ώρ|годин|oras\b|saa\b|órá|uur|timmar|tunti"
+)
+_ROUND_CLOCK_RE = re.compile(
+    r"(?<![\d.,])(?:24\s*[/x×х]\s*7(?:\s*[/x×х]\s*365)?|7\s*/\s*24|24\s*-?\s*(?:" + _HOUR_WORDS + r"))",
+    re.IGNORECASE,
+)
 
 
-def _reconcile_split(missing: list[str], extra: list[str]) -> tuple[list[str], list[str]]:
-    """A dotted number read as one value on one side («4.1» next to a price)
-    and as its parts on the other («4», «1» — a section number) is the same
-    text, not a mismatch (2026-10-08, Александр's «4.1 / 4» case)."""
-    def fold(a: list[str], b: list[str]) -> tuple[list[str], list[str]]:
-        a, rest = list(a), Counter(b)
-        for tok in list(a):
-            if "." not in tok and "," not in tok:
+def _without_round_clock(text: str) -> str:
+    return _ROUND_CLOCK_RE.sub(" ", text or "")
+
+
+# Numbers as words (2026-10-09, Александр): a number may be written with
+# digits or in words, either way round («3 фриспина» ↔ «three free spins»),
+# EXCEPT a date written with digits in the source — those digits must stay.
+# So: a number missing on ONE side only (nothing else changed) is taken as
+# written in words and not reported; a number replaced by a DIFFERENT number
+# (one missing AND another one extra) is still reported, and so is any date
+# number. Whether a number written in words is the right number is left to
+# the AI check.
+_MONTHS_RE = (
+    r"(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр"
+    r"|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+    r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)[a-zа-я]*"
+)
+_NUMERIC_DATE_RE = re.compile(
+    r"(?<![\d.,/])(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)(?![\d.,/]?\d)"
+)
+_YEAR_RE = re.compile(r"(?<![\d.,])(?:19|20)\d{2}(?![\d.,]?\d)")
+_DAY_MONTH_RE = re.compile(
+    r"(?<![\d.,])(\d{1,2})(?:-?(?:го|е|ого|st|nd|rd|th))?\s+(?:по\s+\d{1,2}\s+)?" + _MONTHS_RE
+    + r"|" + _MONTHS_RE + r"\s+(\d{1,2})(?:st|nd|rd|th)?(?![\d.,]?\d)",
+    re.IGNORECASE,
+)
+
+
+def _date_numbers(text: str, month_names: bool) -> Counter:
+    out: Counter = Counter()
+    taken: list[tuple[int, int]] = []
+    for m in _NUMERIC_DATE_RE.finditer(text):
+        out.update(_flatten_number_matches(m.group(0)))
+        taken.append(m.span())
+    for m in _YEAR_RE.finditer(text):
+        if not any(a <= m.start() < b for a, b in taken):
+            out.update([m.group(0)])
+    if month_names:
+        for m in _DAY_MONTH_RE.finditer(text):
+            if any(a <= m.start() < b for a, b in taken):
                 continue
-            parts = Counter(_normalize_number(p) for p in re.split(r"[.,]", tok) if p)
-            if parts and all(rest[k] >= v for k, v in parts.items()):
-                a.remove(tok)
-                rest -= parts
-        return a, sorted(rest.elements())
-    missing, extra = fold(missing, extra)
-    extra, missing = fold(extra, missing)
-    return sorted(missing), sorted(extra)
+            for g in (m.group(1), m.group(2)):
+                if g:
+                    out.update(_flatten_number_matches(g))
+            # «с 15 по 25 октября» — the first day belongs to the date too
+            pre = re.search(r"(?<![\d.,])(\d{1,2})\s+по\s+$", text[max(0, m.start() - 12):m.start()])
+            if pre:
+                out.update(_flatten_number_matches(pre.group(1)))
+    return out
 
 
-def _number_place(source: str, translation: str, missing: list[str], extra: list[str]) -> tuple[str, str]:
-    """(«абзац N», verbatim snippet) of the first paragraph whose numbers
-    differ — so a mismatch in a long text can be found at once."""
-    def lines(t):
-        return [l for l in t.split("\n") if l.strip()]
-    s_lines, t_lines = lines(source), lines(translation)
-    want_s, want_t = set(missing), set(extra)
-
-    def snippet(line: str, wanted: set[str]) -> str:
-        for m in NUMBER_RE.finditer(line):
-            if set(_decompose_grouped(m.group(0))) & wanted or _normalize_number(m.group(0)) in wanted:
-                a, b = max(0, m.start() - 25), min(len(line), m.end() + 25)
-                while a > 0 and not line[a - 1].isspace() and m.start() - a < 40:
-                    a -= 1
-                while b < len(line) and not line[b].isspace() and b - m.end() < 40:
-                    b += 1
-                return line[a:b].strip()
-        return line.strip()[:60]
-
-    if len(s_lines) == len(t_lines):
-        for i, (sl, tl) in enumerate(zip(s_lines, t_lines)):
-            fs, ft = Counter(_flatten_number_matches(sl)), Counter(_flatten_number_matches(tl))
-            if fs != ft:
-                ms, mt = sorted((fs - ft).elements()), sorted((ft - fs).elements())
-                ms, mt = _reconcile_split(ms, mt)
-                if not ms and not mt:
-                    continue
-                if set(mt) & want_t or not (set(ms) & want_s):
-                    return f"абзац {i + 1}", snippet(tl, set(mt) or want_t)
-                return f"абзац {i + 1}", snippet(sl, set(ms) or want_s)
-    for i, sl in enumerate(s_lines):
-        if set(_flatten_number_matches(sl)) & want_s:
-            return f"абзац {i + 1} оригинала", snippet(sl, want_s)
-    for i, tl in enumerate(t_lines):
-        if set(_flatten_number_matches(tl)) & want_t:
-            return f"абзац {i + 1} перевода", snippet(tl, want_t)
-    return "", ""
-
-
-def check_numbers(source: str, translation: str, tgt_lang: str = "", src_lang: str = "") -> list[dict]:
-    src_flat = _flatten_number_matches(source)
-    tr_flat = _flatten_number_matches(translation)
-    findings = []
-    if sorted(src_flat) != sorted(tr_flat):
-        from app.number_words import date_numbers, guess_source_lang, lang_base
-        src_counter = Counter(src_flat)
-        tr_counter = Counter(tr_flat)
-        missing = sorted((src_counter - tr_counter).elements())
-        extra = sorted((tr_counter - src_counter).elements())
-        missing, extra = _reconcile_split(missing, extra)
-        # A number written as a word on the other side is fine; a date in
-        # digits must stay in digits; a date in words may become digits.
-        missing = _words_cover(missing, translation, lang_base(tgt_lang), protected=set(date_numbers(source)))
-        extra = _words_cover(extra, source, lang_base(src_lang) or guess_source_lang(source), months=True)
-        if not missing and not extra:
-            return findings
-        # Point at the SPECIFIC number(s) that actually differ, not a dump
-        # of every number in the text — a long promo paragraph can easily
-        # have 20-30 numbers where only one is actually wrong, and the raw
-        # full lists made that one real difference hard to spot by eye
-        # (Александр kept asking "why is it showing me this" at a glance).
-        parts = []
-        if missing:
-            parts.append(f"есть в исходнике, нет в переводе: {missing}")
-        if extra:
-            parts.append(f"есть в переводе, нет в исходнике: {extra}")
-        finding = {
-            "type": "numbers",
-            "severity": "high",
-            "message": "Числа в исходнике и переводе не совпадают — " + "; ".join(parts) + ".",
-        }
-        # Where: for a long text, the paragraph and the exact place (2026-10-08).
-        if "\n" in source.strip() or len(source) > 160:
-            where, snip = _number_place(source, translation, missing, extra)
-            if where:
-                finding["message"] += f" Место: {where} — «{snip}»."
-                finding["fragment"] = snip
-        findings.append(finding)
-    return findings
+def check_numbers(source: str, translation: str) -> list[dict]:
+    src_text = _without_round_clock(source)
+    tr_text = _without_round_clock(translation)
+    src_counter = Counter(_flatten_number_matches(src_text))
+    tr_counter = Counter(_flatten_number_matches(tr_text))
+    if src_counter == tr_counter:
+        return []
+    missing_c = src_counter - tr_counter
+    extra_c = tr_counter - src_counter
+    # Date numbers are strict: source dates (digits, or a day next to a month
+    # name) must keep their digits; a date added in the translation must be
+    # in the source.
+    strict_missing = missing_c & _date_numbers(src_text, month_names=True)
+    strict_extra = extra_c & _date_numbers(tr_text, month_names=False)
+    loose_missing = missing_c - strict_missing
+    loose_extra = extra_c - strict_extra
+    if not strict_missing and not strict_extra and not (loose_missing and loose_extra):
+        return []  # only written-in-words numbers
+    # Point at the SPECIFIC number(s) that actually differ, not a dump of
+    # every number in the text.
+    missing = sorted(missing_c.elements())
+    extra = sorted(extra_c.elements())
+    parts = []
+    if missing:
+        parts.append(f"есть в исходнике, нет в переводе: {missing}")
+    if extra:
+        parts.append(f"есть в переводе, нет в исходнике: {extra}")
+    note = ""
+    if (strict_missing or strict_extra) and not (loose_missing and loose_extra):
+        note = " Это числа даты — их нужно писать цифрами, как в исходнике."
+    return [{
+        "type": "numbers",
+        "severity": "high",
+        "message": "Числа в исходнике и переводе не совпадают — " + "; ".join(parts) + "." + note,
+    }]
 
 
 def check_placeholders(source: str, translation: str) -> list[dict]:
@@ -749,7 +732,14 @@ _LATIN_LETTER_RE = re.compile(r"[a-zA-Z]")
 _LETTER_RUN_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ]+")
 
 
-def check_mixed_script(translation: str) -> list[dict]:
+# 2026-10-07 (Александр): a project may accept a Latin «i» in place of a
+# look-alike Cyrillic «і» (Kazakh, Ukrainian…) — only when that language's
+# styleguide says so (see styleguide.tolerates_latin_i). Any OTHER look-alike
+# Latin letter inside a Cyrillic word is still flagged.
+_TOLERATED_LATIN_I = set("iI")
+
+
+def check_mixed_script(translation: str, tolerate_latin_i: bool = False) -> list[dict]:
     """Catches an invisible-to-the-eye typo: a word that LOOKS like it's
     written in one alphabet but actually mixes in a look-alike letter from
     the other (Cyrillic "с" typed where a Latin "c" belongs, or vice versa)
@@ -764,10 +754,14 @@ def check_mixed_script(translation: str) -> list[dict]:
     below, the same way check_numbers is silently folded in whenever
     "Оформление" is ticked (see CHECK_OPTIONS/buildChecksToSend on the
     frontend)."""
-    suspects = sorted({
-        m.group(0) for m in _LETTER_RUN_RE.finditer(translation)
-        if _CYRILLIC_LETTER_RE.search(m.group(0)) and _LATIN_LETTER_RE.search(m.group(0))
-    })
+    def _mixed(word: str) -> bool:
+        if not (_CYRILLIC_LETTER_RE.search(word) and _LATIN_LETTER_RE.search(word)):
+            return False
+        if tolerate_latin_i and set(_LATIN_LETTER_RE.findall(word)) <= _TOLERATED_LATIN_I:
+            return False
+        return True
+
+    suspects = sorted({m.group(0) for m in _LETTER_RUN_RE.finditer(translation) if _mixed(m.group(0))})
     if not suspects:
         return []
     shown = ", ".join(f"«{w}»" for w in suspects[:10])
@@ -979,54 +973,11 @@ def _real_last_char(text: str) -> str:
     return t[-1] if t else ""
 
 
-def _places(text: str, positions: list[int], width: int = 25, limit: int = 5) -> tuple[str, str]:
-    """« Где: …» for mechanical findings in long texts (2026-10-08,
-    Александр: «очень тяжело искать»): the words around each position (with
-    the paragraph number when the text has several) — and the first one as
-    the finding's "fragment", so the report shows that very paragraph."""
-    if not positions:
-        return "", ""
-    lines_start = [0] + [m.end() for m in re.finditer(r"\n", text)]
-    nonempty = [i for i, st in enumerate(lines_start)
-                if text[st:(lines_start[i + 1] - 1 if i + 1 < len(lines_start) else len(text))].strip()]
-    multi = len(nonempty) > 1
-    shown, first = [], ""
-    for pos in positions[:limit]:
-        ls = text.rfind("\n", 0, pos) + 1
-        le = text.find("\n", pos)
-        le = len(text) if le < 0 else le
-        a, b = max(ls, pos - width), min(le, pos + width)
-        while a > ls and not text[a - 1].isspace() and pos - a < width + 15:
-            a -= 1
-        while b < le and not text[b].isspace() and b - pos < width + 15:
-            b += 1
-        snip = text[a:b].strip()
-        if not first:
-            first = snip
-        if multi:
-            line_no = bisect.bisect_right(lines_start, pos) - 1
-            para = nonempty.index(line_no) + 1 if line_no in nonempty else line_no + 1
-            shown.append(f"абзац {para}: «{snip}»")
-        else:
-            shown.append(f"«{snip}»")
-    more = f" и ещё {len(positions) - limit}" if len(positions) > limit else ""
-    return " Где: " + "; ".join(shown) + more + ".", first
-
-
-def _with_places(finding: dict, text: str, positions: list[int]) -> dict:
-    where, first = _places(text, positions)
-    if where:
-        finding["message"] = finding["message"].rstrip() + where
-        finding["fragment"] = first
-    return finding
-
-
 # "Оформление": length long dash "—" requires spaces on both sides
 # (Александр's ask, 2026-09-22) — anything glued straight onto a
 # neighboring word looks like a typo, not intentional typography.
 def check_em_dash_spacing(translation: str) -> list[dict]:
     bad_count = 0
-    bad_pos: list[int] = []
     for i, ch in enumerate(translation):
         if ch != "—":
             continue
@@ -1034,17 +985,16 @@ def check_em_dash_spacing(translation: str) -> list[dict]:
         after_ok = i == len(translation) - 1 or translation[i + 1].isspace()
         if not before_ok or not after_ok:
             bad_count += 1
-            bad_pos.append(i)
     if not bad_count:
         return []
-    return [_with_places({
+    return [{
         "type": "punctuation",
         "severity": "low",
         "message": (
             f"В переводе длинное тире «—» стоит без пробела с одной из сторон ({bad_count} раз(а)) — "
             "вокруг «—» должны быть пробелы с обеих сторон."
         ),
-    }, translation, bad_pos)]
+    }]
 
 
 # A plain hyphen "-" surrounded by SPACES on both sides is almost always a
@@ -1164,7 +1114,11 @@ _COLON_RE = re.compile(r"[:：]")
 
 
 def check_hyphen_for_dash(translation: str) -> list[dict]:
-    hyphen_positions = [m.start() for m in re.finditer(r"(?<=\s)-(?=\s)", translation)]
+    from app.styleguide import is_list_marker  # 2026-10-06: bullets at a line start
+    hyphen_positions = [
+        m.start() for m in re.finditer(r"(?<=\s)-(?=\s)", translation)
+        if not is_list_marker(translation, m.start())
+    ]
     if not hyphen_positions:
         return []
 
@@ -1180,7 +1134,6 @@ def check_hyphen_for_dash(translation: str) -> list[dict]:
     first_nonws_pos = first_nonws.start() if first_nonws else len(translation)
 
     count = 0
-    found_pos: list[int] = []
     # A hyphen that opens the cell with NO leading space at all ("- First
     # item...") never matches the (?<=\s) lookbehind above in the first
     # place — it isn't preceded by anything, let alone whitespace — so it
@@ -1207,20 +1160,19 @@ def check_hyphen_for_dash(translation: str) -> list[dict]:
             list_mode = True
             continue  # this hyphen is inside a colon-introduced enumeration — a list marker, not a dash typo
         count += 1
-        found_pos.append(pos)
     if not count:
         return []
-    return [_with_places({
+    return [{
         "type": "punctuation",
         "severity": "low",
         "message": (
             f"В переводе короткий дефис «-» стоит отдельным словом, окружённым пробелами ({count} раз(а)) — "
             "похоже, здесь по смыслу должно быть длинное тире «—», а не дефис."
         ),
-    }, translation, found_pos)]
+    }]
 
 
-def _double_space_locations(translation: str) -> list[tuple[str, str, int]]:
+def _double_space_locations(translation: str) -> list[tuple[str, str]]:
     """Returns (word_before, word_after) for every run of 2+ spaces in
     translation, skipping a run that's purely trailing (nothing but more
     whitespace follows it to the end of the string) — added 2026-09-26,
@@ -1234,27 +1186,17 @@ def _double_space_locations(translation: str) -> list[tuple[str, str, int]]:
     for m in re.finditer(r" {2,}", translation):
         if m.start() >= trimmed_end:
             continue
-        # Layout, not typos (2026-10-08): indentation at the start of a
-        # line, spaces at the end of a line, and the padding inside a
-        # Markdown table row («| Limit       | 2 oyunçu |»).
-        ls = translation.rfind("\n", 0, m.start()) + 1
-        le = translation.find("\n", m.end())
-        le = len(translation) if le < 0 else le
-        line = translation[ls:le]
-        if not translation[ls:m.start()].strip() or not translation[m.end():le].strip():
-            continue
-        if line.strip().startswith("|") or line.count("|") >= 2:
-            continue
         before_match = re.search(r"(\S+)\s*$", translation[: m.start()])
         after_match = re.search(r"^\s*(\S+)", translation[m.end() :])
         before_word = before_match.group(1) if before_match else "начала сегмента"
         after_word = after_match.group(1) if after_match else "конца сегмента"
-        hints.append((before_word, after_word, m.start()))
+        hints.append((before_word, after_word))
     return hints
 
 
 def check_punctuation(
-    source: str, translation: str, lang_code: str = "", checks: list[str] | None = None
+    source: str, translation: str, lang_code: str = "", checks: list[str] | None = None,
+    tolerate_latin_i: bool = False,
 ) -> list[dict]:
     findings = []
     lang_base = lang_code.split("-")[0].lower() if lang_code else ""
@@ -1303,22 +1245,18 @@ def check_punctuation(
         # just leftover formatting noise), so it isn't worth a finding at
         # all here.
         if double_space_hints:
-            where = "; ".join(f"между «{a}» и «{b}»" for a, b, _ in double_space_hints[:5])
-            more = f" и ещё {len(double_space_hints) - 5}" if len(double_space_hints) > 5 else ""
-            finding = {
+            where = "; ".join(f"между «{a}» и «{b}»" for a, b in double_space_hints)
+            findings.append({
                 "type": "punctuation",
                 "severity": "low",
-                "message": f"В переводе есть двойной пробел ({len(double_space_hints)}) — {where}{more}.",
-            }
-            if "\n" in translation.strip() or len(translation) > 160:
-                finding = _with_places(finding, translation, [p for _, _, p in double_space_hints])
-            findings.append(finding)
+                "message": f"В переводе есть двойной пробел — {where}.",
+            })
 
     if "sms_charset" not in checks:
         findings += check_em_dash_spacing(translation)
         findings += check_hyphen_for_dash(translation)
 
-    findings += check_mixed_script(translation)
+    findings += check_mixed_script(translation, tolerate_latin_i)
 
     return findings
 
@@ -1384,19 +1322,20 @@ def run_rule_checks(
     checks: list[str],
     max_length: int | None = None,
     lang_code: str = "",
+    tolerate_latin_i: bool = False,
 ) -> list[dict]:
     findings = []
     if not translation.strip():
         return check_missing(source, translation)
     if "numbers" in checks:
-        findings += check_numbers(source, translation, tgt_lang=lang_code)
+        findings += check_numbers(source, translation)
     if "placeholders" in checks:
         findings += check_placeholders(source, translation)
         findings += check_letter_placeholders(source, translation)
     if "max_length" in checks:
         findings += check_max_length(translation, max_length)
     if "punctuation" in checks:
-        findings += check_punctuation(source, translation, lang_code, checks)
+        findings += check_punctuation(source, translation, lang_code, checks, tolerate_latin_i=tolerate_latin_i)
     if "sms_charset" in checks:
         findings += check_sms_charset(translation)
     # Emoji checks are free and important — always on (2026-10-01).
