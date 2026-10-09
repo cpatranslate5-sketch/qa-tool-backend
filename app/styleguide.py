@@ -150,7 +150,6 @@ AUTO_DEFAULT = {
     "em_dash": "any",
     "en_dash_forbidden": False,
     "hyphen_forbidden": False,
-    "hyphen_as_dash": False,    # « - » between words where a dash «—» is needed
     "ranges": "any",
     "range_spaces": "any",
     "ellipsis_char": False,     # only «…», never «...»
@@ -529,7 +528,7 @@ def quote_kinds(text: str) -> set[str]:
     return kinds
 
 
-_NESTED_OK = {"pt-pt": {"curly"}, "uk": {"straight"}, "es-es": {"curly"}, "ru": {"de_low"}, "hy": {"de_low"}}
+_NESTED_OK = {"pt-pt": {"curly"}, "uk": {"straight"}, "es-es": {"curly"}}
 
 _RANGE_RE = re.compile(
     r"(?<![\d.,:/\-–])(\d{1,4}(?:[.,:]\d{1,2})?)(\s*)([-–—~〜～])(\s*)(\d{1,4}(?:[.,:]\d{1,2})?)(?![\d/\-–]|[.,:]\d)"
@@ -598,6 +597,43 @@ def _term_regex(term: str, lang: str) -> re.Pattern:
     return re.compile(rf"(?<!\w){esc}(?!\w)")
 
 
+
+
+# 2026-10-07 (Александр): writing «латинская «i»» anywhere in a language's
+# styleguide (e.g. «Прочие правила для ИИ») tells the free mixed-alphabet
+# check to accept a Latin «i» in place of a Cyrillic «і» for that project.
+_LATIN_I_RE = re.compile(r"латинск\w*\s*[«\"'“]?\s*i\s*[»\"'”]?", re.IGNORECASE)
+
+
+def tolerates_latin_i(rules: dict | None) -> bool:
+    for v in (rules or {}).values():
+        if isinstance(v, dict):
+            for x in v.values():
+                if isinstance(x, str) and _LATIN_I_RE.search(x):
+                    return True
+    return False
+
+# 2026-10-06 (Александр): a dash/hyphen/bullet that OPENS a line and is
+# followed by a space is a list marker («Разыгрываются:\n- iPhone\n- PS5»),
+# not punctuation — no dash/hyphen/spacing rule applies to it. Same for the
+# «---» runs of a Markdown table's separator row.
+_LIST_MARKERS = "-–—•*·▪●◦"
+
+
+def is_list_marker(text: str, pos: int) -> bool:
+    if pos < 0 or pos >= len(text) or text[pos] not in _LIST_MARKERS:
+        return False
+    nxt = text[pos + 1] if pos + 1 < len(text) else ""
+    if text[pos] == "-" and (nxt == "-" or (pos > 0 and text[pos - 1] == "-")):
+        return True  # «---» (Markdown table separator)
+    if nxt and not nxt.isspace():
+        return False
+    i = pos - 1
+    while i >= 0 and text[i] in " \t\u00a0":
+        i -= 1
+    return i < 0 or text[i] in "\n\r"
+
+
 def check_row(source: str, translation: str, rules: dict | None, lang: str) -> list[dict]:
     """Algorithmic styleguide checks of one translation."""
     if not rules or not (translation or "").strip():
@@ -624,6 +660,8 @@ def check_row(source: str, translation: str, rules: dict | None, lang: str) -> l
     # Em dash
     mode = a.get("em_dash") or "any"
     for m in re.finditer("—", t):
+        if is_list_marker(t, m.start()):
+            continue
         before = t[m.start() - 1] if m.start() > 0 else ""
         after = t[m.end()] if m.end() < len(t) else ""
         if mode == "forbidden":
@@ -635,17 +673,15 @@ def check_row(source: str, translation: str, rules: dict | None, lang: str) -> l
         if mode == "unspaced" and ((before and before.isspace()) or (after and after.isspace())):
             add(f"Длинное тире с пробелами: «{_snip(t, m.start(), m.end())}» — по стайлгайду без пробелов.")
 
-    if a.get("hyphen_as_dash"):
-        m = re.search(r"(?<=[^\W\d_])[ \u00a0]-[ \u00a0](?=[^\W\d_])", t)
-        if m:
-            add(f"Дефис вместо тире: «{_snip(t, m.start(), m.end())}» — между словами нужно длинное тире «—» с пробелами.")
-
-    if a.get("en_dash_forbidden") and "–" in t:
-        i = t.index("–")
-        add(f"Короткое тире «–» запрещено стайлгайдом: «{_snip(t, i, i + 1)}».")
+    if a.get("en_dash_forbidden"):
+        i = next((m.start() for m in re.finditer("–", t) if not is_list_marker(t, m.start())), -1)
+        if i >= 0:
+            add(f"Короткое тире «–» запрещено стайлгайдом: «{_snip(t, i, i + 1)}».")
 
     if a.get("hyphen_forbidden"):
         for m in re.finditer(r"-", t):
+            if is_list_marker(t, m.start()):
+                continue
             b = t[m.start() - 1] if m.start() > 0 else ""
             c = t[m.end()] if m.end() < len(t) else ""
             if b.isdigit() and c.isdigit():
@@ -942,60 +978,4 @@ def without_tone(styleguide: dict | None) -> dict:
         rest = {k: copy.deepcopy(v) for k, v in (secs or {}).items() if k not in NOT_COPIED_SECTIONS}
         if rest:
             out[lang] = rest
-    return out
-
-
-# ------------------------------------------------- default rules (2026-10-07) --
-# Александр: languages the client's styleguide has no rules for (English,
-# Russian, Armenian) get a default set in every client — em dash with spaces,
-# hyphens in compound words, one kind of quotes, etc. Only sections that are
-# not set yet are added; the client's own rules are never overwritten.
-def _auto(**kw) -> dict:
-    a = dict(AUTO_DEFAULT)
-    a.update(kw)
-    return a
-
-
-DEFAULT_LANG_RULES: dict[str, dict] = {
-    "en": {
-        "quotes": {"text": "Двойные фигурные кавычки “…”, вложенные — одинарные ‘…’. Во всём тексте один вид кавычек."},
-        "em_dash": {"text": "Длинное тире «—» с пробелами с обеих сторон: word — word."},
-        "hyphen": {"text": "Дефис в составных определениях перед существительным: 24-hour support, well-known brand, "
-                           "5-day promo. Не путать дефис с тире."},
-        "en_dash": {"text": "Короткое тире «–» — только в диапазонах без пробелов: 10–20, Mon–Fri."},
-        "capitalization": {"text": "Sentence case в заголовках и на кнопках (Get your bonus), не Title Case."},
-        "other": {"text": "Единообразие во всём тексте: один вид кавычек, одно написание многоточия, одинаковые "
-                          "термины. Названия игр, провайдеров и акций — как в оригинале."},
-        "auto": _auto(quotes=["curly"], em_dash="spaced", hyphen_as_dash=True),
-    },
-    "ru": {
-        "quotes": {"text": "Кавычки-ёлочки «…», вложенные — „…“. Во всём тексте один вид кавычек."},
-        "em_dash": {"text": "Длинное тире «—» с пробелами с обеих сторон: слово — слово. Не заменять дефисом."},
-        "hyphen": {"text": "Дефис без пробелов в сложных словах и с частицами: онлайн-казино, бонус-код, кто-то, "
-                           "по-новому, 5-й, 10-процентный."},
-        "en_dash": {"text": "Короткое тире «–» — в диапазонах чисел без пробелов: 10–20."},
-        "other": {"text": "Единообразие во всём тексте: один вид кавычек, одно написание многоточия, одинаковые "
-                          "термины. Буква «ё» — как в остальном тексте проекта."},
-        "auto": _auto(quotes=["guillemets"], em_dash="spaced", hyphen_as_dash=True),
-    },
-    "hy": {
-        "quotes": {"text": "Кавычки-ёлочки «…». Во всём тексте один вид кавычек."},
-        "em_dash": {"text": "Длинное тире «—» с пробелами с обеих сторон."},
-        "hyphen": {"text": "Дефис без пробелов в сложных словах и сокращениях с окончаниями: 5-րդ, FS-ներ."},
-        "other": {"text": "Армянская пунктуация: точка в конце предложения — «։» (не двоеточие и не латинская точка), "
-                          "запятая «,», вопросительный знак «՞» и восклицательный «՜» ставятся над ударной гласной "
-                          "слова. Единообразие кавычек и терминов во всём тексте."},
-        "auto": _auto(quotes=["guillemets"], em_dash="spaced", hyphen_as_dash=True),
-    },
-}
-
-
-def add_default_rules(styleguide: dict | None) -> dict:
-    """The styleguide with DEFAULT_LANG_RULES added where sections are missing."""
-    out = copy.deepcopy(styleguide or {})
-    for lang, secs in DEFAULT_LANG_RULES.items():
-        target = out.setdefault(lang, {})
-        for sec, val in secs.items():
-            if sec not in target:
-                target[sec] = copy.deepcopy(val)
     return out
